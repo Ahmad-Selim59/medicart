@@ -163,31 +163,55 @@ func parseHeartRateLine(line string) (interface{}, error) {
 // NIBP
 // Live: DATA:CUFF_PRESSURE=120
 // Result: DATA:NIBP_RESULT:SYS=110,DIA=70,MAP=85,PR=72,IRR=False
+//        (Or variant: DATA:NIBP_RESULT:SYS=125,DIA=77,MAP94,PR65,IRR=FALSE)
 // Error: STATUS:NIBP_ERROR=5
 func parseNIBPLine(line string) (interface{}, error) {
-	line = strings.TrimSpace(line)
-	if strings.HasPrefix(line, "DATA:CUFF_PRESSURE=") {
-		valStr := strings.TrimPrefix(line, "DATA:CUFF_PRESSURE=")
+	// Normalize line: remove all spaces to handle "DATA: CUFF_PRESSURE" vs "DATA:CUFF_PRESSURE"
+	normalized := strings.ReplaceAll(line, " ", "")
+	normalized = strings.ToUpper(normalized) // Handle case insensitivity for prefixes/keys
+
+	if strings.HasPrefix(normalized, "DATA:CUFF_PRESSURE=") {
+		valStr := strings.TrimPrefix(normalized, "DATA:CUFF_PRESSURE=")
 		val, _ := strconv.Atoi(valStr)
 		return map[string]interface{}{
 			"type":          "cuff_update",
 			"cuff_pressure": val,
 		}, nil
-	} else if strings.HasPrefix(line, "DATA:NIBP_RESULT:") {
-		parts := strings.TrimPrefix(line, "DATA:NIBP_RESULT:")
-		// The output format has colons separating keys sometimes or mixed? 
-		// "DATA:NIBP_RESULT:SYS=110,DIA=70,MAP=85,PR=72,IRR=False"
-		// Our parseKV splits by comma, then by equals.
-		kv := parseKV(parts)
+	} else if strings.HasPrefix(normalized, "DATA:NIBP_RESULT:") {
+		partsStr := strings.TrimPrefix(normalized, "DATA:NIBP_RESULT:")
 		
-		// Add logging to debug if needed (or just rely on return)
-		// fmt.Printf("Debug NIBP Result: %v\n", kv)
+		// Custom parsing for the result to handle "MAP94" (missing =)
+		// Split by comma
+		parts := strings.Split(partsStr, ",")
+		resultMap := make(map[string]string)
+		
+		for _, p := range parts {
+			if strings.Contains(p, "=") {
+				kv := strings.SplitN(p, "=", 2)
+				if len(kv) == 2 {
+					resultMap[kv[0]] = kv[1]
+				}
+			} else {
+				// Handle cases like MAP94, PR65
+				if strings.HasPrefix(p, "MAP") {
+					resultMap["MAP"] = strings.TrimPrefix(p, "MAP")
+				} else if strings.HasPrefix(p, "PR") {
+					resultMap["PR"] = strings.TrimPrefix(p, "PR")
+				} else if strings.HasPrefix(p, "SYS") {
+					resultMap["SYS"] = strings.TrimPrefix(p, "SYS")
+				} else if strings.HasPrefix(p, "DIA") {
+					resultMap["DIA"] = strings.TrimPrefix(p, "DIA")
+				}
+			}
+		}
 
-		sys, _ := strconv.Atoi(kv["SYS"])
-		dia, _ := strconv.Atoi(kv["DIA"])
-		mean, _ := strconv.Atoi(kv["MAP"])
-		pr, _ := strconv.Atoi(kv["PR"])
-		irr := kv["IRR"] == "True" || kv["IRR"] == "true" // Check lowercase too
+		sys, _ := strconv.Atoi(resultMap["SYS"])
+		dia, _ := strconv.Atoi(resultMap["DIA"])
+		mean, _ := strconv.Atoi(resultMap["MAP"])
+		pr, _ := strconv.Atoi(resultMap["PR"])
+		
+		irrVal := resultMap["IRR"]
+		irr := irrVal == "TRUE" // We normalized to uppercase
 
 		return map[string]interface{}{
 			"type": "result",
@@ -197,12 +221,17 @@ func parseNIBPLine(line string) (interface{}, error) {
 			"pr":   pr,
 			"irr":  irr,
 		}, nil
-	} else if strings.HasPrefix(line, "STATUS:NIBP_ERROR=") {
-		codeStr := strings.TrimPrefix(line, "STATUS:NIBP_ERROR=")
+	} else if strings.HasPrefix(normalized, "STATUS:NIBP_ERROR=") {
+		codeStr := strings.TrimPrefix(normalized, "STATUS:NIBP_ERROR=")
 		code, _ := strconv.Atoi(codeStr)
 		return map[string]interface{}{
 			"type": "error",
 			"code": code,
+		}, nil
+	} else if strings.HasPrefix(normalized, "STATUS:NIBP_END") {
+		return map[string]interface{}{
+			"type": "status",
+			"msg":  "NIBP_END",
 		}, nil
 	}
 	return nil, nil
