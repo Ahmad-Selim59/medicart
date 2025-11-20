@@ -107,18 +107,13 @@ func runCLIAndStream(w http.ResponseWriter, r *http.Request, args []string, pars
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		line := scanner.Text()
-		log.Printf("Raw CLI output: %q", line) // Debug logging
-
 		data, err := parser(line)
 		if err != nil {
-			log.Printf("Parse error for line %q: %v", line, err)
 			continue 
 		}
 		
 		if data != nil {
-			log.Printf("Sending to client: %+v", data) // Debug logging
 			if err := ws.WriteJSON(data); err != nil {
-				log.Printf("Client write error: %v", err)
 				break
 			}
 		}
