@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Medicart WebSocket Test</title>
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 20px auto; padding: 0 20px; }
+        .card { border: 1px solid #ccc; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
+        button { padding: 8px 16px; cursor: pointer; margin-right: 10px; }
+        pre { background: #f4f4f4; padding: 10px; height: 150px; overflow-y: auto; border: 1px solid #eee; }
+        .status { font-weight: bold; margin-bottom: 10px; }
+        .connected { color: green; }
+        .disconnected { color: red; }
+    </style>
+</head>
+<body>
+    <h1>Medicart Device Test</h1>
+    <p>Open this file in your browser to test the WebSocket connections.</p>
+
+    <div class="card">
+        <h3>Heart Rate / SpO2</h3>
+        <div class="status" id="hr-status">Status: Disconnected</div>
+        <button onclick="connect('heartrate', 'hr-status', 'hr-log')">Start Stream</button>
+        <button onclick="disconnect('heartrate')">Stop Stream</button>
+        <pre id="hr-log"></pre>
+    </div>
+
+    <div class="card">
+        <h3>NIBP (Blood Pressure)</h3>
+        <div class="status" id="nibp-status">Status: Disconnected</div>
+        <button onclick="connect('nibp', 'nibp-status', 'nibp-log')">Start Stream</button>
+        <button onclick="disconnect('nibp')">Stop Stream</button>
+        <pre id="nibp-log"></pre>
+    </div>
+
+    <div class="card">
+        <h3>Glucose</h3>
+        <div class="status" id="glu-status">Status: Disconnected</div>
+        <button onclick="connect('glucose', 'glu-status', 'glu-log')">Start Stream</button>
+        <button onclick="disconnect('glucose')">Stop Stream</button>
+        <pre id="glu-log"></pre>
+    </div>
+
+    <div class="card">
+        <h3>Temperature</h3>
+        <div class="status" id="temp-status">Status: Disconnected</div>
+        <button onclick="connect('temperature', 'temp-status', 'temp-log')">Start Stream</button>
+        <button onclick="disconnect('temperature')">Stop Stream</button>
+        <pre id="temp-log"></pre>
+    </div>
+
+    <script>
+        const sockets = {};
+
+        function connect(endpoint, statusId, logId) {
+            if (sockets[endpoint]) {
+                sockets[endpoint].close();
+            }
+
+            const statusEl = document.getElementById(statusId);
+            const logEl = document.getElementById(logId);
+            logEl.textContent = "Connecting...\n";
+
+            // Change 'localhost' to your Windows machine's IP if accessing from another device
+            const ws = new WebSocket(`ws://localhost:8080/api/${endpoint}`);
+            sockets[endpoint] = ws;
+
+            ws.onopen = () => {
+                statusEl.textContent = "Status: Connected";
+                statusEl.className = "status connected";
+                log("Connected!");
+            };
+
+            ws.onmessage = (event) => {
+                // Pretty print the JSON data
+                try {
+                    const data = JSON.parse(event.data);
+                    log(JSON.stringify(data, null, 2));
+                } catch (e) {
+                    log(event.data);
+                }
+            };
+
+            ws.onclose = () => {
+                statusEl.textContent = "Status: Disconnected";
+                statusEl.className = "status disconnected";
+                log("Disconnected");
+                delete sockets[endpoint];
+            };
+
+            ws.onerror = (error) => {
+                log("Error: " + error);
+            };
+
+            function log(msg) {
+                logEl.textContent = msg + "\n" + logEl.textContent;
+            }
+        }
+
+        function disconnect(endpoint) {
+            if (sockets[endpoint]) {
+                sockets[endpoint].close();
+            }
+        }
+    </script>
+</body>
+</html>
+
