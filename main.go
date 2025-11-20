@@ -107,16 +107,18 @@ func runCLIAndStream(w http.ResponseWriter, r *http.Request, args []string, pars
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		line := scanner.Text()
+		log.Printf("Raw CLI output: %q", line) // Debug logging
+
 		data, err := parser(line)
 		if err != nil {
-			// Optional: Send parse errors or ignore them
+			log.Printf("Parse error for line %q: %v", line, err)
 			continue 
 		}
 		
-		// If parser returns nil, it means the line was ignored/irrelevant
 		if data != nil {
+			log.Printf("Sending to client: %+v", data) // Debug logging
 			if err := ws.WriteJSON(data); err != nil {
-				// Client likely disconnected
+				log.Printf("Client write error: %v", err)
 				break
 			}
 		}
@@ -166,9 +168,10 @@ func parseHeartRateLine(line string) (interface{}, error) {
 //        (Or variant: DATA:NIBP_RESULT:SYS=125,DIA=77,MAP94,PR65,IRR=FALSE)
 // Error: STATUS:NIBP_ERROR=5
 func parseNIBPLine(line string) (interface{}, error) {
-	// Normalize line: remove all spaces to handle "DATA: CUFF_PRESSURE" vs "DATA:CUFF_PRESSURE"
+	// Clean up the line: remove spaces and carriage returns
 	normalized := strings.ReplaceAll(line, " ", "")
-	normalized = strings.ToUpper(normalized) // Handle case insensitivity for prefixes/keys
+	normalized = strings.ReplaceAll(normalized, "\r", "")
+	normalized = strings.ToUpper(normalized)
 
 	if strings.HasPrefix(normalized, "DATA:CUFF_PRESSURE=") {
 		valStr := strings.TrimPrefix(normalized, "DATA:CUFF_PRESSURE=")
