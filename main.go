@@ -175,13 +175,19 @@ func parseNIBPLine(line string) (interface{}, error) {
 		}, nil
 	} else if strings.HasPrefix(line, "DATA:NIBP_RESULT:") {
 		parts := strings.TrimPrefix(line, "DATA:NIBP_RESULT:")
+		// The output format has colons separating keys sometimes or mixed? 
+		// "DATA:NIBP_RESULT:SYS=110,DIA=70,MAP=85,PR=72,IRR=False"
+		// Our parseKV splits by comma, then by equals.
 		kv := parseKV(parts)
 		
+		// Add logging to debug if needed (or just rely on return)
+		// fmt.Printf("Debug NIBP Result: %v\n", kv)
+
 		sys, _ := strconv.Atoi(kv["SYS"])
 		dia, _ := strconv.Atoi(kv["DIA"])
 		mean, _ := strconv.Atoi(kv["MAP"])
 		pr, _ := strconv.Atoi(kv["PR"])
-		irr := kv["IRR"] == "True"
+		irr := kv["IRR"] == "True" || kv["IRR"] == "true" // Check lowercase too
 
 		return map[string]interface{}{
 			"type": "result",
