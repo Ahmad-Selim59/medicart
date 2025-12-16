@@ -2,105 +2,213 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
-	"github.com/gorilla/websocket"
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true 
-	},
-}
-
-func main() {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "Medicart Server is running")
-	})
-
-	http.HandleFunc("/api/heartrate", handleHeartRate)
-	http.HandleFunc("/api/nibp", handleNIBP)
-	http.HandleFunc("/api/glucose", handleGlucose)
-	http.HandleFunc("/api/temperature", handleTemperature)
-
-	port := ":8080"
-	fmt.Printf("Server starting on port %s...\n", port)
-	if err := http.ListenAndServe(port, nil); err != nil {
-		log.Fatal(err)
-	}
-}
-
-
-func handleHeartRate(w http.ResponseWriter, r *http.Request) {
-	runCLIAndStream(w, r, []string{"-heartrate"}, parseHeartRateLine)
-}
-
-func handleNIBP(w http.ResponseWriter, r *http.Request) {
-	runCLIAndStream(w, r, []string{"-nibp"}, parseNIBPLine)
-}
-
-func handleGlucose(w http.ResponseWriter, r *http.Request) {
-	runCLIAndStream(w, r, []string{"-glu"}, parseGlucoseLine)
-}
-
-func handleTemperature(w http.ResponseWriter, r *http.Request) {
-	runCLIAndStream(w, r, []string{"-temperature"}, parseTemperatureLine)
-}
-
-// --- Core Streaming Logic ---
-
+// LineParser function signature
 type LineParser func(line string) (interface{}, error)
 
-func runCLIAndStream(w http.ResponseWriter, r *http.Request, args []string, parser LineParser) {
-	// Upgrade to WebSocket
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("Upgrade error: %v", err)
-		return
-	}
-	defer ws.Close()
+var (
+	currentCmd *exec.Cmd
+	cmdMutex   sync.Mutex
+	cancelFunc context.CancelFunc
+)
 
-	// Context for cancellation when client disconnects
-	// WebSocket CloseHandler doesn't automatically cancel a context, 
-	// so we'll listen for the close message or a write error.
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
+func main() {
+	myApp := app.New()
+	myWindow := myApp.NewWindow("Medicart Uploader")
 
-	// Handle client disconnects (ReadMessage will fail if client closes)
-	go func() {
-		for {
-			if _, _, err := ws.ReadMessage(); err != nil {
-				cancel()
-				return
+	// Theme Toggle
+	lightModeCheck := widget.NewCheck("Light Mode", func(checked bool) {
+		if checked {
+			myApp.Settings().SetTheme(theme.LightTheme())
+		} else {
+			myApp.Settings().SetTheme(theme.DarkTheme())
+		}
+	})
+
+	// URL Input
+	urlLabel := widget.NewLabel("Web Server URL:")
+	urlEntry := widget.NewEntry()
+	urlEntry.SetPlaceHolder("http://your-server.com/api/ingest")
+	urlEntry.Text = "http://localhost:8080/api/data" // Default for testing
+
+	// Patient Name Input
+	patientNameLabel := widget.NewLabel("Patient Name:")
+	patientNameEntry := widget.NewEntry()
+	patientNameEntry.SetPlaceHolder("Enter patient name")
+
+	// Status Area
+	statusLabel := widget.NewRichTextFromMarkdown("Status: Idle")
+	logArea := widget.NewMultiLineEntry()
+	logArea.Disable()
+	logArea.SetMinRowsVisible(10)
+
+	log := func(msg string) {
+		timestamp := time.Now().Format("15:04:05")
+		logArea.SetText(fmt.Sprintf("[%s] %s\n%s", timestamp, msg, logArea.Text))
+		
+		statusText := "Status: " + msg
+		isError := strings.HasPrefix(msg, "Error") || strings.Contains(strings.ToLower(msg), "error")
+		
+		if isError {
+			statusLabel.Segments = []widget.RichTextSegment{
+				&widget.TextSegment{
+					Text: statusText,
+					Style: widget.RichTextStyle{
+						ColorName: theme.ColorNameError,
+						Inline:    true,
+						TextStyle: fyne.TextStyle{Bold: true},
+					},
+				},
+			}
+		} else {
+			statusLabel.Segments = []widget.RichTextSegment{
+				&widget.TextSegment{
+					Text: statusText,
+					Style: widget.RichTextStyle{
+						ColorName: theme.ColorNameForeground,
+						Inline:    true,
+					},
+				},
 			}
 		}
+		statusLabel.Refresh()
+	}
+
+	// Action Buttons
+	var stopBtn *widget.Button
+
+	startProcess := func(name string, args []string, parser LineParser) {
+		cmdMutex.Lock()
+		if currentCmd != nil {
+			cmdMutex.Unlock()
+			log("Error: A process is already running. Stop it first.")
+			return
+		}
+		cmdMutex.Unlock()
+
+		targetURL := urlEntry.Text
+		if targetURL == "" {
+			log("Error: Please enter a Web Server URL")
+			return
+		}
+
+		patientName := patientNameEntry.Text
+		if patientName == "" {
+			log("Error: Please enter a Patient Name")
+			return
+		}
+
+		stopBtn.Enable()
+		go runCLIAndSend(name, args, parser, targetURL, patientName, log, func() {
+			stopBtn.Disable()
+		})
+	}
+
+	stopBtn = widget.NewButton("Stop", func() {
+		cmdMutex.Lock()
+		defer cmdMutex.Unlock()
+		if cancelFunc != nil {
+			cancelFunc() // Cancel the context
+			log("Stopping process...")
+		}
+	})
+	stopBtn.Disable()
+
+	btnHeartRate := widget.NewButton("Start Heart Rate / SpO2", func() {
+		startProcess("HeartRate", []string{"-heartrate"}, parseHeartRateLine)
+	})
+
+	btnNIBP := widget.NewButton("Start NIBP", func() {
+		startProcess("NIBP", []string{"-nibp"}, parseNIBPLine)
+	})
+
+	btnGlucose := widget.NewButton("Start Glucose", func() {
+		startProcess("Glucose", []string{"-glu"}, parseGlucoseLine)
+	})
+
+	btnTemp := widget.NewButton("Start Temperature", func() {
+		startProcess("Temperature", []string{"-temperature"}, parseTemperatureLine)
+	})
+
+	// Layout
+	content := container.NewVBox(
+		lightModeCheck,
+		urlLabel,
+		urlEntry,
+		patientNameLabel,
+		patientNameEntry,
+		widget.NewSeparator(),
+		widget.NewLabel("Select Sensor to Monitor:"),
+		btnHeartRate,
+		btnNIBP,
+		btnGlucose,
+		btnTemp,
+		widget.NewSeparator(),
+		stopBtn,
+		widget.NewSeparator(),
+		statusLabel,
+		logArea,
+	)
+
+	myWindow.SetContent(content)
+	myWindow.Resize(fyne.NewSize(400, 600))
+	myWindow.ShowAndRun()
+}
+
+func runCLIAndSend(name string, args []string, parser LineParser, targetURL string, patientName string, log func(string), onFinish func()) {
+	defer onFinish()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	cmdMutex.Lock()
+	cancelFunc = cancel
+	cmdMutex.Unlock()
+
+	defer func() {
+		cmdMutex.Lock()
+		currentCmd = nil
+		cancelFunc = nil
+		cmdMutex.Unlock()
 	}()
 
-	// Prepare command
-	// We assume lepu_cli.exe is in the PATH or current directory
-	// For local dev on macOS/Linux, we might need ./ prefix if it's in CWD
 	cmdPath := "lepu_cli.exe"
 	if _, err := exec.LookPath(cmdPath); err != nil {
-		// Not in path, try current directory
 		cmdPath = "./lepu_cli.exe"
 	}
+	
+	log(fmt.Sprintf("Starting %s (%s)...", name, cmdPath))
+
 	cmd := exec.CommandContext(ctx, cmdPath, args...)
 	
-	// Stdout pipe
+	cmdMutex.Lock()
+	currentCmd = cmd
+	cmdMutex.Unlock()
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		ws.WriteJSON(map[string]string{"type": "error", "message": "Failed to get stdout pipe"})
+		log(fmt.Sprintf("Error creating stdout pipe: %v", err))
 		return
 	}
 
 	if err := cmd.Start(); err != nil {
-		ws.WriteJSON(map[string]string{"type": "error", "message": "Failed to start process: " + err.Error()})
+		log(fmt.Sprintf("Error starting process: %v", err))
 		return
 	}
 
@@ -109,24 +217,54 @@ func runCLIAndStream(w http.ResponseWriter, r *http.Request, args []string, pars
 		line := scanner.Text()
 		data, err := parser(line)
 		if err != nil {
-			continue 
+			// Parser error usually means skip
+			continue
 		}
-		
+
 		if data != nil {
-			if err := ws.WriteJSON(data); err != nil {
-				break
+			// Inject Patient Name
+			if dataMap, ok := data.(map[string]interface{}); ok {
+				dataMap["patient_name"] = patientName
+			}
+
+			// Send to server
+			log(fmt.Sprintf("Sending data: %v", data))
+			if err := sendData(targetURL, data); err != nil {
+				log(fmt.Sprintf("Error sending data: %v", err))
 			}
 		}
 	}
 
-	// Clean up
 	if err := cmd.Wait(); err != nil {
-		// Process might have been killed by context, which is expected on disconnect
-		log.Printf("Process finished with: %v", err)
+		if ctx.Err() == context.Canceled {
+			log("Process stopped by user.")
+		} else {
+			log(fmt.Sprintf("Process finished with error: %v", err))
+		}
+	} else {
+		log("Process finished successfully.")
 	}
 }
 
-// --- Parsers ---
+func sendData(url string, data interface{}) error {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("server returned status: %s", resp.Status)
+	}
+	return nil
+}
+
+// --- Parsers (Copied from legacy/main.go) ---
 
 // Heart Rate / SpO2
 // Output: DATA:PR=75,SPO2=98
@@ -134,7 +272,6 @@ func runCLIAndStream(w http.ResponseWriter, r *http.Request, args []string, pars
 func parseHeartRateLine(line string) (interface{}, error) {
 	line = strings.TrimSpace(line)
 	if strings.HasPrefix(line, "DATA:") {
-		// DATA:PR=75,SPO2=98
 		parts := strings.TrimPrefix(line, "DATA:")
 		kv := parseKV(parts)
 		
@@ -147,7 +284,6 @@ func parseHeartRateLine(line string) (interface{}, error) {
 			"spo2": spo2,
 		}, nil
 	} else if strings.HasPrefix(line, "STATUS:") {
-		// STATUS:PROBE_OFF
 		status := strings.TrimPrefix(line, "STATUS:")
 		return map[string]interface{}{
 			"type": "status",
@@ -158,12 +294,7 @@ func parseHeartRateLine(line string) (interface{}, error) {
 }
 
 // NIBP
-// Live: DATA:CUFF_PRESSURE=120
-// Result: DATA:NIBP_RESULT:SYS=110,DIA=70,MAP=85,PR=72,IRR=False
-//        (Or variant: DATA:NIBP_RESULT:SYS=125,DIA=77,MAP94,PR65,IRR=FALSE)
-// Error: STATUS:NIBP_ERROR=5
 func parseNIBPLine(line string) (interface{}, error) {
-	// Clean up the line: remove spaces and carriage returns
 	normalized := strings.ReplaceAll(line, " ", "")
 	normalized = strings.ReplaceAll(normalized, "\r", "")
 	normalized = strings.ToUpper(normalized)
@@ -177,9 +308,6 @@ func parseNIBPLine(line string) (interface{}, error) {
 		}, nil
 	} else if strings.HasPrefix(normalized, "DATA:NIBP_RESULT:") {
 		partsStr := strings.TrimPrefix(normalized, "DATA:NIBP_RESULT:")
-		
-		// Custom parsing for the result to handle "MAP94" (missing =)
-		// Split by comma
 		parts := strings.Split(partsStr, ",")
 		resultMap := make(map[string]string)
 		
@@ -190,7 +318,6 @@ func parseNIBPLine(line string) (interface{}, error) {
 					resultMap[kv[0]] = kv[1]
 				}
 			} else {
-				// Handle cases like MAP94, PR65
 				if strings.HasPrefix(p, "MAP") {
 					resultMap["MAP"] = strings.TrimPrefix(p, "MAP")
 				} else if strings.HasPrefix(p, "PR") {
@@ -209,7 +336,7 @@ func parseNIBPLine(line string) (interface{}, error) {
 		pr, _ := strconv.Atoi(resultMap["PR"])
 		
 		irrVal := resultMap["IRR"]
-		irr := irrVal == "TRUE" // We normalized to uppercase
+		irr := irrVal == "TRUE"
 
 		return map[string]interface{}{
 			"type": "result",
@@ -236,7 +363,6 @@ func parseNIBPLine(line string) (interface{}, error) {
 }
 
 // Glucose
-// Output: DATA:GLU=105
 func parseGlucoseLine(line string) (interface{}, error) {
 	line = strings.TrimSpace(line)
 	if strings.HasPrefix(line, "DATA:GLU=") {
@@ -251,7 +377,6 @@ func parseGlucoseLine(line string) (interface{}, error) {
 }
 
 // Temperature
-// Output: DATA:TEMP=36.5
 func parseTemperatureLine(line string) (interface{}, error) {
 	line = strings.TrimSpace(line)
 	if strings.HasPrefix(line, "DATA:TEMP=") {
@@ -268,8 +393,6 @@ func parseTemperatureLine(line string) (interface{}, error) {
 	return nil, nil
 }
 
-// Helper to parse comma-separated Key=Value pairs
-// e.g., "PR=75,SPO2=98" -> map[PR:75 SPO2:98]
 func parseKV(input string) map[string]string {
 	result := make(map[string]string)
 	pairs := strings.Split(input, ",")
