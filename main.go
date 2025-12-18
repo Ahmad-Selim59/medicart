@@ -59,18 +59,8 @@ func main() {
 	logArea.Disable()
 	logArea.SetMinRowsVisible(10)
 
-	runOnMain := func(f func()) {
-		if drv := fyne.CurrentApp().Driver(); drv != nil {
-			if r, ok := drv.(interface{ RunOnMain(func()) }); ok {
-				r.RunOnMain(f)
-				return
-			}
-		}
-		f() 
-	}
-
 	log := func(msg string) {
-		runOnMain(func() {
+		fyne.Do(func() {
 			timestamp := time.Now().Format("15:04:05")
 			logArea.SetText(fmt.Sprintf("[%s] %s\n%s", timestamp, msg, logArea.Text))
 
@@ -129,7 +119,9 @@ func main() {
 
 		stopBtn.Enable()
 		go runCLIAndSend(name, args, parser, targetURL, patientName, log, func() {
-			stopBtn.Disable()
+			fyne.Do(func() {
+				stopBtn.Disable()
+			})
 		})
 	}
 
