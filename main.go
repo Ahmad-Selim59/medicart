@@ -59,36 +59,48 @@ func main() {
 	logArea.Disable()
 	logArea.SetMinRowsVisible(10)
 
-	log := func(msg string) {
-		timestamp := time.Now().Format("15:04:05")
-		logArea.SetText(fmt.Sprintf("[%s] %s\n%s", timestamp, msg, logArea.Text))
-		
-		statusText := "Status: " + msg
-		isError := strings.HasPrefix(msg, "Error") || strings.Contains(strings.ToLower(msg), "error")
-		
-		if isError {
-			statusLabel.Segments = []widget.RichTextSegment{
-				&widget.TextSegment{
-					Text: statusText,
-					Style: widget.RichTextStyle{
-						ColorName: theme.ColorNameError,
-						Inline:    true,
-						TextStyle: fyne.TextStyle{Bold: true},
-					},
-				},
-			}
-		} else {
-			statusLabel.Segments = []widget.RichTextSegment{
-				&widget.TextSegment{
-					Text: statusText,
-					Style: widget.RichTextStyle{
-						ColorName: theme.ColorNameForeground,
-						Inline:    true,
-					},
-				},
+	runOnMain := func(f func()) {
+		if drv := fyne.CurrentApp().Driver(); drv != nil {
+			if r, ok := drv.(interface{ RunOnMain(func()) }); ok {
+				r.RunOnMain(f)
+				return
 			}
 		}
-		statusLabel.Refresh()
+		f() 
+	}
+
+	log := func(msg string) {
+		runOnMain(func() {
+			timestamp := time.Now().Format("15:04:05")
+			logArea.SetText(fmt.Sprintf("[%s] %s\n%s", timestamp, msg, logArea.Text))
+
+			statusText := "Status: " + msg
+			isError := strings.HasPrefix(msg, "Error") || strings.Contains(strings.ToLower(msg), "error")
+
+			if isError {
+				statusLabel.Segments = []widget.RichTextSegment{
+					&widget.TextSegment{
+						Text: statusText,
+						Style: widget.RichTextStyle{
+							ColorName: theme.ColorNameError,
+							Inline:    true,
+							TextStyle: fyne.TextStyle{Bold: true},
+						},
+					},
+				}
+			} else {
+				statusLabel.Segments = []widget.RichTextSegment{
+					&widget.TextSegment{
+						Text: statusText,
+						Style: widget.RichTextStyle{
+							ColorName: theme.ColorNameForeground,
+							Inline:    true,
+						},
+					},
+				}
+			}
+			statusLabel.Refresh()
+		})
 	}
 
 	// Action Buttons
