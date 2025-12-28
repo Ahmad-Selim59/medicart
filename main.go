@@ -250,7 +250,6 @@ func main() {
 		go func() {
 			ticker := time.NewTicker(1 * time.Second)
 			defer ticker.Stop()
-			failCount := 0
 			for {
 				select {
 				case <-ctx.Done():
@@ -259,14 +258,8 @@ func main() {
 					img, err := captureSnapshot(ctx, device)
 					if err != nil {
 						log(fmt.Sprintf("Error capturing frame: %v", err))
-						failCount++
-						if failCount >= 3 {
-							stopPreviewInternal("Camera preview stopped after repeated capture errors")
-							return
-						}
 						continue
 					}
-					failCount = 0
 					fyne.Do(func() {
 						previewImage.Image = img
 						previewImage.Refresh()
