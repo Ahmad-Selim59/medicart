@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"net/http"
 	"os/exec"
 	"strconv"
@@ -15,6 +17,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -27,6 +30,8 @@ var (
 	currentCmd *exec.Cmd
 	cmdMutex   sync.Mutex
 	cancelFunc context.CancelFunc
+	previewMu  sync.Mutex
+	previewCancel context.CancelFunc
 )
 
 func main() {
@@ -58,6 +63,17 @@ func main() {
 	logArea := widget.NewMultiLineEntry()
 	logArea.Disable()
 	logArea.SetMinRowsVisible(10)
+
+	// Camera Device Input (for ffmpeg dshow)
+	cameraLabel := widget.NewLabel("Camera Device (dshow name):")
+	cameraEntry := widget.NewEntry()
+	cameraEntry.SetPlaceHolder(`video="Integrated Camera"`)
+	cameraEntry.SetText(`video="Integrated Camera"`)
+
+	// Camera Preview
+	previewImage := canvas.NewImageFromImage(nil)
+	previewImage.FillMode = canvas.ImageFillContain
+	previewImage.SetMinSize(fyne.NewSize(320, 240))
 
 	log := func(msg string) {
 		fyne.Do(func() {
@@ -198,6 +214,60 @@ func main() {
 		runCameraCommand("move-down", []string{"-move-down"})
 	})
 
+
+	startPreview := func() {
+		device := strings.TrimSpace(cameraEntry.Text)
+		if device == "" {
+			log("Error: Enter camera device name (dshow, e.g. video=\"Integrated Camera\")")
+			return
+		}
+
+		previewMu.Lock()
+		if previewCancel != nil {
+			previewMu.Unlock()
+			log("Error: Preview already running")
+			return
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		previewCancel = cancel
+		previewMu.Unlock()
+
+		log(fmt.Sprintf("Starting camera preview for %s", device))
+
+		go func() {
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					img, err := captureSnapshot(ctx, device)
+					if err != nil {
+						log(fmt.Sprintf("Error capturing frame: %v", err))
+						continue
+					}
+					fyne.Do(func() {
+						previewImage.Image = img
+						previewImage.Refresh()
+					})
+				}
+			}
+		}()
+	}
+
+	stopPreview := func() {
+		previewMu.Lock()
+		if previewCancel != nil {
+			previewCancel()
+			previewCancel = nil
+			log("Camera preview stopped")
+		}
+		previewMu.Unlock()
+	}
+
+	btnPreviewStart := widget.NewButton("Start Preview", startPreview)
+	btnPreviewStop := widget.NewButton("Stop Preview", stopPreview)
 	// Layout
 	content := container.NewVBox(
 		lightModeCheck,
@@ -213,11 +283,15 @@ func main() {
 		btnTemp,
 		widget.NewSeparator(),
 		widget.NewLabel("Camera Controls:"),
+		cameraLabel,
+		cameraEntry,
 		btnCamList,
 		btnCamLeft,
 		btnCamRight,
 		btnCamUp,
 		btnCamDown,
+		container.NewHBox(btnPreviewStart, btnPreviewStop),
+		previewImage,
 		widget.NewSeparator(),
 		stopBtn,
 		widget.NewSeparator(),
@@ -320,6 +394,33 @@ func sendData(url string, data interface{}) error {
 		return fmt.Errorf("server returned status: %s", resp.Status)
 	}
 	return nil
+}
+
+// captureSnapshot uses ffmpeg (dshow) to grab a single JPEG frame from the given device name.
+func captureSnapshot(ctx context.Context, device string) (image.Image, error) {
+	// Example device string: video="Integrated Camera"
+	args := []string{
+		"-f", "dshow",
+		"-i", device,
+		"-vframes", "1",
+		"-f", "mjpeg",
+		"-",
+	}
+
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("ffmpeg run error: %v (%s)", err, strings.TrimSpace(stderr.String()))
+	}
+
+	img, err := jpeg.Decode(bytes.NewReader(stdout.Bytes()))
+	if err != nil {
+		return nil, fmt.Errorf("decode jpeg error: %v", err)
+	}
+	return img, nil
 }
 
 // --- Parsers (Copied from legacy/main.go) ---
