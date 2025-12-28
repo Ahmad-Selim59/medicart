@@ -151,6 +151,53 @@ func main() {
 		startProcess("Temperature", []string{"-temperature"}, parseTemperatureLine)
 	})
 
+	runCameraCommand := func(action string, args []string) {
+		go func() {
+			log(fmt.Sprintf("Camera: %s ...", action))
+
+			cmdPath := "camera_cli.exe"
+			if _, err := exec.LookPath(cmdPath); err != nil {
+				cmdPath = "./camera_cli.exe"
+			}
+
+			cmd := exec.Command(cmdPath, args...)
+			outputBytes, err := cmd.CombinedOutput()
+			output := strings.TrimSpace(string(outputBytes))
+
+			if output != "" {
+				log(fmt.Sprintf("Camera output: %s", output))
+			}
+			if err != nil {
+				log(fmt.Sprintf("Error running camera %s: %v", action, err))
+				return
+			}
+
+			upper := strings.ToUpper(output)
+			if strings.HasPrefix(upper, "DATA:ERROR") {
+				log(fmt.Sprintf("Camera %s reported error: %s", action, output))
+				return
+			}
+
+			log(fmt.Sprintf("Camera %s completed", action))
+		}()
+	}
+
+	btnCamList := widget.NewButton("List Cameras", func() {
+		runCameraCommand("list", []string{"-list"})
+	})
+	btnCamLeft := widget.NewButton("Move Left", func() {
+		runCameraCommand("move-left", []string{"-move-left"})
+	})
+	btnCamRight := widget.NewButton("Move Right", func() {
+		runCameraCommand("move-right", []string{"-move-right"})
+	})
+	btnCamUp := widget.NewButton("Move Up", func() {
+		runCameraCommand("move-up", []string{"-move-up"})
+	})
+	btnCamDown := widget.NewButton("Move Down", func() {
+		runCameraCommand("move-down", []string{"-move-down"})
+	})
+
 	// Layout
 	content := container.NewVBox(
 		lightModeCheck,
@@ -164,6 +211,13 @@ func main() {
 		btnNIBP,
 		btnGlucose,
 		btnTemp,
+		widget.NewSeparator(),
+		widget.NewLabel("Camera Controls:"),
+		btnCamList,
+		btnCamLeft,
+		btnCamRight,
+		btnCamUp,
+		btnCamDown,
 		widget.NewSeparator(),
 		stopBtn,
 		widget.NewSeparator(),
