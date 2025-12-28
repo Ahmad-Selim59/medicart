@@ -231,8 +231,13 @@ func main() {
 	startPreview := func() {
 		device := strings.TrimSpace(cameraEntry.Text)
 		if device == "" {
-			log("Error: Enter camera device name (dshow, e.g. video=\"Integrated Camera\")")
-			return
+			if autoDevice, err := detectDefaultCameraDevice(); err == nil && autoDevice != "" {
+				device = autoDevice
+				log(fmt.Sprintf("Using detected camera: %s", device))
+			} else {
+				log("Error: No camera device found. Set a device name (e.g. video=\"Integrated Camera\")")
+				return
+			}
 		}
 
 		previewMu.Lock()
@@ -428,6 +433,33 @@ func captureSnapshot(ctx context.Context, device string) (image.Image, error) {
 		return nil, fmt.Errorf("decode jpeg error: %v", err)
 	}
 	return img, nil
+}
+
+// detectDefaultCameraDevice tries to find the first dshow video device via ffmpeg -list_devices.
+func detectDefaultCameraDevice() (string, error) {
+	cmd := exec.Command("ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy")
+	var stderr bytes.Buffer
+	cmd.Stdout = &stderr // ffmpeg prints device list to stderr; stdout unused
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		// Listing devices returns an error exit code; that's fine as long as we get output.
+	}
+	lines := strings.Split(stderr.String(), "\n")
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		// Match lines like: [dshow @ ...] "USB3.0 FULL HD PTZ" (video)
+		if strings.Contains(ln, "(video)") && strings.Count(ln, "\"") >= 2 {
+			start := strings.Index(ln, "\"")
+			end := strings.LastIndex(ln, "\"")
+			if start >= 0 && end > start {
+				name := ln[start+1 : end]
+				if name != "" {
+					return fmt.Sprintf(`video="%s"`, name), nil
+				}
+			}
+		}
+	}
+	return "", fmt.Errorf("no video devices found")
 }
 
 // --- Parsers (Copied from legacy/main.go) ---
