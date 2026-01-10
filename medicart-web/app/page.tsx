@@ -47,7 +47,8 @@ export default function Home() {
 
   async function loadClinics() {
     try {
-      const res = await fetch(`${API_BASE}/clinics`);
+      const base = (API_BASE || "").replace(/\/$/, "");
+      const res = await fetch(`${base}/api/clinics`);
       const json = await res.json();
       setClinics(Array.isArray(json) ? json : []);
     } catch {
