@@ -440,8 +440,6 @@ func buildFFmpegArgsForSnapshot(device string) []string {
 		device = normalizeWindowsDeviceName(device)
 		return []string{
 			"-f", "dshow",
-			"-framerate", "30",
-			"-video_size", "1920x1080",
 			"-i", device,
 			"-vframes", "1",
 			"-f", "mjpeg",
