@@ -47,6 +47,7 @@ func main() {
 	http.HandleFunc("/api/feed/start", handleFeedStart)
 	http.HandleFunc("/api/feed/stop", handleFeedStop)
 	http.HandleFunc("/api/clinics", handleClinics)
+	http.HandleFunc("/clinics", handleClinics) // simple alias
 	http.HandleFunc("/api/clinic/", handleClinicRoutes)
 
 	port := ":8081"

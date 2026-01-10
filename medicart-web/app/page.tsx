@@ -22,7 +22,7 @@ export default function Home() {
   const [loadingPatients, setLoadingPatients] = useState(false);
   const [loadingData, setLoadingData] = useState(false);
 
-  const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
+  const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8081";
 
   useEffect(() => {
     loadClinics();
