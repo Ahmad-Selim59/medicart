@@ -533,18 +533,13 @@ func normalizeWindowsDeviceName(device string) string {
 	if d == "" {
 		return d
 	}
-	lower := strings.ToLower(d)
-	if strings.HasPrefix(lower, "video=") {
-		// Ensure exactly one pair of quotes after video=
-		parts := strings.SplitN(d, "=", 2)
-		if len(parts) == 2 {
-			name := strings.Trim(parts[1], `"`)
-			return fmt.Sprintf(`video="%s"`, name)
-		}
-		return d
+	// Remove leading video= if present, and strip any quotes.
+	if strings.HasPrefix(strings.ToLower(d), "video=") {
+		d = d[len("video="):]
 	}
-	// If user typed just the name, wrap it.
-	return fmt.Sprintf(`video="%s"`, strings.Trim(d, `"`))
+	name := strings.Trim(d, `"`)
+	// For exec.Command we do NOT need quotes; they are only for shell protection.
+	return "video=" + name
 }
 
 
