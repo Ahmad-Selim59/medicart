@@ -423,36 +423,6 @@ func captureSnapshot(ctx context.Context, device string) (image.Image, error) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		// On Windows, try a couple of fallback device strings if dshow can't find the device.
-		if runtime.GOOS == "windows" {
-			fallbacks := buildWindowsDeviceVariants(device)
-			var errs []string
-			for _, dev := range fallbacks {
-				argsAlt := buildFFmpegArgsForSnapshot(dev)
-				if strings.Join(argsAlt, " ") == strings.Join(args, " ") {
-					continue // same as primary
-				}
-				logCmdAlt := strings.Join(append([]string{"ffmpeg"}, argsAlt...), " ")
-				fmt.Printf("ffmpeg fallback command: %s\n", logCmdAlt)
-
-				var outAlt, errAltBuf bytes.Buffer
-				cmdAlt := exec.CommandContext(ctx, "ffmpeg", argsAlt...)
-				cmdAlt.Stdout = &outAlt
-				cmdAlt.Stderr = &errAltBuf
-				if errAlt := cmdAlt.Run(); errAlt == nil {
-					img, decErr := jpeg.Decode(bytes.NewReader(outAlt.Bytes()))
-					if decErr == nil {
-						return img, nil
-					}
-					errs = append(errs, fmt.Sprintf("fallback decode error: %v", decErr))
-					continue
-				} else {
-					errs = append(errs, fmt.Sprintf("fallback failed (%s): %s", dev, strings.TrimSpace(errAltBuf.String())))
-				}
-			}
-			return nil, fmt.Errorf("ffmpeg run error: %v (%s); fallbacks: %s", err, strings.TrimSpace(stderr.String()), strings.Join(errs, " | "))
-		}
-
 		return nil, fmt.Errorf("ffmpeg run error: %v (%s)", err, strings.TrimSpace(stderr.String()))
 	}
 
@@ -577,37 +547,6 @@ func normalizeWindowsDeviceName(device string) string {
 	return fmt.Sprintf(`video="%s"`, strings.Trim(d, `"`))
 }
 
-// buildWindowsDeviceVariants tries a few device name formats for dshow.
-func buildWindowsDeviceVariants(device string) []string {
-	var variants []string
-	norm := normalizeWindowsDeviceName(device)
-	raw := strings.TrimSpace(device)
-	nameOnly := strings.Trim(raw, `"`)
-	withVideoNoQuotes := fmt.Sprintf("video=%s", nameOnly)
-	withVideoQuotes := fmt.Sprintf(`video="%s"`, nameOnly)
-
-	var add = func(s string) {
-		if s != "" {
-			variants = append(variants, s)
-		}
-	}
-
-	add(norm)
-	add(raw)
-	add(withVideoQuotes)
-	add(withVideoNoQuotes)
-
-	// de-duplicate
-	seen := make(map[string]bool)
-	var uniq []string
-	for _, v := range variants {
-		if !seen[v] {
-			seen[v] = true
-			uniq = append(uniq, v)
-		}
-	}
-	return uniq
-}
 
 // --- Parsers (Copied from legacy/main.go) ---
 
