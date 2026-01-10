@@ -99,7 +99,6 @@ func main() {
 
 	// Buttons that may need refresh on redraw glitches
 	refreshButtons := []*widget.Button{}
-	buttonTexts := map[*widget.Button]string{}
 
 	log := func(msg string) {
 		fyne.Do(func() {
@@ -136,9 +135,6 @@ func main() {
 			// Force redraw of buttons if they visually glitch
 			for _, b := range refreshButtons {
 				if b != nil {
-					if t, ok := buttonTexts[b]; ok {
-						b.SetText(t)
-					}
 					b.Refresh()
 				}
 			}
@@ -313,23 +309,25 @@ func main() {
 						log(fmt.Sprintf("Error capturing frame: %v", err))
 						continue
 					}
-					fyne.Do(func() {
-						// Apply vertical flip if enabled
-						if previewImageFlip {
-							b := img.Bounds()
-							flipped := image.NewRGBA(b)
-							h := b.Dy()
-							for y := 0; y < h; y++ {
-								for x := b.Min.X; x < b.Max.X; x++ {
-									flipped.Set(x, b.Min.Y+(h-1)-(y-b.Min.Y), img.At(x, y+b.Min.Y))
+					// Avoid re-entering render loop while UI might be mid-refresh.
+					go func(img image.Image, flip bool) {
+						fyne.Do(func() {
+							if flip {
+								b := img.Bounds()
+								flipped := image.NewRGBA(b)
+								h := b.Dy()
+								for y := 0; y < h; y++ {
+									for x := b.Min.X; x < b.Max.X; x++ {
+										flipped.Set(x, b.Min.Y+(h-1)-(y-b.Min.Y), img.At(x, y+b.Min.Y))
+									}
 								}
+								previewImage.Image = flipped
+							} else {
+								previewImage.Image = img
 							}
-							previewImage.Image = flipped
-						} else {
-							previewImage.Image = img
-						}
-						previewImage.Refresh()
-					})
+							previewImage.Refresh()
+						})
+					}(img, previewImageFlip)
 				}
 			}
 		}()
@@ -409,24 +407,26 @@ func main() {
 						log(fmt.Sprintf("Error capturing frame: %v", err))
 						continue
 					}
-					var buf bytes.Buffer
-					if err := jpeg.Encode(&buf, img, nil); err != nil {
-						log(fmt.Sprintf("Encode error: %v", err))
-						continue
-					}
-					wsMu.Lock()
-					c := wsConn
-					wsMu.Unlock()
-					if c == nil {
-						log("WS disconnected during stream")
-						stopStreaming()
-						return
-					}
-					if err := c.WriteMessage(websocket.BinaryMessage, buf.Bytes()); err != nil {
-						log(fmt.Sprintf("WS send error: %v", err))
-						stopStreaming()
-						return
-					}
+					go func(img image.Image) {
+						var buf bytes.Buffer
+						if err := jpeg.Encode(&buf, img, nil); err != nil {
+							log(fmt.Sprintf("Encode error: %v", err))
+							return
+						}
+						wsMu.Lock()
+						c := wsConn
+						wsMu.Unlock()
+						if c == nil {
+							log("WS disconnected during stream")
+							stopStreaming()
+							return
+						}
+						if err := c.WriteMessage(websocket.BinaryMessage, buf.Bytes()); err != nil {
+							log(fmt.Sprintf("WS send error: %v", err))
+							stopStreaming()
+							return
+						}
+					}(img)
 				}
 			}
 		}()
@@ -530,11 +530,6 @@ func main() {
 		btnPreviewStart, btnPreviewStop,
 		wsConnectBtn, wsDisconnectBtn,
 		advancedBtn,
-	}
-	for _, b := range refreshButtons {
-		if b != nil {
-			buttonTexts[b] = b.Text
-		}
 	}
 	// Layout
 	mainContent := container.NewVBox(
