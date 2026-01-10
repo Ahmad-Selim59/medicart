@@ -433,8 +433,11 @@ func buildFFmpegArgsForSnapshot(device string) []string {
 	// Select correct input driver per OS
 	if runtime.GOOS == "windows" {
 		// dshow expects video="Device Name"
+		device = normalizeWindowsDeviceName(device)
 		return []string{
 			"-f", "dshow",
+			"-framerate", "30",
+			"-video_size", "1920x1080",
 			"-i", device,
 			"-vframes", "1",
 			"-f", "mjpeg",
@@ -520,6 +523,26 @@ func detectDefaultCameraDevice() (string, error) {
 	}
 
 	return "", fmt.Errorf("auto-detect not supported on this OS")
+}
+
+// normalizeWindowsDeviceName ensures dshow format video="Name" without double-wrapping quotes.
+func normalizeWindowsDeviceName(device string) string {
+	d := strings.TrimSpace(device)
+	if d == "" {
+		return d
+	}
+	lower := strings.ToLower(d)
+	if strings.HasPrefix(lower, "video=") {
+		// Ensure exactly one pair of quotes after video=
+		parts := strings.SplitN(d, "=", 2)
+		if len(parts) == 2 {
+			name := strings.Trim(parts[1], `"`)
+			return fmt.Sprintf(`video="%s"`, name)
+		}
+		return d
+	}
+	// If user typed just the name, wrap it.
+	return fmt.Sprintf(`video="%s"`, strings.Trim(d, `"`))
 }
 
 // --- Parsers (Copied from legacy/main.go) ---
