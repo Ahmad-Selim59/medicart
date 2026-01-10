@@ -96,21 +96,30 @@ export default function Home() {
     disconnectStream();
     const base = (API_BASE || "").replace(/\/$/, "");
     const httpUrl = `${base}/ws/stream?clinic=${encodeURIComponent(c)}&patient=${encodeURIComponent(p)}`;
-    const wsUrl = httpUrl.replace(/^http/, "ws");
+    const wsUrl = httpUrl.startsWith("ws") ? httpUrl : httpUrl.replace(/^http/, "ws");
     const sock = new WebSocket(wsUrl);
     sock.binaryType = "arraybuffer";
-    sock.onopen = () => setCamStatus("Connected to stream");
-    sock.onclose = () => {
+    sock.onopen = () => {
+      setCamStatus(`Connected to stream (${wsUrl})`);
+      console.info("WS open", wsUrl);
+    };
+    sock.onclose = (ev) => {
       setCamStatus("Stream disconnected");
       setWs(null);
+      console.info("WS closed", ev);
     };
-    sock.onerror = () => setCamStatus("Stream error");
+    sock.onerror = (ev) => {
+      setCamStatus("Stream error");
+      console.error("WS error", ev);
+    };
     sock.onmessage = (ev) => {
       if (ev.data instanceof ArrayBuffer) {
         const blob = new Blob([ev.data], { type: "image/jpeg" });
         const urlObj = URL.createObjectURL(blob);
         setCamSrc(urlObj);
         setCamStatus("Streaming");
+      } else {
+        console.info("WS message (non-binary)", ev.data);
       }
     };
     setWs(sock);
