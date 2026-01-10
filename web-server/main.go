@@ -57,7 +57,27 @@ func main() {
 	}
 }
 
+// --- CORS helpers ---
+func setCORS(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+}
+
+func preflight(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodOptions {
+		setCORS(w)
+		w.WriteHeader(http.StatusOK)
+		return true
+	}
+	setCORS(w)
+	return false
+}
+
 func handleIngest(w http.ResponseWriter, r *http.Request) {
+	if preflight(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -201,6 +221,9 @@ func handleFeedWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleFeedStart(w http.ResponseWriter, r *http.Request) {
+	if preflight(w, r) {
+		return
+	}
 	if err := sendControl("start"); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -210,6 +233,9 @@ func handleFeedStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleFeedStop(w http.ResponseWriter, r *http.Request) {
+	if preflight(w, r) {
+		return
+	}
 	if err := sendControl("stop"); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -326,6 +352,9 @@ func safe(s string) string {
 
 // --- Listing APIs ---
 func handleClinics(w http.ResponseWriter, r *http.Request) {
+	if preflight(w, r) {
+		return
+	}
 	entries, err := os.ReadDir("data")
 	if err != nil {
 		http.Error(w, "Failed to list clinics", http.StatusInternalServerError)
@@ -372,6 +401,9 @@ func handleClinicRoutes(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePatients(w http.ResponseWriter, r *http.Request, clinic string) {
+	if preflight(w, r) {
+		return
+	}
 	dir := filepath.Join("data", clinic)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -388,6 +420,9 @@ func handlePatients(w http.ResponseWriter, r *http.Request, clinic string) {
 }
 
 func handlePatientData(w http.ResponseWriter, r *http.Request, clinic, patient string) {
+	if preflight(w, r) {
+		return
+	}
 	dir := filepath.Join("data", clinic, patient)
 	files, err := os.ReadDir(dir)
 	if err != nil {
@@ -415,6 +450,9 @@ func handlePatientData(w http.ResponseWriter, r *http.Request, clinic, patient s
 }
 
 func handlePatientCamera(w http.ResponseWriter, r *http.Request, clinic, patient string) {
+	if preflight(w, r) {
+		return
+	}
 	path := filepath.Join("data", clinic, patient, "camera.jpg")
 	http.ServeFile(w, r, path)
 }
