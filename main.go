@@ -528,7 +528,7 @@ func main() {
 					fyne.Do(func() { stopStreaming() })
 				case "move-left", "move-right", "move-up", "move-down":
 					log(fmt.Sprintf("WS camera command: %s", cmd))
-					runCameraCommand(cmd, []string{cmd})
+					runCameraCommand(cmd, []string{"-" + cmd})
 				case "flip":
 					fyne.Do(func() {
 						previewImageFlip = !previewImageFlip
