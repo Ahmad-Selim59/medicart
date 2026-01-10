@@ -479,10 +479,10 @@ func main() {
 				switch cmd {
 				case "start":
 					log("WS command: start streaming")
-					startStreaming()
+					fyne.Do(func() { startStreaming() })
 				case "stop":
 					log("WS command: stop streaming")
-					stopStreaming()
+					fyne.Do(func() { stopStreaming() })
 				default:
 					log(fmt.Sprintf("WS unknown command: %s", cmd))
 				}
