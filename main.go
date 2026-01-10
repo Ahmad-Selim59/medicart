@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"runtime"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -410,14 +411,7 @@ func sendData(url string, data interface{}) error {
 
 // captureSnapshot uses ffmpeg (dshow) to grab a single JPEG frame from the given device name.
 func captureSnapshot(ctx context.Context, device string) (image.Image, error) {
-	// Example device string: video="Integrated Camera"
-	args := []string{
-		"-f", "dshow",
-		"-i", device,
-		"-vframes", "1",
-		"-f", "mjpeg",
-		"-",
-	}
+	args := buildFFmpegArgsForSnapshot(device)
 
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	var stdout, stderr bytes.Buffer
@@ -435,31 +429,97 @@ func captureSnapshot(ctx context.Context, device string) (image.Image, error) {
 	return img, nil
 }
 
-// detectDefaultCameraDevice tries to find the first dshow video device via ffmpeg -list_devices.
-func detectDefaultCameraDevice() (string, error) {
-	cmd := exec.Command("ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy")
-	var stderr bytes.Buffer
-	cmd.Stdout = &stderr // ffmpeg prints device list to stderr; stdout unused
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		// Listing devices returns an error exit code; that's fine as long as we get output.
+func buildFFmpegArgsForSnapshot(device string) []string {
+	// Select correct input driver per OS
+	if runtime.GOOS == "windows" {
+		// dshow expects video="Device Name"
+		return []string{
+			"-f", "dshow",
+			"-i", device,
+			"-vframes", "1",
+			"-f", "mjpeg",
+			"-",
+		}
 	}
-	lines := strings.Split(stderr.String(), "\n")
-	for _, ln := range lines {
-		ln = strings.TrimSpace(ln)
-		// Match lines like: [dshow @ ...] "USB3.0 FULL HD PTZ" (video)
-		if strings.Contains(ln, "(video)") && strings.Count(ln, "\"") >= 2 {
-			start := strings.Index(ln, "\"")
-			end := strings.LastIndex(ln, "\"")
-			if start >= 0 && end > start {
-				name := ln[start+1 : end]
-				if name != "" {
-					return fmt.Sprintf(`video="%s"`, name), nil
+
+	// macOS: avfoundation, device is usually "0" (video index) or "0:" (video:audio)
+	// If user passed a named device, avfoundation still expects an index; auto-detect helps.
+	if runtime.GOOS == "darwin" {
+		return []string{
+			"-f", "avfoundation",
+			"-framerate", "30",
+			"-video_size", "640x480",
+			"-i", device, // device is an index like "0"
+			"-vframes", "1",
+			"-f", "mjpeg",
+			"-",
+		}
+	}
+
+	// Fallback: try v4l2 on linux
+	return []string{
+		"-f", "v4l2",
+		"-i", device,
+		"-vframes", "1",
+		"-f", "mjpeg",
+		"-",
+	}
+}
+
+// detectDefaultCameraDevice tries to find the first video device via ffmpeg -list_devices.
+func detectDefaultCameraDevice() (string, error) {
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command("ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy")
+		var stderr bytes.Buffer
+		cmd.Stdout = &stderr // ffmpeg prints device list to stderr; stdout unused
+		cmd.Stderr = &stderr
+		_ = cmd.Run() // non-zero exit is expected
+		lines := strings.Split(stderr.String(), "\n")
+		for _, ln := range lines {
+			ln = strings.TrimSpace(ln)
+			if strings.Contains(ln, "(video)") && strings.Count(ln, "\"") >= 2 {
+				start := strings.Index(ln, "\"")
+				end := strings.LastIndex(ln, "\"")
+				if start >= 0 && end > start {
+					name := ln[start+1 : end]
+					if name != "" {
+						return fmt.Sprintf(`video="%s"`, name), nil
+					}
 				}
 			}
 		}
+		return "", fmt.Errorf("no video devices found")
 	}
-	return "", fmt.Errorf("no video devices found")
+
+	if runtime.GOOS == "darwin" {
+		cmd := exec.Command("ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", "")
+		var stderr bytes.Buffer
+		cmd.Stdout = &stderr
+		cmd.Stderr = &stderr
+		_ = cmd.Run() // ffmpeg returns error exit; ignore
+		lines := strings.Split(stderr.String(), "\n")
+		for _, ln := range lines {
+			ln = strings.TrimSpace(ln)
+			// Match lines like: [AVFoundation input device @ ...] [0] FaceTime HD Camera
+			if strings.Contains(ln, "AVFoundation input device") && strings.Contains(ln, "] [") {
+				parts := strings.Split(ln, "] [")
+				if len(parts) >= 2 {
+					// Extract index between '[' and ']' after split
+					// e.g. "...] [0] FaceTime HD Camera"
+					idxEnd := strings.Index(parts[1], "]")
+					if idxEnd > 0 {
+						idx := strings.TrimSpace(parts[1][:idxEnd])
+						if idx != "" {
+							return idx, nil // avfoundation expects numeric index like "0"
+						}
+					}
+				}
+			}
+		}
+		return "", fmt.Errorf("no video devices found")
+	}
+
+	return "", fmt.Errorf("auto-detect not supported on this OS")
 }
 
 // --- Parsers (Copied from legacy/main.go) ---
