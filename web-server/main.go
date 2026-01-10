@@ -303,6 +303,9 @@ func handleStreamWS(w http.ResponseWriter, r *http.Request) {
 	streams[key][conn] = true
 	streamsMu.Unlock()
 
+	// Attempt to start feed when a subscriber connects
+	_ = sendControl("start")
+
 	log.Printf("Stream subscriber connected: %s", key)
 
 	for {
@@ -320,6 +323,18 @@ func handleStreamWS(w http.ResponseWriter, r *http.Request) {
 	}
 	streamsMu.Unlock()
 	conn.Close()
+
+	// If no subscribers remain at all, try stopping feed
+	streamsMu.Lock()
+	remaining := 0
+	for _, m := range streams {
+		remaining += len(m)
+	}
+	streamsMu.Unlock()
+	if remaining == 0 {
+		_ = sendControl("stop")
+	}
+
 	log.Printf("Stream subscriber disconnected: %s", key)
 }
 
