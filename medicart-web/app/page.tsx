@@ -22,6 +22,8 @@ export default function Home() {
   const [loadingPatients, setLoadingPatients] = useState(false);
   const [loadingData, setLoadingData] = useState(false);
 
+  const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
+
   useEffect(() => {
     loadClinics();
   }, []);
@@ -45,7 +47,7 @@ export default function Home() {
 
   async function loadClinics() {
     try {
-      const res = await fetch("/api/clinics");
+      const res = await fetch(`${API_BASE}/clinics`);
       const json = await res.json();
       setClinics(Array.isArray(json) ? json : []);
     } catch {
@@ -56,7 +58,7 @@ export default function Home() {
   async function loadPatients(c: string) {
     setLoadingPatients(true);
     try {
-      const res = await fetch(`/api/clinic/${c}/patients`);
+      const res = await fetch(`${API_BASE}/api/clinic/${c}/patients`);
       const json = await res.json();
       setPatients(Array.isArray(json) ? json : []);
     } catch {
@@ -69,7 +71,7 @@ export default function Home() {
   async function loadPatientData(c: string, p: string) {
     setLoadingData(true);
     try {
-      const res = await fetch(`/api/clinic/${c}/patient/${p}/data`);
+      const res = await fetch(`${API_BASE}/api/clinic/${c}/patient/${p}/data`);
       const json = await res.json();
       setData(json || {});
     } catch {
@@ -81,8 +83,10 @@ export default function Home() {
 
   function connectStream(c: string, p: string) {
     disconnectStream();
-    const url = `/ws/stream?clinic=${encodeURIComponent(c)}&patient=${encodeURIComponent(p)}`;
-    const sock = new WebSocket(url.replace(/^http/, "ws"));
+    const base = (API_BASE || "").replace(/\/$/, "");
+    const httpUrl = `${base}/ws/stream?clinic=${encodeURIComponent(c)}&patient=${encodeURIComponent(p)}`;
+    const wsUrl = httpUrl.replace(/^http/, "ws");
+    const sock = new WebSocket(wsUrl);
     sock.binaryType = "arraybuffer";
     sock.onopen = () => setCamStatus("Connected to stream");
     sock.onclose = () => {
