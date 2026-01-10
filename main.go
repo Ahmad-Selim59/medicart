@@ -413,6 +413,10 @@ func sendData(url string, data interface{}) error {
 func captureSnapshot(ctx context.Context, device string) (image.Image, error) {
 	args := buildFFmpegArgsForSnapshot(device)
 
+	// Debug log the command being used (without context cancellation details)
+	logCmd := strings.Join(append([]string{"ffmpeg"}, args...), " ")
+	fmt.Printf("ffmpeg command: %s\n", logCmd)
+
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
