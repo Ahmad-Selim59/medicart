@@ -97,6 +97,9 @@ func main() {
 	previewImage.SetMinSize(fyne.NewSize(320, 240))
 	previewImageFlip := false
 
+	// Buttons that may need refresh on redraw glitches
+	refreshButtons := []*widget.Button{}
+
 	log := func(msg string) {
 		fyne.Do(func() {
 			timestamp := time.Now().Format("15:04:05")
@@ -128,6 +131,13 @@ func main() {
 				}
 			}
 			statusLabel.Refresh()
+
+			// Force redraw of buttons if they visually glitch
+			for _, b := range refreshButtons {
+				if b != nil {
+					b.Refresh()
+				}
+			}
 		})
 	}
 
@@ -507,6 +517,16 @@ func main() {
 
 	wsConnectBtn := widget.NewButton("Connect WS", connectWS)
 	wsDisconnectBtn := widget.NewButton("Disconnect WS", disconnectWS)
+
+	// Collect buttons for refresh
+	refreshButtons = []*widget.Button{
+		stopBtn,
+		btnHeartRate, btnNIBP, btnGlucose, btnTemp,
+		btnCamList, btnCamLeft, btnCamRight, btnCamUp, btnCamDown, btnCamFlip,
+		btnPreviewStart, btnPreviewStop,
+		wsConnectBtn, wsDisconnectBtn,
+		advancedBtn,
+	}
 	// Layout
 	mainContent := container.NewVBox(
 		lightModeCheck,
