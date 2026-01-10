@@ -66,15 +66,31 @@ func main() {
 	logArea.SetMinRowsVisible(10)
 
 	// Camera Device Input (for ffmpeg dshow)
-	cameraLabel := widget.NewLabel("Camera Device (dshow name):")
-	cameraEntry := widget.NewEntry()
-	cameraEntry.SetPlaceHolder(`video="Integrated Camera"`)
-	cameraEntry.SetText(`video="Integrated Camera"`)
+	cameraLabel := widget.NewLabel("Camera Device (optional):")
+	cameraEntry := widget.NewSelect([]string{}, nil)
+	cameraEntry.PlaceHolder = "Auto (first camera)"
+
+	// Advanced toggle for showing device select
+	advancedOpen := false
+	advancedBtn := widget.NewButton("Show Advanced Camera Options", nil)
+	advancedContainer := container.NewVBox(cameraLabel, cameraEntry)
+	advancedContainer.Hide()
+	advancedBtn.OnTapped = func() {
+		advancedOpen = !advancedOpen
+		if advancedOpen {
+			advancedContainer.Show()
+			advancedBtn.SetText("Hide Advanced Camera Options")
+		} else {
+			advancedContainer.Hide()
+			advancedBtn.SetText("Show Advanced Camera Options")
+		}
+	}
 
 	// Camera Preview
 	previewImage := canvas.NewImageFromImage(nil)
 	previewImage.FillMode = canvas.ImageFillContain
 	previewImage.SetMinSize(fyne.NewSize(320, 240))
+	previewImageFlip := false
 
 	log := func(msg string) {
 		fyne.Do(func() {
@@ -214,6 +230,18 @@ func main() {
 	btnCamDown := widget.NewButton("Move Down", func() {
 		runCameraCommand("move-down", []string{"-move-down"})
 	})
+	btnCamFlip := widget.NewButton("Flip Preview (Vertical)", func() {
+		previewImageFlip = !previewImageFlip
+		applyPreview := func() {
+			if previewImage.Image != nil {
+				previewImage.Refresh()
+			}
+		}
+		if previewImage.Image == nil {
+			log("Preview flip toggled; will apply when preview shows an image.")
+		}
+		applyPreview()
+	})
 
 
 	// Camera Preview (snapshot via ffmpeg dshow)
@@ -230,13 +258,13 @@ func main() {
 	}
 
 	startPreview := func() {
-		device := strings.TrimSpace(cameraEntry.Text)
+		device := strings.TrimSpace(cameraEntry.Selected)
 		if device == "" {
 			if autoDevice, err := detectDefaultCameraDevice(); err == nil && autoDevice != "" {
 				device = autoDevice
 				log(fmt.Sprintf("Using detected camera: %s", device))
 			} else {
-				log("Error: No camera device found. Set a device name (e.g. video=\"Integrated Camera\")")
+				log("Error: No camera device found. Set a device name (advanced options).")
 				return
 			}
 		}
@@ -267,7 +295,20 @@ func main() {
 						continue
 					}
 					fyne.Do(func() {
-						previewImage.Image = img
+						// Apply vertical flip if enabled
+						if previewImageFlip {
+							b := img.Bounds()
+							flipped := image.NewRGBA(b)
+							h := b.Dy()
+							for y := 0; y < h; y++ {
+								for x := b.Min.X; x < b.Max.X; x++ {
+									flipped.Set(x, b.Min.Y+(h-1)-(y-b.Min.Y), img.At(x, y+b.Min.Y))
+								}
+							}
+							previewImage.Image = flipped
+						} else {
+							previewImage.Image = img
+						}
 						previewImage.Refresh()
 					})
 				}
@@ -296,13 +337,14 @@ func main() {
 		btnTemp,
 		widget.NewSeparator(),
 		widget.NewLabel("Camera Controls:"),
-		cameraLabel,
-		cameraEntry,
+		advancedBtn,
+		advancedContainer,
 		btnCamList,
 		btnCamLeft,
 		btnCamRight,
 		btnCamUp,
 		btnCamDown,
+		btnCamFlip,
 		container.NewHBox(btnPreviewStart, btnPreviewStop),
 		previewImage,
 		widget.NewSeparator(),
