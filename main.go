@@ -64,6 +64,11 @@ func main() {
 	patientNameEntry := widget.NewEntry()
 	patientNameEntry.SetPlaceHolder("Enter patient name")
 
+	// Clinic Name Input
+	clinicNameLabel := widget.NewLabel("Clinic Name:")
+	clinicNameEntry := widget.NewEntry()
+	clinicNameEntry.SetPlaceHolder("Enter clinic name")
+
 	// Status Area
 	statusLabel := widget.NewRichTextFromMarkdown("Status: Idle")
 	logArea := widget.NewMultiLineEntry()
@@ -165,6 +170,12 @@ func main() {
 			return
 		}
 
+		clinicName := clinicNameEntry.Text
+		if clinicName == "" {
+			log("Error: Please enter a Clinic Name")
+			return
+		}
+
 		patientName := patientNameEntry.Text
 		if patientName == "" {
 			log("Error: Please enter a Patient Name")
@@ -172,7 +183,7 @@ func main() {
 		}
 
 		stopBtn.Enable()
-		go runCLIAndSend(name, args, parser, targetURL, patientName, log, func() {
+		go runCLIAndSend(name, args, parser, targetURL, clinicName, patientName, log, func() {
 			fyne.Do(func() {
 				stopBtn.Disable()
 			})
@@ -393,6 +404,9 @@ func main() {
 			return
 		}
 
+		clinic := strings.TrimSpace(clinicNameEntry.Text)
+		patient := strings.TrimSpace(patientNameEntry.Text)
+
 		ctx, cancel := context.WithCancel(context.Background())
 		wsMu.Lock()
 		streamCancel = cancel
@@ -414,6 +428,13 @@ func main() {
 						continue
 					}
 					go func(img image.Image) {
+						// send metadata first once per stream? We'll send periodically
+						meta := map[string]string{
+							"clinic_name":  clinic,
+							"patient_name": patient,
+						}
+						metaJSON, _ := json.Marshal(meta)
+
 						var buf bytes.Buffer
 						if err := jpeg.Encode(&buf, img, nil); err != nil {
 							log(fmt.Sprintf("Encode error: %v", err))
@@ -427,6 +448,8 @@ func main() {
 							stopStreaming()
 							return
 						}
+						// send meta
+						_ = c.WriteMessage(websocket.TextMessage, metaJSON)
 						if err := c.WriteMessage(websocket.BinaryMessage, buf.Bytes()); err != nil {
 							log(fmt.Sprintf("WS send error: %v", err))
 							stopStreaming()
@@ -547,6 +570,8 @@ func main() {
 		lightModeCheck,
 		urlLabel,
 		urlEntry,
+		clinicNameLabel,
+		clinicNameEntry,
 		patientNameLabel,
 		patientNameEntry,
 		widget.NewSeparator(),
@@ -585,7 +610,7 @@ func main() {
 	myWindow.ShowAndRun()
 }
 
-func runCLIAndSend(name string, args []string, parser LineParser, targetURL string, patientName string, log func(string), onFinish func()) {
+func runCLIAndSend(name string, args []string, parser LineParser, targetURL string, clinicName string, patientName string, log func(string), onFinish func()) {
 	defer onFinish()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -638,6 +663,7 @@ func runCLIAndSend(name string, args []string, parser LineParser, targetURL stri
 			// Inject Patient Name
 			if dataMap, ok := data.(map[string]interface{}); ok {
 				dataMap["patient_name"] = patientName
+				dataMap["clinic_name"] = clinicName
 			}
 
 			// Send to server
