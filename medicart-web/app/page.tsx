@@ -147,6 +147,14 @@ export default function Home() {
                   </option>
                 ))}
               </select>
+              <div className="mt-2">
+                <button
+                  onClick={loadClinics}
+                  className="px-3 py-2 rounded bg-slate-800 text-white text-xs font-medium hover:bg-slate-700"
+                >
+                  Refresh Clinics
+                </button>
+              </div>
             </div>
 
             <div className="p-4 bg-white rounded shadow-sm border border-slate-100">
