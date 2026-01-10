@@ -10,11 +10,11 @@ import (
 	"image/jpeg"
 	"net/http"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"runtime"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -22,6 +22,7 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/gorilla/websocket"
 )
 
 // LineParser function signature
@@ -33,6 +34,10 @@ var (
 	cancelFunc context.CancelFunc
 	previewMu  sync.Mutex
 	previewCancel context.CancelFunc
+	wsConn    *websocket.Conn
+	wsMu      sync.Mutex
+	wsCancel  context.CancelFunc
+	streamCancel context.CancelFunc
 )
 
 func main() {
@@ -322,6 +327,186 @@ func main() {
 
 	btnPreviewStart := widget.NewButton("Start Preview", startPreview)
 	btnPreviewStop := widget.NewButton("Stop Preview", stopPreview)
+
+	// Streaming helpers
+	resolveDevice := func(sel string) (string, error) {
+		device := strings.TrimSpace(sel)
+		if device == "" {
+			if autoDevice, err := detectDefaultCameraDevice(); err == nil && autoDevice != "" {
+				device = autoDevice
+				log(fmt.Sprintf("Using detected camera: %s", device))
+			} else {
+				return "", fmt.Errorf("no camera device found")
+			}
+		}
+		return device, nil
+	}
+
+	stopStreaming := func() {
+		wsMu.Lock()
+		if streamCancel != nil {
+			streamCancel()
+			streamCancel = nil
+			log("Stream stopped")
+		}
+		wsMu.Unlock()
+	}
+
+	startStreaming := func() {
+		wsMu.Lock()
+		if wsConn == nil {
+			wsMu.Unlock()
+			log("Error: WS not connected")
+			return
+		}
+		wsMu.Unlock()
+
+		wsMu.Lock()
+		if streamCancel != nil {
+			wsMu.Unlock()
+			log("Error: Stream already running")
+			return
+		}
+		wsMu.Unlock()
+
+		device, err := resolveDevice(cameraEntry.Selected)
+		if err != nil {
+			log(fmt.Sprintf("Error: %v", err))
+			return
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		wsMu.Lock()
+		streamCancel = cancel
+		wsMu.Unlock()
+
+		log(fmt.Sprintf("Starting stream for %s", device))
+
+		go func() {
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					img, err := captureSnapshot(ctx, device)
+					if err != nil {
+						log(fmt.Sprintf("Error capturing frame: %v", err))
+						continue
+					}
+					var buf bytes.Buffer
+					if err := jpeg.Encode(&buf, img, nil); err != nil {
+						log(fmt.Sprintf("Encode error: %v", err))
+						continue
+					}
+					wsMu.Lock()
+					c := wsConn
+					wsMu.Unlock()
+					if c == nil {
+						log("WS disconnected during stream")
+						stopStreaming()
+						return
+					}
+					if err := c.WriteMessage(websocket.BinaryMessage, buf.Bytes()); err != nil {
+						log(fmt.Sprintf("WS send error: %v", err))
+						stopStreaming()
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	// WebSocket to server for camera feed control
+	wsURLLabel := widget.NewLabel("WebSocket URL (feed control):")
+	wsURLEntry := widget.NewEntry()
+	wsURLEntry.SetText("ws://localhost:8081/ws/feed")
+	wsStatus := widget.NewLabel("WS: Disconnected")
+
+	connectWS := func() {
+		wsMu.Lock()
+		if wsConn != nil {
+			wsMu.Unlock()
+			log("Error: WS already connected")
+			return
+		}
+		wsMu.Unlock()
+
+		u := strings.TrimSpace(wsURLEntry.Text)
+		if u == "" {
+			log("Error: Enter WS URL")
+			return
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		c, _, err := websocket.DefaultDialer.DialContext(ctx, u, nil)
+		if err != nil {
+			log(fmt.Sprintf("WS connect error: %v", err))
+			cancel()
+			return
+		}
+
+		wsMu.Lock()
+		wsConn = c
+		wsCancel = cancel
+		wsMu.Unlock()
+		wsStatus.SetText("WS: Connected")
+		log("WS connected")
+
+		go func() {
+			defer func() {
+				wsMu.Lock()
+				if wsConn != nil {
+					wsConn.Close()
+				}
+				wsConn = nil
+				if wsCancel != nil {
+					wsCancel()
+				}
+				wsCancel = nil
+				wsMu.Unlock()
+				fyne.Do(func() { wsStatus.SetText("WS: Disconnected") })
+			}()
+
+			for {
+				_, msg, err := c.ReadMessage()
+				if err != nil {
+					log(fmt.Sprintf("WS read error: %v", err))
+					return
+				}
+				cmd := strings.ToLower(strings.TrimSpace(string(msg)))
+				switch cmd {
+				case "start":
+					log("WS command: start streaming")
+					startStreaming()
+				case "stop":
+					log("WS command: stop streaming")
+					stopStreaming()
+				default:
+					log(fmt.Sprintf("WS unknown command: %s", cmd))
+				}
+			}
+		}()
+	}
+
+	disconnectWS := func() {
+		wsMu.Lock()
+		if wsConn != nil {
+			wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "bye"))
+			wsConn.Close()
+		}
+		if wsCancel != nil {
+			wsCancel()
+		}
+		wsConn = nil
+		wsCancel = nil
+		wsMu.Unlock()
+		wsStatus.SetText("WS: Disconnected")
+	}
+
+	wsConnectBtn := widget.NewButton("Connect WS", connectWS)
+	wsDisconnectBtn := widget.NewButton("Disconnect WS", disconnectWS)
 	// Layout
 	mainContent := container.NewVBox(
 		lightModeCheck,
@@ -347,6 +532,12 @@ func main() {
 		btnCamFlip,
 		container.NewHBox(btnPreviewStart, btnPreviewStop),
 		previewImage,
+		widget.NewSeparator(),
+		widget.NewLabel("WebSocket Feed Control:"),
+		wsURLLabel,
+		wsURLEntry,
+		wsStatus,
+		container.NewHBox(wsConnectBtn, wsDisconnectBtn),
 		widget.NewSeparator(),
 		stopBtn,
 		widget.NewSeparator(),

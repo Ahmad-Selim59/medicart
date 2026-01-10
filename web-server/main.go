@@ -7,8 +7,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 type DataStorage struct {
@@ -24,12 +27,19 @@ type Record struct {
 var (
 	storageFile = "data.json"
 	fileMutex   sync.Mutex
+
+	feedConn *websocket.Conn
+	wsMutex  sync.Mutex
 )
 
 func main() {
 	ensureStorageFile()
+	ensureDataDir()
 
 	http.HandleFunc("/api/ingest", handleIngest)
+	http.HandleFunc("/ws/feed", handleFeedWS)
+	http.HandleFunc("/api/feed/start", handleFeedStart)
+	http.HandleFunc("/api/feed/stop", handleFeedStop)
 
 	port := ":8081"
 	fmt.Printf("Web Server starting on port %s...\n", port)
@@ -129,4 +139,82 @@ func saveStorage(storage DataStorage) error {
 	}
 
 	return os.WriteFile(storageFile, data, 0644)
+}
+
+func ensureDataDir() {
+	_ = os.MkdirAll("data", 0755)
+}
+
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+func handleFeedWS(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WS upgrade error: %v", err)
+		return
+	}
+	wsMutex.Lock()
+	if feedConn != nil {
+		feedConn.Close()
+	}
+	feedConn = conn
+	wsMutex.Unlock()
+
+	log.Printf("Feed WS connected")
+
+	for {
+		mt, msg, err := conn.ReadMessage()
+		if err != nil {
+			log.Printf("WS read error: %v", err)
+			break
+		}
+		if mt == websocket.BinaryMessage {
+			path := filepath.Join("data", "last_frame.jpg")
+			if err := os.WriteFile(path, msg, 0644); err != nil {
+				log.Printf("Failed to write frame: %v", err)
+			}
+		} else {
+			log.Printf("WS text: %s", string(msg))
+		}
+	}
+
+	wsMutex.Lock()
+	if feedConn == conn {
+		feedConn = nil
+	}
+	wsMutex.Unlock()
+}
+
+func handleFeedStart(w http.ResponseWriter, r *http.Request) {
+	if err := sendControl("start"); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, "started")
+}
+
+func handleFeedStop(w http.ResponseWriter, r *http.Request) {
+	if err := sendControl("stop"); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, "stopped")
+}
+
+func sendControl(cmd string) error {
+	wsMutex.Lock()
+	defer wsMutex.Unlock()
+	if feedConn == nil {
+		return fmt.Errorf("no desktop connected")
+	}
+	if err := feedConn.WriteMessage(websocket.TextMessage, []byte(cmd)); err != nil {
+		feedConn = nil
+		return fmt.Errorf("failed to send command: %w", err)
+	}
+	return nil
 }
