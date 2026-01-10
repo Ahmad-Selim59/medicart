@@ -19,6 +19,7 @@ export default function Home() {
   const [camSrc, setCamSrc] = useState("");
   const [camStatus, setCamStatus] = useState("Requires camera feed");
   const [ws, setWs] = useState<WebSocket | null>(null);
+  const [flip, setFlip] = useState(false);
   const [loadingPatients, setLoadingPatients] = useState(false);
   const [loadingData, setLoadingData] = useState(false);
 
@@ -80,6 +81,15 @@ export default function Home() {
     } finally {
       setLoadingData(false);
     }
+  }
+
+  async function sendCameraControl(command: string) {
+    const base = (API_BASE || "").replace(/\/$/, "");
+    await fetch(`${base}/api/camera/control`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command }),
+    }).catch(() => {});
   }
 
   function connectStream(c: string, p: string) {
@@ -244,12 +254,44 @@ export default function Home() {
                   </button>
                 </div>
               </div>
+              <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                <button
+                  onClick={() => sendCameraControl("move-left")}
+                  className="px-3 py-2 rounded bg-slate-100 hover:bg-slate-200"
+                >
+                  Move Left
+                </button>
+                <button
+                  onClick={() => sendCameraControl("move-right")}
+                  className="px-3 py-2 rounded bg-slate-100 hover:bg-slate-200"
+                >
+                  Move Right
+                </button>
+                <button
+                  onClick={() => sendCameraControl("move-up")}
+                  className="px-3 py-2 rounded bg-slate-100 hover:bg-slate-200"
+                >
+                  Move Up
+                </button>
+                <button
+                  onClick={() => sendCameraControl("move-down")}
+                  className="px-3 py-2 rounded bg-slate-100 hover:bg-slate-200"
+                >
+                  Move Down
+                </button>
+                <button
+                  onClick={() => setFlip((f) => !f)}
+                  className="px-3 py-2 rounded bg-slate-100 hover:bg-slate-200"
+                >
+                  Flip View
+                </button>
+              </div>
               <div className="mt-3 border border-slate-200 rounded overflow-hidden bg-slate-100 min-h-[200px] flex items-center justify-center">
                 {camSrc ? (
                   <img
                     src={camSrc}
                     alt="Camera"
-                    className="w-full max-h-[360px] object-contain"
+                    className={`w-full max-h-[360px] object-contain ${flip ? "scale-y-[-1]" : ""}`}
                   />
                 ) : (
                   <div className="text-slate-400 text-sm">No camera image available</div>

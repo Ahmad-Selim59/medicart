@@ -526,6 +526,14 @@ func main() {
 				case "stop":
 					log("WS command: stop streaming")
 					fyne.Do(func() { stopStreaming() })
+				case "move-left", "move-right", "move-up", "move-down":
+					log(fmt.Sprintf("WS camera command: %s", cmd))
+					runCameraCommand(cmd, []string{cmd})
+				case "flip":
+					fyne.Do(func() {
+						previewImageFlip = !previewImageFlip
+						log("WS camera command: flip preview")
+					})
 				default:
 					log(fmt.Sprintf("WS unknown command: %s", cmd))
 				}

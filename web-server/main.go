@@ -48,6 +48,7 @@ func main() {
 	http.HandleFunc("/api/feed/stop", handleFeedStop)
 	http.HandleFunc("/api/clinics", handleClinics)
 	http.HandleFunc("/clinics", handleClinics) // simple alias
+	http.HandleFunc("/api/camera/control", handleCameraControl)
 	http.HandleFunc("/api/clinic/", handleClinicRoutes)
 
 	port := ":8081"
@@ -255,6 +256,35 @@ func sendControl(cmd string) error {
 		return fmt.Errorf("failed to send command: %w", err)
 	}
 	return nil
+}
+
+// Camera control endpoint: expects {"command":"move-left"} etc.
+func handleCameraControl(w http.ResponseWriter, r *http.Request) {
+	if preflight(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+	var req struct {
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.Command == "" {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if err := sendControl(req.Command); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok"})
 }
 
 // --- Stream broker ---
