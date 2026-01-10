@@ -99,6 +99,7 @@ func main() {
 
 	// Buttons that may need refresh on redraw glitches
 	refreshButtons := []*widget.Button{}
+	buttonDefaults := map[*widget.Button]string{}
 
 	log := func(msg string) {
 		fyne.Do(func() {
@@ -135,6 +136,11 @@ func main() {
 			// Force redraw of buttons if they visually glitch
 			for _, b := range refreshButtons {
 				if b != nil {
+					if b.Text == "" {
+						if txt, ok := buttonDefaults[b]; ok {
+							b.SetText(txt)
+						}
+					}
 					b.Refresh()
 				}
 			}
@@ -530,6 +536,11 @@ func main() {
 		btnPreviewStart, btnPreviewStop,
 		wsConnectBtn, wsDisconnectBtn,
 		advancedBtn,
+	}
+	for _, b := range refreshButtons {
+		if b != nil {
+			buttonDefaults[b] = b.Text
+		}
 	}
 	// Layout
 	mainContent := container.NewVBox(
