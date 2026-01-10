@@ -304,7 +304,9 @@ func handleStreamWS(w http.ResponseWriter, r *http.Request) {
 	streamsMu.Unlock()
 
 	// Attempt to start feed when a subscriber connects
-	_ = sendControl("start")
+	if err := sendControl("start"); err != nil {
+		log.Printf("feed start error (ignored): %v", err)
+	}
 
 	log.Printf("Stream subscriber connected: %s", key)
 
@@ -332,7 +334,9 @@ func handleStreamWS(w http.ResponseWriter, r *http.Request) {
 	}
 	streamsMu.Unlock()
 	if remaining == 0 {
-		_ = sendControl("stop")
+		if err := sendControl("stop"); err != nil {
+			log.Printf("feed stop error (ignored): %v", err)
+		}
 	}
 
 	log.Printf("Stream subscriber disconnected: %s", key)
