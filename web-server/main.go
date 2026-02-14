@@ -386,6 +386,8 @@ func metricFile(data map[string]interface{}) string {
 		return "glucose.json"
 	case lowerKeys["temp"]:
 		return "temperature.json"
+	case lowerKeys["type"] && data["type"] == "stream" && (data["stream_type"] == "audio" || data["stream_type"] == "heartrate"):
+		return "stethoscope.json"
 	default:
 		return "misc.json"
 	}
