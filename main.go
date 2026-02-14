@@ -216,6 +216,26 @@ func main() {
 		startProcess("Temperature", []string{"-temperature"}, parseTemperatureLine)
 	})
 
+	// Stethoscope Buttons
+	var btnStethoscopeList *widget.Button
+	var stethMacEntry *widget.Entry
+
+	btnStethoscopeList = widget.NewButton("List Stethoscopes", func() {
+		startProcess("StethoscopeList", []string{"-list"}, parseStethoscopeLine)
+	})
+
+	stethMacEntry = widget.NewEntry()
+	stethMacEntry.SetPlaceHolder("Stethoscope MAC (AA:BB:CC:DD:EE:FF)")
+
+	btnStethoscopeConnect := widget.NewButton("Connect Stethoscope", func() {
+		mac := strings.TrimSpace(stethMacEntry.Text)
+		if mac == "" {
+			log("Error: Please enter a Stethoscope MAC address")
+			return
+		}
+		startProcess("StethoscopeStream", []string{"-connect", "-mac", mac}, parseStethoscopeLine)
+	})
+
 	runCameraCommand := func(action string, args []string) {
 		go func() {
 			log(fmt.Sprintf("Camera: %s ...", action))
@@ -563,6 +583,7 @@ func main() {
 	refreshButtons = []*widget.Button{
 		stopBtn,
 		btnHeartRate, btnNIBP, btnGlucose, btnTemp,
+		btnStethoscopeList, btnStethoscopeConnect,
 		btnCamList, btnCamLeft, btnCamRight, btnCamUp, btnCamDown, btnCamFlip,
 		btnPreviewStart, btnPreviewStop,
 		wsConnectBtn, wsDisconnectBtn,
@@ -588,6 +609,11 @@ func main() {
 		btnNIBP,
 		btnGlucose,
 		btnTemp,
+		widget.NewSeparator(),
+		widget.NewLabel("Stethoscope:"),
+		btnStethoscopeList,
+		stethMacEntry,
+		btnStethoscopeConnect,
 		widget.NewSeparator(),
 		widget.NewLabel("Camera Controls:"),
 		advancedBtn,
@@ -635,8 +661,16 @@ func runCLIAndSend(name string, args []string, parser LineParser, targetURL stri
 	}()
 
 	cmdPath := "lepu_cli.exe"
+	if name == "StethoscopeList" || name == "StethoscopeStream" {
+		cmdPath = "MinttiCLI.exe"
+	}
+
 	if _, err := exec.LookPath(cmdPath); err != nil {
-		cmdPath = "./lepu_cli.exe"
+		if name == "StethoscopeList" || name == "StethoscopeStream" {
+			cmdPath = "./MinttiCLI.exe"
+		} else {
+			cmdPath = "./lepu_cli.exe"
+		}
 	}
 	
 	log(fmt.Sprintf("Starting %s (%s)...", name, cmdPath))
@@ -972,6 +1006,90 @@ func parseTemperatureLine(line string) (interface{}, error) {
 		}, nil
 	}
 	return nil, nil
+}
+
+// Stethoscope
+func parseStethoscopeLine(line string) (interface{}, error) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "DATA:") {
+		return nil, nil
+	}
+
+	parts := strings.TrimPrefix(line, "DATA:")
+	if strings.HasPrefix(parts, "OK") {
+		return map[string]interface{}{
+			"type": "status",
+			"msg":  parts,
+		}, nil
+	}
+	if strings.HasPrefix(parts, "ERROR") {
+		return map[string]interface{}{
+			"type": "error",
+			"msg":  parts,
+		}, nil
+	}
+	if strings.HasPrefix(parts, "STATUS") {
+		return map[string]interface{}{
+			"type": "status",
+			"msg":  parts,
+		}, nil
+	}
+	if strings.HasPrefix(parts, "LIST") || strings.HasPrefix(parts, "ITEM") {
+		return map[string]interface{}{
+			"type": "discovery",
+			"msg":  parts,
+		}, nil
+	}
+	if strings.HasPrefix(parts, "STREAM") {
+		// DATA:STREAM type=audio data=[...]
+		// DATA:STREAM type=heartrate value=N
+		streamParts := parseKVSpace(parts)
+		res := map[string]interface{}{
+			"type": "stream",
+		}
+		for k, v := range streamParts {
+			if k == "type" {
+				res["stream_type"] = v
+			} else if k == "data" {
+				var audioData []int16
+				if err := json.Unmarshal([]byte(v), &audioData); err == nil {
+					res["data"] = audioData
+				} else {
+					res["data"] = v
+				}
+			} else if k == "value" {
+				if val, err := strconv.Atoi(v); err == nil {
+					res["value"] = val
+				} else {
+					res["value"] = v
+				}
+			} else {
+				res[k] = v
+			}
+		}
+		return res, nil
+	}
+
+	return map[string]interface{}{
+		"type": "raw",
+		"msg":  parts,
+	}, nil
+}
+
+func parseKVSpace(input string) map[string]string {
+	result := make(map[string]string)
+	// Simple space-based KV parser for "type=audio data=[...]"
+	// This is naive but should work for the expected format
+	pairs := strings.Split(input, " ")
+	for _, p := range pairs {
+		if strings.Contains(p, "=") {
+			parts := strings.SplitN(p, "=", 2)
+			if len(parts) == 2 {
+				result[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	return result
 }
 
 func parseKV(input string) map[string]string {
