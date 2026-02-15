@@ -230,7 +230,51 @@ func main() {
 	btnStethoscopeConnect := widget.NewButton("Connect Stethoscope", func() {
 		mac := strings.TrimSpace(stethMacEntry.Text)
 		if mac == "" {
-			log("Error: Please enter a Stethoscope MAC address")
+			// If no MAC is entered, try to auto-detect if there's exactly one device
+			
+			cmdPath := "MinttiCLI.exe"
+			if _, err := exec.LookPath(cmdPath); err != nil {
+				cmdPath = "./MinttiCLI.exe"
+			}
+
+			// Run a quick scan to see if we can find exactly one device
+			go func() {
+				cmd := exec.Command(cmdPath, "-list")
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					log(fmt.Sprintf("Auto-scan failed: %v", err))
+					return
+				}
+
+				lines := strings.Split(string(output), "\n")
+				var foundMacs []string
+				for _, line := range lines {
+					line = strings.TrimSpace(line)
+					if strings.Contains(line, "DATA:ITEM") {
+						// Simple extraction of mac="..."
+						if start := strings.Index(line, "mac=\""); start != -1 {
+							rest := line[start+len("mac=\""):]
+							if end := strings.Index(rest, "\""); end != -1 {
+								foundMacs = append(foundMacs, rest[:end])
+							}
+						}
+					}
+				}
+
+				if len(foundMacs) == 1 {
+					autoMac := foundMacs[0]
+					fyne.Do(func() {
+						stethMacEntry.SetText(autoMac)
+						log(fmt.Sprintf("Auto-detected single stethoscope: %s", autoMac))
+						// Start the process now that we have the MAC
+						startProcess("StethoscopeStream", []string{"-connect", "-mac", autoMac}, parseStethoscopeLine)
+					})
+				} else if len(foundMacs) > 1 {
+					log(fmt.Sprintf("Found %d devices. Please enter a MAC address manually.", len(foundMacs)))
+				} else {
+					log("No stethoscopes found. Ensure device is on and in range.")
+				}
+			}()
 			return
 		}
 		startProcess("StethoscopeStream", []string{"-connect", "-mac", mac}, parseStethoscopeLine)
