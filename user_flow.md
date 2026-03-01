@@ -58,14 +58,14 @@ graph TD
 
 ## Flow Implementation Status
 
-### ✅ Backend Completed
+### Backend Supported Already
 | Feature | Note |
 | :--- | :--- |
 | **Clinic/Patient Navigation** | Dynamic fetching of clinics and patient lists via REST API. |
 | **Data Visualization** | Structured JSON retrieval for all supported sensor types. |
 | **Camera Streaming** | Low-latency binary JPEG streaming over WebSockets. |
 
-### ⏳ Backend Planned
+### Backend Not yet supported
 | Feature | Note |
 | :--- | :--- |
 | **Doctor Login** | Transition from simple name entry to secure authentication. |
