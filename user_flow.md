@@ -9,7 +9,7 @@ The primary workflow for medical staff to monitor patient vitals and camera feed
 
 ```mermaid
 graph TD
-    A[Start: Visit Web App] --> B[Enter Doctor Name & Log In]
+    A[Start: Visit Web App] --> B[Enter Doctor Log In]
     B --> C[Select Clinic from list]
     C --> D[Select Patient from List]
     D --> E{Patient Dashboard}
@@ -20,7 +20,7 @@ graph TD
 ```
 
 ### Steps:
-1. **Authentication**: Enter "Doctor name" and click **Log In**.
+1. **Authentication**: Enter Doctor details and click **Log In**.
 2. **Clinic Selection**: Choose a clinic from the available list populated from the server.
 3. **Patient Selection**: Once a clinic is selected, a list of active patients for that clinic is displayed.
 4. **Data Review**:
@@ -58,17 +58,17 @@ graph TD
 
 ## Flow Implementation Status
 
-| Feature | Status | Note |
-| :--- | :--- | :--- |
-BACK END COMPLETED
+### ✅ Backend Completed
+| Feature | Note |
+| :--- | :--- |
+| **Clinic/Patient Navigation** | Dynamic fetching of clinics and patient lists via REST API. |
+| **Data Visualization** | Structured JSON retrieval for all supported sensor types. |
+| **Camera Streaming** | Low-latency binary JPEG streaming over WebSockets. |
 
-| Clinic/Patient Navigation | Implemented | Dynamic fetching via API. |
-| Data Visualization | Implemented | JSON-based record display. |
-| Camera Streaming | Implemented | WebSocket binary stream. |
-
-NOT COMLPETED YET FROM BACK END SIDE
-
-| Doctor Login | planned | Simple login. |
-| Admin Portal | Planned | UI and specific API routes pending. |
-| Delete Records | Planned | File-system deletion API required. |
-| Doctor-to-Clinic Mapping | Planned | Requires persistent configuration mapping. |
+### ⏳ Backend Planned
+| Feature | Note |
+| :--- | :--- |
+| **Doctor Login** | Transition from simple name entry to secure authentication. |
+| **Admin Portal** | New routes for system-wide configuration and management. |
+| **Delete Records** | Endpoint for authenticated deletion of patient data files. |
+| **Doctor-to-Clinic Mapping** | Persistence layer to associate medical staff with specific clinics. |
