@@ -140,19 +140,17 @@ func saveRecord(record Record) error {
 		return err
 	}
 
-	filename := metricFile(record.RawData)
-	if filename == "" {
-		filename = "misc.json"
+	baseFilename := metricFile(record.RawData)
+	if baseFilename == "" {
+		baseFilename = "misc"
 	}
+	
+	filename := fmt.Sprintf("%s_%d.json", baseFilename, record.Timestamp.Unix())
 	path := filepath.Join(dir, filename)
 
-	var existing []Record
-	if b, err := os.ReadFile(path); err == nil && len(b) > 0 {
-		_ = json.Unmarshal(b, &existing)
-	}
-	existing = append(existing, record)
+	recordsToSave := []Record{record}
 
-	data, err := json.MarshalIndent(existing, "", "  ")
+	data, err := json.MarshalIndent(recordsToSave, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -373,23 +371,28 @@ func handleStreamWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func metricFile(data map[string]interface{}) string {
+	payload := data
+	if d, ok := data["data"].(map[string]interface{}); ok {
+		payload = d
+	}
+
 	lowerKeys := map[string]bool{}
-	for k := range data {
+	for k := range payload {
 		lowerKeys[strings.ToLower(k)] = true
 	}
 	switch {
 	case lowerKeys["pr"] || lowerKeys["spo2"]:
-		return "heart_rate.json"
+		return "heart_rate"
 	case lowerKeys["sys"] || lowerKeys["dia"] || lowerKeys["cuff_pressure"]:
-		return "bp.json"
+		return "bp"
 	case lowerKeys["glu"]:
-		return "glucose.json"
+		return "glucose"
 	case lowerKeys["temp"]:
-		return "temperature.json"
-	case lowerKeys["type"] && data["type"] == "stream" && (data["stream_type"] == "audio" || data["stream_type"] == "heartrate"):
-		return "stethoscope.json"
+		return "temperature"
+	case lowerKeys["type"] && payload["type"] == "stream" && (payload["stream_type"] == "audio" || payload["stream_type"] == "heartrate"):
+		return "stethoscope"
 	default:
-		return "misc.json"
+		return "misc"
 	}
 }
 
