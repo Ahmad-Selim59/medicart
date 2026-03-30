@@ -1,0 +1,8 @@
+[
+  {
+    "timestamp": "2026-03-30T19:00:00Z",
+    "patient_name": "Ahmad",
+    "clinic_name": "ClinicA",
+    "data": { "type": "data", "pr": 74, "spo2": 99 }
+  }
+]
