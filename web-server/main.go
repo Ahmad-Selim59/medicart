@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/joho/godotenv"
 )
 
 type DataStorage struct {
@@ -38,6 +39,15 @@ var (
 )
 
 func main() {
+	// Try to find the .env file in the executable's directory
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		_ = godotenv.Load(filepath.Join(exeDir, ".env"))
+	}
+	
+	// Also try loading from current working directory as fallback
+	_ = godotenv.Load()
+
 	ensureStorageFile()
 	ensureDataDir()
 
@@ -46,10 +56,13 @@ func main() {
 	http.HandleFunc("/ws/stream", handleStreamWS) // clinic & patient query params
 	http.HandleFunc("/api/feed/start", handleFeedStart)
 	http.HandleFunc("/api/feed/stop", handleFeedStop)
-	http.HandleFunc("/api/clinics", handleClinics)
-	http.HandleFunc("/clinics", handleClinics) // simple alias
-	http.HandleFunc("/api/camera/control", handleCameraControl)
-	http.HandleFunc("/api/clinic/", handleClinicRoutes)
+	http.HandleFunc("/api/clinics", authMiddleware(handleClinics))
+	http.HandleFunc("/clinics", authMiddleware(handleClinics)) // simple alias
+	http.HandleFunc("/api/camera/control", handleCameraControl) // optionally protect this too? Let's leave it for now
+	http.HandleFunc("/api/clinic/", authMiddleware(handleClinicRoutes))
+	http.HandleFunc("/api/patient/", authMiddleware(handlePatientRoutes))
+	http.HandleFunc("/api/patients", authMiddleware(handleAllPatients))
+	http.HandleFunc("/api/dashboard", authMiddleware(handleDashboard))
 
 	port := ":8081"
 	fmt.Printf("Web Server starting on port %s...\n", port)
@@ -404,112 +417,7 @@ func safe(s string) string {
 	return s
 }
 
-// --- Listing APIs ---
-func handleClinics(w http.ResponseWriter, r *http.Request) {
-	if preflight(w, r) {
-		return
-	}
-	entries, err := os.ReadDir("data")
-	if err != nil {
-		http.Error(w, "Failed to list clinics", http.StatusInternalServerError)
-		return
-	}
-	var clinics []string
-	for _, e := range entries {
-		if e.IsDir() {
-			clinics = append(clinics, e.Name())
-		}
-	}
-	writeJSON(w, clinics)
-}
-
-// Routes under /api/clinic/{clinic}/...
-func handleClinicRoutes(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/api/clinic/")
-	parts := strings.Split(path, "/")
-	if len(parts) == 0 || parts[0] == "" {
-		http.NotFound(w, r)
-		return
-	}
-	clinic := parts[0]
-	if len(parts) == 1 {
-		http.NotFound(w, r)
-		return
-	}
-	switch parts[1] {
-	case "patients":
-		handlePatients(w, r, clinic)
-	case "patient":
-		if len(parts) >= 4 && parts[3] == "data" {
-			patient := parts[2]
-			handlePatientData(w, r, clinic, patient)
-		} else if len(parts) >= 4 && parts[3] == "camera" {
-			patient := parts[2]
-			handlePatientCamera(w, r, clinic, patient)
-		} else {
-			http.NotFound(w, r)
-		}
-	default:
-		http.NotFound(w, r)
-	}
-}
-
-func handlePatients(w http.ResponseWriter, r *http.Request, clinic string) {
-	if preflight(w, r) {
-		return
-	}
-	dir := filepath.Join("data", clinic)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		http.Error(w, "Failed to list patients", http.StatusInternalServerError)
-		return
-	}
-	var patients []string
-	for _, e := range entries {
-		if e.IsDir() {
-			patients = append(patients, e.Name())
-		}
-	}
-	writeJSON(w, patients)
-}
-
-func handlePatientData(w http.ResponseWriter, r *http.Request, clinic, patient string) {
-	if preflight(w, r) {
-		return
-	}
-	dir := filepath.Join("data", clinic, patient)
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		http.Error(w, "Failed to read patient data", http.StatusInternalServerError)
-		return
-	}
-	result := map[string]interface{}{}
-	for _, f := range files {
-		if f.IsDir() {
-			continue
-		}
-		name := f.Name()
-		if strings.HasSuffix(name, ".json") {
-			b, err := os.ReadFile(filepath.Join(dir, name))
-			if err != nil {
-				continue
-			}
-			var recs []Record
-			if err := json.Unmarshal(b, &recs); err == nil {
-				result[name] = recs
-			}
-		}
-	}
-	writeJSON(w, result)
-}
-
-func handlePatientCamera(w http.ResponseWriter, r *http.Request, clinic, patient string) {
-	if preflight(w, r) {
-		return
-	}
-	path := filepath.Join("data", clinic, patient, "camera.jpg")
-	http.ServeFile(w, r, path)
-}
+// Handlers are now in api.go
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
