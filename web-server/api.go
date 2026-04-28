@@ -297,7 +297,7 @@ func handleClinicRoutes(w http.ResponseWriter, r *http.Request) {
 			allowed = strings.Split(allowedStr, ",")
 		}
 
-		var result []Patient
+		result := []Patient{}
 		patients := getAllPatients(allowed)
 		for _, p := range patients {
 			if p.ClinicID == clinicID {
