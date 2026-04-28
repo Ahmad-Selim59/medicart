@@ -33,52 +33,74 @@ type Patient struct {
 }
 
 func getAllClinics(allowedClinics []string) []Clinic {
-	var clinics []Clinic
-	entries, err := os.ReadDir("data")
-	if err != nil {
-		return clinics
+	clinics := []Clinic{}
+	clinicsMap := make(map[string]bool)
+
+	// 1. Add all authorized clinics from Supabase (Source of Truth)
+	for _, name := range allowedClinics {
+		if name != "" && !clinicsMap[name] {
+			// We fetch metadata if available, otherwise use defaults
+			clinics = append(clinics, Clinic{
+				ID:           name,
+				Name:         name,
+				Address:      "Address N/A",
+				Phone:        "N/A",
+				Email:        "N/A",
+				Website:      "N/A",
+				Action:       "View",
+				PatientCount: 0,
+				Status:       "active",
+			})
+			clinicsMap[name] = true
+		}
 	}
 
-	allowedMap := make(map[string]bool)
-	for _, c := range allowedClinics {
-		allowedMap[c] = true
-	}
+	// 2. Add local folders (and update patient counts for existing ones)
+	entries, _ := os.ReadDir("data")
+	for _, e := range entries {
+		if e.IsDir() {
+			name := e.Name()
+			
+			// count patients in folder
+			patientEntries, _ := os.ReadDir(filepath.Join("data", name))
+			patientCount := 0
+			for _, pe := range patientEntries {
+				if pe.IsDir() {
+					patientCount++
+				}
+			}
 
-	for i, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		name := e.Name()
-
-		// Filter if allowedClinics is provided
-		if len(allowedClinics) > 0 && !allowedMap[name] {
-			continue
-		}
-
-		// count patients
-		patientEntries, _ := os.ReadDir(filepath.Join("data", name))
-		patientCount := 0
-		for _, pe := range patientEntries {
-			if pe.IsDir() {
-				patientCount++
+			if !clinicsMap[name] {
+				// Only show if no authorized list provided (e.g. admin or local mode)
+				if len(allowedClinics) == 0 {
+					clinics = append(clinics, Clinic{
+						ID:           name,
+						Name:         name,
+						Address:      "Address N/A",
+						Phone:        "N/A",
+						Email:        "N/A",
+						Website:      "N/A",
+						Action:       "View",
+						PatientCount: patientCount,
+						Status:       "active",
+					})
+					clinicsMap[name] = true
+				}
+			} else {
+				// Update patient count for the already added clinic
+				for i := range clinics {
+					if clinics[i].Name == name {
+						clinics[i].PatientCount = patientCount
+						break
+					}
+				}
 			}
 		}
-
-		clinics = append(clinics, Clinic{
-			ID:           name, // use name as ID for simplicity
-			Name:         name,
-			Address:      "Address N/A",
-			Phone:        "N/A",
-			Email:        "N/A",
-			Website:      "N/A",
-			Action:       "View",
-			PatientCount: patientCount,
-			Status:       "active",
-		})
-		_ = i
 	}
+
 	return clinics
 }
+
 
 func buildPatient(clinicName string, patientName string) Patient {
 	dir := filepath.Join("data", clinicName, patientName)
