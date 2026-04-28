@@ -642,17 +642,34 @@ func main() {
 
 	// --- Layout Refactor ---
 
-	// 1. Dashboard Tab
-	dashboardContent := container.NewVBox(
-		widget.NewCard("Current Status", "", container.NewVBox(statusLabel)),
-		container.NewPadded(stopBtn),
-		widget.NewLabel("Activity Logs:"),
-		container.NewStack(logArea), // Stack allows it to fill available space better in VBox
+	// 1. Patients Tab
+	// Mimicking the Patient Info & Overview section
+	ageEntry := widget.NewEntry()
+	ageEntry.SetText("62")
+	weightEntry := widget.NewEntry()
+	weightEntry.SetText("85")
+	heightEntry := widget.NewEntry()
+	heightEntry.SetText("180")
+
+	patientOverview := container.NewGridWithColumns(3,
+		container.NewVBox(widget.NewLabelWithStyle("AGE (YRS)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), ageEntry),
+		container.NewVBox(widget.NewLabelWithStyle("WEIGHT (KG)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), weightEntry),
+		container.NewVBox(widget.NewLabelWithStyle("HEIGHT (CM)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), heightEntry),
 	)
 
-	// 2. Vitals Tab
-	vitalsContent := container.NewVBox(
-		widget.NewLabelWithStyle("Patient Vitals", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+	patientsContent := container.NewVBox(
+		widget.NewCard("Identity Context", "Select Clinic and Patient", container.NewVBox(
+			clinicNameLabel, clinicNameEntry,
+			patientNameLabel, patientNameEntry,
+		)),
+		widget.NewCard("Patient Overview", "", patientOverview),
+	)
+
+	// 2. Readings Tab
+	// Mimicking the Vitals & Stethoscope section + Live Console
+	readingsContent := container.NewVBox(
+		widget.NewLabelWithStyle("Patient Readings", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel("Select a vital sign to begin live monitoring."),
 		container.NewGridWithColumns(2,
 			btnHeartRate,
 			btnNIBP,
@@ -660,61 +677,71 @@ func main() {
 			btnTemp,
 		),
 		widget.NewSeparator(),
-		widget.NewCard("Stethoscope", "Mintti Digital Stethoscope", container.NewVBox(
+		widget.NewCard("Connect Stethoscope", "Stream high-fidelity auscultation", container.NewVBox(
 			btnStethoscopeList,
 			widget.NewLabel("MAC Address:"),
 			stethMacEntry,
 			btnStethoscopeConnect,
 		)),
+		widget.NewSeparator(),
+		widget.NewCard("Live Console", "System Active", container.NewVBox(
+			statusLabel,
+			container.NewStack(logArea),
+			stopBtn,
+		)),
 	)
 
-	// 3. Camera Tab
-	cameraContent := container.NewVBox(
-		widget.NewCard("PTZ Controls", "Pan-Tilt-Zoom", container.NewVBox(
-			btnCamList,
-			container.NewCenter(
-				container.NewVBox(
-					container.NewCenter(btnCamUp),
-					container.NewHBox(btnCamLeft, btnCamDown, btnCamRight),
-				),
-			),
-			btnCamFlip,
-		)),
-		widget.NewCard("Preview", "", container.NewVBox(
+	// 3. Comms Tab
+	// Mimicking the Remote Comm & Camera section
+	commsContent := container.NewVBox(
+		widget.NewCard("Live Feed", "", container.NewVBox(
 			container.NewGridWithColumns(2, btnPreviewStart, btnPreviewStop),
 			previewImage,
 			advancedBtn,
 			advancedContainer,
 		)),
+		widget.NewCard("Camera Control", "Precision Pan-Tilt-Zoom", container.NewVBox(
+			btnCamList,
+			container.NewCenter(
+				container.NewGridWithColumns(3,
+					widget.NewLabel(""), btnCamUp, widget.NewLabel(""),
+					btnCamLeft, widget.NewButtonWithIcon("Reset", theme.ViewRefreshIcon(), func(){
+						runCameraCommand("reset", []string{"-reset"}) // Assuming reset exists
+					}), btnCamRight,
+					widget.NewLabel(""), btnCamDown, widget.NewLabel(""),
+				),
+			),
+			btnCamFlip,
+		)),
 	)
 
-	// 4. Configuration Tab
-	configContent := container.NewVBox(
-		widget.NewCard("Endpoint Settings", "API & WebSocket", container.NewVBox(
+	// 4. Settings Tab
+	// Mimicking the Configuration Settings section
+	settingsContent := container.NewVBox(
+		widget.NewCard("Configuration Settings", "Manage hospital connectivity", container.NewVBox(
+			widget.NewLabelWithStyle("Server Environment", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 			urlLabel, urlEntry,
 			widget.NewSeparator(),
+			widget.NewLabelWithStyle("WebSocket Feed Control", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 			wsURLLabel, wsURLEntry,
 			wsStatus,
 			container.NewGridWithColumns(2, wsConnectBtn, wsDisconnectBtn),
-		)),
-		widget.NewCard("Identity Context", "Metadata for Uploads", container.NewVBox(
-			clinicNameLabel, clinicNameEntry,
-			patientNameLabel, patientNameEntry,
 		)),
 		widget.NewCard("Display", "", lightModeCheck),
 	)
 
 	// Main Tab Container
 	tabs := container.NewAppTabs(
-		container.NewTabItemWithIcon("Dashboard", theme.HomeIcon(), container.NewVScroll(dashboardContent)),
-		container.NewTabItemWithIcon("Vitals", theme.InfoIcon(), container.NewVScroll(vitalsContent)),
-		container.NewTabItemWithIcon("Camera", theme.VisibilityIcon(), container.NewVScroll(cameraContent)),
-		container.NewTabItemWithIcon("Settings", theme.SettingsIcon(), container.NewVScroll(configContent)),
+		container.NewTabItemWithIcon("Patients", theme.AccountIcon(), container.NewVScroll(patientsContent)),
+		container.NewTabItemWithIcon("Readings", theme.InfoIcon(), container.NewVScroll(readingsContent)),
+		container.NewTabItemWithIcon("Comms", theme.VisibilityIcon(), container.NewVScroll(commsContent)),
+		container.NewTabItemWithIcon("Settings", theme.SettingsIcon(), container.NewVScroll(settingsContent)),
 	)
-	tabs.SetTabLocation(container.TabLocationTop)
+	tabs.SetTabLocation(container.TabLocationBottom) // Move tabs to bottom to mimic mobile/app feel from the designs
 
 	myWindow.SetContent(tabs)
-	myWindow.Resize(fyne.NewSize(480, 780))
+	myWindow.Resize(fyne.NewSize(480, 800))
+
 	myWindow.ShowAndRun()
 }
 
