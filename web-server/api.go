@@ -36,10 +36,17 @@ func getAllClinics(allowedClinics []string) []Clinic {
 	clinics := []Clinic{}
 	clinicsMap := make(map[string]bool)
 
-	// 1. Add all authorized clinics from Supabase (Source of Truth)
+	// Filter out internal markers like __none__
+	cleanAllowed := []string{}
 	for _, name := range allowedClinics {
-		if name != "" && !clinicsMap[name] {
-			// We fetch metadata if available, otherwise use defaults
+		if name != "" && name != "__none__" {
+			cleanAllowed = append(cleanAllowed, name)
+		}
+	}
+
+	// 1. Add all authorized clinics from Supabase (Source of Truth)
+	for _, name := range cleanAllowed {
+		if !clinicsMap[name] {
 			clinics = append(clinics, Clinic{
 				ID:           name,
 				Name:         name,
@@ -55,7 +62,8 @@ func getAllClinics(allowedClinics []string) []Clinic {
 		}
 	}
 
-	// 2. Add local folders (and update patient counts for existing ones)
+	// 2. Add local folders (only if no authorized list provided at all)
+	// We check len(allowedClinics) == 0 to see if the query param was missing
 	entries, _ := os.ReadDir("data")
 	for _, e := range entries {
 		if e.IsDir() {
@@ -71,7 +79,8 @@ func getAllClinics(allowedClinics []string) []Clinic {
 			}
 
 			if !clinicsMap[name] {
-				// Only show if no authorized list provided (e.g. admin or local mode)
+				// ONLY fallback to local folders if NO allowed list was provided
+				// This prevents unauthorized users from seeing everything
 				if len(allowedClinics) == 0 {
 					clinics = append(clinics, Clinic{
 						ID:           name,
@@ -100,6 +109,7 @@ func getAllClinics(allowedClinics []string) []Clinic {
 
 	return clinics
 }
+
 
 
 func buildPatient(clinicName string, patientName string) Patient {
