@@ -33,39 +33,59 @@ type Patient struct {
 }
 
 func getAllClinics(allowedClinics []string) []Clinic {
-	clinics := []Clinic{}
-	clinicsMap := make(map[string]bool)
-
-	// 1. Add all authorized clinics from Supabase
-	for _, name := range allowedClinics {
-		if name != "" && !clinicsMap[name] {
-			clinics = append(clinics, Clinic{ID: name, Name: name})
-			clinicsMap[name] = true
-		}
+	var clinics []Clinic
+	entries, err := os.ReadDir("data")
+	if err != nil {
+		return clinics
 	}
 
-	// 2. Add local folders (only if no authorized list provided)
-	entries, _ := os.ReadDir("data")
-	for _, e := range entries {
-		if e.IsDir() {
-			name := e.Name()
-			if !clinicsMap[name] && len(allowedClinics) == 0 {
-				clinics = append(clinics, Clinic{ID: name, Name: name})
-				clinicsMap[name] = true
+	allowedMap := make(map[string]bool)
+	for _, c := range allowedClinics {
+		allowedMap[c] = true
+	}
+
+	for i, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+
+		// Filter if allowedClinics is provided
+		if len(allowedClinics) > 0 && !allowedMap[name] {
+			continue
+		}
+
+		// count patients
+		patientEntries, _ := os.ReadDir(filepath.Join("data", name))
+		patientCount := 0
+		for _, pe := range patientEntries {
+			if pe.IsDir() {
+				patientCount++
 			}
 		}
-	}
 
+		clinics = append(clinics, Clinic{
+			ID:           name, // use name as ID for simplicity
+			Name:         name,
+			Address:      "Address N/A",
+			Phone:        "N/A",
+			Email:        "N/A",
+			Website:      "N/A",
+			Action:       "View",
+			PatientCount: patientCount,
+			Status:       "active",
+		})
+		_ = i
+	}
 	return clinics
 }
-
 
 func buildPatient(clinicName string, patientName string) Patient {
 	dir := filepath.Join("data", clinicName, patientName)
 	files, err := os.ReadDir(dir)
-	
+
 	realData := make(map[string]interface{})
-	
+
 	if err == nil {
 		for _, f := range files {
 			if f.IsDir() {
@@ -85,9 +105,13 @@ func buildPatient(clinicName string, patientName string) Patient {
 					if lastIdx != -1 {
 						key = nameNoExt[:lastIdx]
 					}
-					if key == "heart_rate" { key = "heartRate" }
-					if key == "bp" { key = "bloodPressure" }
-					
+					if key == "heart_rate" {
+						key = "heartRate"
+					}
+					if key == "bp" {
+						key = "bloodPressure"
+					}
+
 					var innerData []interface{}
 					for _, r := range recs {
 						innerData = append(innerData, r.RawData)
@@ -118,7 +142,7 @@ func buildPatient(clinicName string, patientName string) Patient {
 }
 
 func getAllPatients(allowedClinics []string) []Patient {
-	patients := []Patient{}
+	var patients []Patient
 	clinics := getAllClinics(allowedClinics)
 	for _, c := range clinics {
 		entries, err := os.ReadDir(filepath.Join("data", c.Name))
@@ -133,7 +157,6 @@ func getAllPatients(allowedClinics []string) []Patient {
 	}
 	return patients
 }
-
 
 func handleClinics(w http.ResponseWriter, r *http.Request) {
 	if preflight(w, r) {
@@ -163,7 +186,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if preflight(w, r) {
 		return
 	}
-	
+
 	allowedStr := r.URL.Query().Get("clinics")
 	var allowed []string
 	if allowedStr != "" {
@@ -178,7 +201,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 			"totalPatients": len(patients),
 			"activeClinics": len(clinics),
 			"activeDevices": len(patients), // Assume 1 device per patient
-			"alertsCount": 0,
+			"alertsCount":   0,
 		},
 	}
 
@@ -219,7 +242,7 @@ func handleClinicRoutes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clinicID := parts[0]
-	
+
 	if len(parts) == 1 {
 		if preflight(w, r) {
 			return
@@ -251,8 +274,8 @@ func handleClinicRoutes(w http.ResponseWriter, r *http.Request) {
 		if allowedStr != "" {
 			allowed = strings.Split(allowedStr, ",")
 		}
-		
-		result := []Patient{}
+
+		var result []Patient
 		patients := getAllPatients(allowed)
 		for _, p := range patients {
 			if p.ClinicID == clinicID {
