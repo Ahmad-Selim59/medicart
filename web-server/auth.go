@@ -78,10 +78,13 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// Inject the allowed clinics into the request context, or just set it as a header/query for simplicity
-		// For simplicity, we'll inject it into the URL query so existing handlers work without modification
+		// Inject the allowed clinics into the request context
 		q := r.URL.Query()
-		q.Set("clinics", strings.Join(allowedClinics, ","))
+		clinicsStr := strings.Join(allowedClinics, ",")
+		if clinicsStr == "" {
+			clinicsStr = "__none__" // Explicitly mark as unauthorized to prevent fallback to 'show everything'
+		}
+		q.Set("clinics", clinicsStr)
 		r.URL.RawQuery = q.Encode()
 
 		next.ServeHTTP(w, r)
