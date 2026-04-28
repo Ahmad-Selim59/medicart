@@ -44,7 +44,7 @@ func main() {
 		exeDir := filepath.Dir(exePath)
 		_ = godotenv.Load(filepath.Join(exeDir, ".env"))
 	}
-	
+
 	// Also try loading from current working directory as fallback
 	_ = godotenv.Load()
 
@@ -57,7 +57,7 @@ func main() {
 	http.HandleFunc("/api/feed/start", handleFeedStart)
 	http.HandleFunc("/api/feed/stop", handleFeedStop)
 	http.HandleFunc("/api/clinics", authMiddleware(handleClinics))
-	http.HandleFunc("/clinics", authMiddleware(handleClinics)) // simple alias
+	http.HandleFunc("/clinics", authMiddleware(handleClinics))  // simple alias
 	http.HandleFunc("/api/camera/control", handleCameraControl) // optionally protect this too? Let's leave it for now
 	http.HandleFunc("/api/clinic/", authMiddleware(handleClinicRoutes))
 	http.HandleFunc("/api/patient/", authMiddleware(handlePatientRoutes))
@@ -66,25 +66,33 @@ func main() {
 
 	port := ":8081"
 	fmt.Printf("Web Server starting on port %s...\n", port)
-	if err := http.ListenAndServe(port, nil); err != nil {
+
+	// Wrap the default mux with CORS middleware
+	handler := corsMiddleware(http.DefaultServeMux)
+
+	if err := http.ListenAndServe(port, handler); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// --- CORS helpers ---
-func setCORS(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+// corsMiddleware handles CORS for all routes
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, apikey")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 func preflight(w http.ResponseWriter, r *http.Request) bool {
-	if r.Method == http.MethodOptions {
-		setCORS(w)
-		w.WriteHeader(http.StatusOK)
-		return true
-	}
-	setCORS(w)
+	// Already handled by middleware, return false to continue to actual handler
 	return false
 }
 
@@ -157,7 +165,7 @@ func saveRecord(record Record) error {
 	if baseFilename == "" {
 		baseFilename = "misc"
 	}
-	
+
 	filename := fmt.Sprintf("%s_%d.json", baseFilename, record.Timestamp.Unix())
 	path := filepath.Join(dir, filename)
 
@@ -173,7 +181,6 @@ func saveRecord(record Record) error {
 func ensureDataDir() {
 	_ = os.MkdirAll("data", 0755)
 }
-
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
@@ -209,7 +216,7 @@ func handleFeedWS(w http.ResponseWriter, r *http.Request) {
 		} else {
 			// Expect JSON metadata: {"clinic_name": "...", "patient_name": "..."}
 			var meta struct {
-				Clinic string `json:"clinic_name"`
+				Clinic  string `json:"clinic_name"`
 				Patient string `json:"patient_name"`
 			}
 			if err := json.Unmarshal(msg, &meta); err == nil {
