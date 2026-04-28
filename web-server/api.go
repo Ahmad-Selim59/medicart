@@ -34,51 +34,31 @@ type Patient struct {
 
 func getAllClinics(allowedClinics []string) []Clinic {
 	clinics := []Clinic{}
-	entries, err := os.ReadDir("data")
-	if err != nil {
-		return clinics
+	clinicsMap := make(map[string]bool)
+
+	// 1. Add all authorized clinics from Supabase
+	for _, name := range allowedClinics {
+		if name != "" && !clinicsMap[name] {
+			clinics = append(clinics, Clinic{ID: name, Name: name})
+			clinicsMap[name] = true
+		}
 	}
 
-	allowedMap := make(map[string]bool)
-	for _, c := range allowedClinics {
-		allowedMap[c] = true
-	}
-
-	for i, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		name := e.Name()
-
-		// Filter if allowedClinics is provided
-		if len(allowedClinics) > 0 && !allowedMap[name] {
-			continue
-		}
-
-		// count patients
-		patientEntries, _ := os.ReadDir(filepath.Join("data", name))
-		patientCount := 0
-		for _, pe := range patientEntries {
-			if pe.IsDir() {
-				patientCount++
+	// 2. Add local folders (only if no authorized list provided)
+	entries, _ := os.ReadDir("data")
+	for _, e := range entries {
+		if e.IsDir() {
+			name := e.Name()
+			if !clinicsMap[name] && len(allowedClinics) == 0 {
+				clinics = append(clinics, Clinic{ID: name, Name: name})
+				clinicsMap[name] = true
 			}
 		}
-
-		clinics = append(clinics, Clinic{
-			ID:           name, // use name as ID for simplicity
-			Name:         name,
-			Address:      "Address N/A",
-			Phone:        "N/A",
-			Email:        "N/A",
-			Website:      "N/A",
-			Action:       "View",
-			PatientCount: patientCount,
-			Status:       "active",
-		})
-		_ = i
 	}
+
 	return clinics
 }
+
 
 func buildPatient(clinicName string, patientName string) Patient {
 	dir := filepath.Join("data", clinicName, patientName)
