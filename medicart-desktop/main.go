@@ -29,20 +29,24 @@ import (
 type LineParser func(line string) (interface{}, error)
 
 var (
-	currentCmd *exec.Cmd
-	cmdMutex   sync.Mutex
-	cancelFunc context.CancelFunc
-	previewMu  sync.Mutex
+	currentCmd    *exec.Cmd
+	cmdMutex      sync.Mutex
+	cancelFunc    context.CancelFunc
+	previewMu     sync.Mutex
 	previewCancel context.CancelFunc
-	wsConn    *websocket.Conn
-	wsMu      sync.Mutex
-	wsCancel  context.CancelFunc
-	streamCancel context.CancelFunc
+	wsConn        *websocket.Conn
+	wsMu          sync.Mutex
+	wsCancel      context.CancelFunc
+	streamCancel  context.CancelFunc
 )
 
 func main() {
 	myApp := app.New()
 	myWindow := myApp.NewWindow("Medicart Uploader")
+
+	var connectWS func() error
+	var btnPreviewStart, btnPreviewStop *widget.Button
+	var btnBroadcastStart, btnBroadcastStop *widget.Button
 
 	// Theme Toggle
 	lightModeCheck := widget.NewCheck("Light Mode", func(checked bool) {
@@ -51,23 +55,39 @@ func main() {
 		} else {
 			myApp.Settings().SetTheme(theme.DarkTheme())
 		}
+		myApp.Preferences().SetBool("light_mode", checked)
 	})
+	lightModeCheck.Checked = myApp.Preferences().Bool("light_mode")
+	if lightModeCheck.Checked {
+		myApp.Settings().SetTheme(theme.LightTheme())
+	}
 
 	// URL Input
 	urlLabel := widget.NewLabel("Web Server URL:")
 	urlEntry := widget.NewEntry()
 	urlEntry.SetPlaceHolder("http://your-server.com/api/ingest")
-	urlEntry.Text = "http://localhost:8080/api/data" // Default for testing
+	urlEntry.Text = myApp.Preferences().StringWithFallback("server_url", "http://localhost:8081/api/ingest")
+	urlEntry.OnChanged = func(s string) {
+		myApp.Preferences().SetString("server_url", s)
+	}
 
 	// Patient Name Input
 	patientNameLabel := widget.NewLabel("Patient Name:")
 	patientNameEntry := widget.NewEntry()
 	patientNameEntry.SetPlaceHolder("Enter patient name")
+	patientNameEntry.Text = myApp.Preferences().String("patient_name")
+	patientNameEntry.OnChanged = func(s string) {
+		myApp.Preferences().SetString("patient_name", s)
+	}
 
 	// Clinic Name Input
 	clinicNameLabel := widget.NewLabel("Clinic Name:")
 	clinicNameEntry := widget.NewEntry()
 	clinicNameEntry.SetPlaceHolder("Enter clinic name")
+	clinicNameEntry.Text = myApp.Preferences().String("clinic_name")
+	clinicNameEntry.OnChanged = func(s string) {
+		myApp.Preferences().SetString("clinic_name", s)
+	}
 
 	// Status Area
 	statusLabel := widget.NewRichTextFromMarkdown("Status: Idle")
@@ -138,15 +158,16 @@ func main() {
 			}
 			statusLabel.Refresh()
 
-			// Force redraw of buttons if they visually glitch
-			for _, b := range refreshButtons {
-				if b != nil {
-					if b.Text == "" {
-						if txt, ok := buttonDefaults[b]; ok {
+			// Force redraw of buttons only if they are actually missing text
+			// and only every few log messages to avoid flooding the UI thread
+			if len(logArea.Text)%5 == 0 {
+				for _, b := range refreshButtons {
+					if b != nil && b.Text == "" {
+						if txt, ok := buttonDefaults[b]; ok && txt != "" {
 							b.SetText(txt)
+							b.Refresh()
 						}
 					}
-					b.Refresh()
 				}
 			}
 		})
@@ -227,12 +248,16 @@ func main() {
 
 	stethMacEntry = widget.NewEntry()
 	stethMacEntry.SetPlaceHolder("AA:BB:CC:DD:EE:FF")
+	stethMacEntry.Text = myApp.Preferences().String("steth_mac")
+	stethMacEntry.OnChanged = func(s string) {
+		myApp.Preferences().SetString("steth_mac", s)
+	}
 
 	btnStethoscopeConnect := widget.NewButtonWithIcon("Connect", theme.MediaPlayIcon(), func() {
 		mac := strings.TrimSpace(stethMacEntry.Text)
 		if mac == "" {
 			// If no MAC is entered, try to auto-detect if there's exactly one device
-			
+
 			cmdPath := "MinttiCLI.exe"
 			if _, err := exec.LookPath(cmdPath); err != nil {
 				cmdPath = "./MinttiCLI.exe"
@@ -340,7 +365,6 @@ func main() {
 		applyPreview()
 	})
 
-
 	// Camera Preview (snapshot via ffmpeg dshow)
 	stopPreviewInternal := func(logMsg string) {
 		previewMu.Lock()
@@ -350,6 +374,10 @@ func main() {
 			if logMsg != "" {
 				log(logMsg)
 			}
+			fyne.Do(func() {
+				btnPreviewStart.Enable()
+				btnPreviewStop.Disable()
+			})
 		}
 		previewMu.Unlock()
 	}
@@ -377,6 +405,8 @@ func main() {
 		previewMu.Unlock()
 
 		log(fmt.Sprintf("Starting camera preview for %s", device))
+		btnPreviewStart.Disable()
+		btnPreviewStop.Enable()
 
 		go func() {
 			ticker := time.NewTicker(1 * time.Second)
@@ -419,9 +449,6 @@ func main() {
 		stopPreviewInternal("Camera preview stopped")
 	}
 
-	btnPreviewStart := widget.NewButtonWithIcon("Start Preview", theme.VisibilityIcon(), startPreview)
-	btnPreviewStop := widget.NewButtonWithIcon("Stop Preview", theme.VisibilityOffIcon(), stopPreview)
-
 	// Streaming helpers
 	resolveDevice := func(sel string) (string, error) {
 		device := strings.TrimSpace(sel)
@@ -442,6 +469,10 @@ func main() {
 			streamCancel()
 			streamCancel = nil
 			log("Stream stopped")
+			fyne.Do(func() {
+				btnBroadcastStart.Enable()
+				btnBroadcastStop.Disable()
+			})
 		}
 		wsMu.Unlock()
 	}
@@ -450,10 +481,16 @@ func main() {
 		wsMu.Lock()
 		if wsConn == nil {
 			wsMu.Unlock()
-			log("Error: WS not connected")
-			return
+			log("Connecting to server...")
+			if err := connectWS(); err != nil {
+				log(fmt.Sprintf("Auto-connect failed: %v", err))
+				return
+			}
+			// Wait a brief moment for connection to stabilize if needed
+			time.Sleep(100 * time.Millisecond)
+		} else {
+			wsMu.Unlock()
 		}
-		wsMu.Unlock()
 
 		wsMu.Lock()
 		if streamCancel != nil {
@@ -469,15 +506,14 @@ func main() {
 			return
 		}
 
-		clinic := strings.TrimSpace(clinicNameEntry.Text)
-		patient := strings.TrimSpace(patientNameEntry.Text)
-
 		ctx, cancel := context.WithCancel(context.Background())
 		wsMu.Lock()
 		streamCancel = cancel
 		wsMu.Unlock()
 
 		log(fmt.Sprintf("Starting stream for %s", device))
+		btnBroadcastStart.Disable()
+		btnBroadcastStop.Enable()
 
 		go func() {
 			ticker := time.NewTicker(1 * time.Second)
@@ -493,10 +529,10 @@ func main() {
 						continue
 					}
 					go func(img image.Image) {
-						// send metadata first once per stream? We'll send periodically
+						// Always use the latest clinic name from the entry
+						currentClinic := strings.TrimSpace(clinicNameEntry.Text)
 						meta := map[string]string{
-							"clinic_name":  clinic,
-							"patient_name": patient,
+							"clinic_name": currentClinic,
 						}
 						metaJSON, _ := json.Marshal(meta)
 
@@ -526,25 +562,47 @@ func main() {
 		}()
 	}
 
+	btnPreviewStart = widget.NewButtonWithIcon("Start Preview", theme.VisibilityIcon(), startPreview)
+	btnPreviewStop = widget.NewButtonWithIcon("Stop Preview", theme.VisibilityOffIcon(), stopPreview)
+
+	startBroadcast := func() {
+		startStreaming()
+	}
+	stopBroadcast := func() {
+		stopStreaming()
+	}
+
+	btnBroadcastStart = widget.NewButtonWithIcon("Go Live", theme.MediaPlayIcon(), startBroadcast)
+	btnBroadcastStop = widget.NewButtonWithIcon("End Stream", theme.MediaStopIcon(), stopBroadcast)
+	btnBroadcastStop.Disable()
+
+	btnPreviewStop.Disable()
+
 	// WebSocket to server for camera feed control
 	wsURLLabel := widget.NewLabel("WebSocket URL:")
 	wsURLEntry := widget.NewEntry()
-	wsURLEntry.SetText("ws://localhost:8081/ws/feed")
+	wsURLEntry.SetText(myApp.Preferences().StringWithFallback("ws_url", "ws://localhost:8081/ws/feed"))
+	wsURLEntry.OnChanged = func(s string) {
+		myApp.Preferences().SetString("ws_url", s)
+	}
 	wsStatus := widget.NewLabel("WS: Disconnected")
 
-	connectWS := func() {
+	// Declare connectWS early so it can be used by startStreaming
+	// var connectWS func() error // Moved to top of main
+
+	connectWS = func() error {
 		wsMu.Lock()
 		if wsConn != nil {
 			wsMu.Unlock()
 			log("Error: WS already connected")
-			return
+			return nil
 		}
 		wsMu.Unlock()
 
 		u := strings.TrimSpace(wsURLEntry.Text)
 		if u == "" {
 			log("Error: Enter WS URL")
-			return
+			return fmt.Errorf("missing URL")
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -552,15 +610,25 @@ func main() {
 		if err != nil {
 			log(fmt.Sprintf("WS connect error: %v", err))
 			cancel()
-			return
+			return err
 		}
 
 		wsMu.Lock()
 		wsConn = c
 		wsCancel = cancel
 		wsMu.Unlock()
-		wsStatus.SetText("WS: Connected")
+		fyne.Do(func() {
+			wsStatus.SetText("WS: Connected")
+		})
 		log("WS connected")
+
+		// Send identity immediately so server registers this clinic connection
+		clinic := strings.TrimSpace(clinicNameEntry.Text)
+		if clinic != "" {
+			meta := map[string]string{"clinic_name": clinic}
+			mj, _ := json.Marshal(meta)
+			c.WriteMessage(websocket.TextMessage, mj)
+		}
 
 		go func() {
 			defer func() {
@@ -598,12 +666,17 @@ func main() {
 					fyne.Do(func() {
 						previewImageFlip = !previewImageFlip
 						log("WS camera command: flip preview")
+						if previewImage.Image != nil {
+							previewImage.Refresh()
+						}
 					})
 				default:
 					log(fmt.Sprintf("WS unknown command: %s", cmd))
 				}
 			}
 		}()
+
+		return nil
 	}
 
 	disconnectWS := func() {
@@ -621,21 +694,23 @@ func main() {
 		wsStatus.SetText("WS: Disconnected")
 	}
 
-	wsConnectBtn := widget.NewButtonWithIcon("Connect", theme.SettingsIcon(), connectWS)
+	wsConnectBtn := widget.NewButtonWithIcon("Connect", theme.SettingsIcon(), func() { connectWS() })
 	wsDisconnectBtn := widget.NewButtonWithIcon("Disconnect", theme.CancelIcon(), disconnectWS)
 
 	// Collect buttons for refresh
-	refreshButtons = []*widget.Button{
+	// Collect buttons for refresh
+	refreshButtons = append(refreshButtons,
 		stopBtn,
 		btnHeartRate, btnNIBP, btnGlucose, btnTemp,
 		btnStethoscopeList, btnStethoscopeConnect,
 		btnCamList, btnCamLeft, btnCamRight, btnCamUp, btnCamDown, btnCamFlip,
 		btnPreviewStart, btnPreviewStop,
 		wsConnectBtn, wsDisconnectBtn,
+		btnBroadcastStart, btnBroadcastStop,
 		advancedBtn,
-	}
+	)
 	for _, b := range refreshButtons {
-		if b != nil {
+		if b != nil && b.Text != "" {
 			buttonDefaults[b] = b.Text
 		}
 	}
@@ -693,9 +768,12 @@ func main() {
 	// 3. Comms Tab
 	// Mimicking the Remote Comm & Camera section
 	commsContent := container.NewVBox(
-		widget.NewCard("Live Feed", "", container.NewVBox(
+		widget.NewCard("Live Feed", "Local Preview", container.NewVBox(
 			container.NewGridWithColumns(2, btnPreviewStart, btnPreviewStop),
 			previewImage,
+		)),
+		widget.NewCard("Server Streaming", "Broadcast to Clinic Dashboard", container.NewVBox(
+			container.NewGridWithColumns(2, btnBroadcastStart, btnBroadcastStop),
 			advancedBtn,
 			advancedContainer,
 		)),
@@ -704,7 +782,7 @@ func main() {
 			container.NewCenter(
 				container.NewGridWithColumns(3,
 					widget.NewLabel(""), btnCamUp, widget.NewLabel(""),
-					btnCamLeft, widget.NewButtonWithIcon("Reset", theme.ViewRefreshIcon(), func(){
+					btnCamLeft, widget.NewButtonWithIcon("Reset", theme.ViewRefreshIcon(), func() {
 						runCameraCommand("reset", []string{"-reset"}) // Assuming reset exists
 					}), btnCamRight,
 					widget.NewLabel(""), btnCamDown, widget.NewLabel(""),
@@ -751,7 +829,7 @@ func runCLIAndSend(name string, args []string, parser LineParser, targetURL stri
 	defer onFinish()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	cmdMutex.Lock()
 	cancelFunc = cancel
 	cmdMutex.Unlock()
@@ -775,11 +853,11 @@ func runCLIAndSend(name string, args []string, parser LineParser, targetURL stri
 			cmdPath = "./lepu_cli.exe"
 		}
 	}
-	
+
 	log(fmt.Sprintf("Starting %s (%s)...", name, cmdPath))
 
 	cmd := exec.CommandContext(ctx, cmdPath, args...)
-	
+
 	cmdMutex.Lock()
 	currentCmd = cmd
 	cmdMutex.Unlock()
@@ -953,7 +1031,7 @@ func detectDefaultCameraDevice() (string, error) {
 					if idxEnd > 0 {
 						idx := strings.TrimSpace(parts[1][:idxEnd])
 						deviceName := strings.TrimSpace(parts[1][idxEnd+1:])
-						
+
 						// Skip audio devices if they appear here, and skip screen capture
 						if idx != "" && !strings.Contains(strings.ToLower(deviceName), "capture screen") && !strings.Contains(strings.ToLower(ln), "audio devices") {
 							return idx, nil
@@ -983,7 +1061,6 @@ func normalizeWindowsDeviceName(device string) string {
 	return "video=" + name
 }
 
-
 // --- Parsers (Copied from legacy/main.go) ---
 
 // Heart Rate / SpO2
@@ -994,7 +1071,7 @@ func parseHeartRateLine(line string) (interface{}, error) {
 	if strings.HasPrefix(line, "DATA:") {
 		parts := strings.TrimPrefix(line, "DATA:")
 		kv := parseKV(parts)
-		
+
 		pr, _ := strconv.Atoi(kv["PR"])
 		spo2, _ := strconv.Atoi(kv["SPO2"])
 
@@ -1030,7 +1107,7 @@ func parseNIBPLine(line string) (interface{}, error) {
 		partsStr := strings.TrimPrefix(normalized, "DATA:NIBP_RESULT:")
 		parts := strings.Split(partsStr, ",")
 		resultMap := make(map[string]string)
-		
+
 		for _, p := range parts {
 			if strings.Contains(p, "=") {
 				kv := strings.SplitN(p, "=", 2)
@@ -1054,7 +1131,7 @@ func parseNIBPLine(line string) (interface{}, error) {
 		dia, _ := strconv.Atoi(resultMap["DIA"])
 		mean, _ := strconv.Atoi(resultMap["MAP"])
 		pr, _ := strconv.Atoi(resultMap["PR"])
-		
+
 		irrVal := resultMap["IRR"]
 		irr := irrVal == "TRUE"
 

@@ -35,13 +35,20 @@ export default function Home() {
   }, [clinic]);
 
   useEffect(() => {
-    if (clinic && patient) {
-      loadPatientData(clinic, patient);
-      connectStream(clinic, patient);
+    if (clinic) {
+      connectStream(clinic);
     } else {
-      setData({});
       setCamSrc("");
       disconnectStream();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clinic]);
+
+  useEffect(() => {
+    if (clinic && patient) {
+      loadPatientData(clinic, patient);
+    } else {
+      setData({});
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clinic, patient]);
@@ -88,14 +95,14 @@ export default function Home() {
     await fetch(`${base}/api/camera/control`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ command }),
+      body: JSON.stringify({ clinic_name: clinic, command }),
     }).catch(() => {});
   }
 
-  function connectStream(c: string, p: string) {
+  function connectStream(c: string) {
     disconnectStream();
     const base = (API_BASE || "").replace(/\/$/, "");
-    const httpUrl = `${base}/ws/stream?clinic=${encodeURIComponent(c)}&patient=${encodeURIComponent(p)}`;
+    const httpUrl = `${base}/ws/stream?clinic=${encodeURIComponent(c)}`;
     const wsUrl = httpUrl.startsWith("ws") ? httpUrl : httpUrl.replace(/^http/, "ws");
     const sock = new WebSocket(wsUrl);
     sock.binaryType = "arraybuffer";
@@ -249,9 +256,9 @@ export default function Home() {
                 </div>
                 <div className="flex gap-2">
                   <button
-                    onClick={() => clinic && patient && connectStream(clinic, patient)}
+                    onClick={() => clinic && connectStream(clinic)}
                     className="px-3 py-2 rounded bg-slate-800 text-white text-xs font-medium hover:bg-slate-700 disabled:opacity-50"
-                    disabled={!patient}
+                    disabled={!clinic}
                   >
                     Connect Stream
                   </button>

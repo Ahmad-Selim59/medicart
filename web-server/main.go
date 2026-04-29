@@ -31,8 +31,9 @@ var (
 	storageFile = "data.json"
 	fileMutex   sync.Mutex
 
-	feedConn *websocket.Conn
-	wsMutex  sync.Mutex
+	// feedConns maps clinicName -> websocket.Conn
+	feedConns = make(map[string]*websocket.Conn)
+	wsMutex   sync.Mutex
 
 	streams   = make(map[string]map[*websocket.Conn]bool) // key: clinic|patient
 	streamsMu sync.Mutex
@@ -187,20 +188,14 @@ var upgrader = websocket.Upgrader{
 }
 
 func handleFeedWS(w http.ResponseWriter, r *http.Request) {
-	var currentClinic = "Unknown"
-	var currentPatient = "Unknown"
+	var currentClinic = ""
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("WS upgrade error: %v", err)
 		return
 	}
-	wsMutex.Lock()
-	if feedConn != nil {
-		feedConn.Close()
-	}
-	feedConn = conn
-	wsMutex.Unlock()
+	// Registration is deferred until the first text message identifying the clinic.
 
 	log.Printf("Feed WS connected")
 
@@ -211,20 +206,25 @@ func handleFeedWS(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if mt == websocket.BinaryMessage {
-			key := streamKey(currentClinic, currentPatient)
-			broadcastFrame(key, msg)
+			broadcastFrame(safe(currentClinic), msg)
 		} else {
-			// Expect JSON metadata: {"clinic_name": "...", "patient_name": "..."}
+			// Expect JSON metadata: {"clinic_name": "..."}
 			var meta struct {
-				Clinic  string `json:"clinic_name"`
-				Patient string `json:"patient_name"`
+				Clinic string `json:"clinic_name"`
 			}
 			if err := json.Unmarshal(msg, &meta); err == nil {
 				if meta.Clinic != "" {
+					oldClinic := currentClinic
 					currentClinic = meta.Clinic
-				}
-				if meta.Patient != "" {
-					currentPatient = meta.Patient
+
+					wsMutex.Lock()
+					if oldClinic != "" && oldClinic != currentClinic {
+						delete(feedConns, oldClinic)
+					}
+					feedConns[currentClinic] = conn
+					wsMutex.Unlock()
+
+					log.Printf("Feed WS registered for clinic: %s", currentClinic)
 				}
 			} else {
 				log.Printf("WS text: %s", string(msg))
@@ -232,18 +232,26 @@ func handleFeedWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	wsMutex.Lock()
-	if feedConn == conn {
-		feedConn = nil
+	if currentClinic != "" {
+		wsMutex.Lock()
+		if feedConns[currentClinic] == conn {
+			delete(feedConns, currentClinic)
+			log.Printf("Feed WS disconnected for clinic: %s", currentClinic)
+		}
+		wsMutex.Unlock()
 	}
-	wsMutex.Unlock()
 }
 
 func handleFeedStart(w http.ResponseWriter, r *http.Request) {
 	if preflight(w, r) {
 		return
 	}
-	if err := sendControl("start"); err != nil {
+	clinic := r.URL.Query().Get("clinic")
+	if clinic == "" {
+		http.Error(w, "clinic required", http.StatusBadRequest)
+		return
+	}
+	if err := sendControl(clinic, "start"); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
@@ -255,7 +263,12 @@ func handleFeedStop(w http.ResponseWriter, r *http.Request) {
 	if preflight(w, r) {
 		return
 	}
-	if err := sendControl("stop"); err != nil {
+	clinic := r.URL.Query().Get("clinic")
+	if clinic == "" {
+		http.Error(w, "clinic required", http.StatusBadRequest)
+		return
+	}
+	if err := sendControl(clinic, "stop"); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
@@ -263,15 +276,16 @@ func handleFeedStop(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "stopped")
 }
 
-func sendControl(cmd string) error {
+func sendControl(clinic, cmd string) error {
 	wsMutex.Lock()
 	defer wsMutex.Unlock()
-	if feedConn == nil {
-		return fmt.Errorf("no desktop connected")
+	conn, ok := feedConns[clinic]
+	if !ok {
+		return fmt.Errorf("no desktop connected for clinic: %s", clinic)
 	}
-	if err := feedConn.WriteMessage(websocket.TextMessage, []byte(cmd)); err != nil {
-		feedConn = nil
-		return fmt.Errorf("failed to send command: %w", err)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(cmd)); err != nil {
+		delete(feedConns, clinic)
+		return fmt.Errorf("failed to send command to %s: %w", clinic, err)
 	}
 	return nil
 }
@@ -292,13 +306,14 @@ func handleCameraControl(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 	var req struct {
+		Clinic  string `json:"clinic_name"`
 		Command string `json:"command"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil || req.Command == "" {
 		http.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
-	if err := sendControl(req.Command); err != nil {
+	if err := sendControl(req.Clinic, req.Command); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
@@ -308,7 +323,12 @@ func handleCameraControl(w http.ResponseWriter, r *http.Request) {
 // --- Stream broker ---
 
 func streamKey(clinic, patient string) string {
-	return safe(clinic) + "|" + safe(patient)
+	c := safe(clinic)
+	p := safe(patient)
+	if p == "unknown" || p == "" {
+		return c
+	}
+	return c + "|" + p
 }
 
 func broadcastFrame(key string, frame []byte) {
@@ -333,8 +353,8 @@ func broadcastFrame(key string, frame []byte) {
 func handleStreamWS(w http.ResponseWriter, r *http.Request) {
 	clinic := r.URL.Query().Get("clinic")
 	patient := r.URL.Query().Get("patient")
-	if clinic == "" || patient == "" {
-		http.Error(w, "clinic and patient required", http.StatusBadRequest)
+	if clinic == "" {
+		http.Error(w, "clinic required", http.StatusBadRequest)
 		return
 	}
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -352,7 +372,7 @@ func handleStreamWS(w http.ResponseWriter, r *http.Request) {
 	streamsMu.Unlock()
 
 	// Attempt to start feed when a subscriber connects
-	if err := sendControl("start"); err != nil {
+	if err := sendControl(clinic, "start"); err != nil {
 		log.Printf("feed start error (ignored): %v", err)
 	}
 
@@ -374,15 +394,12 @@ func handleStreamWS(w http.ResponseWriter, r *http.Request) {
 	streamsMu.Unlock()
 	conn.Close()
 
-	// If no subscribers remain at all, try stopping feed
+	// If no subscribers remain for THIS clinic, try stopping feed
 	streamsMu.Lock()
-	remaining := 0
-	for _, m := range streams {
-		remaining += len(m)
-	}
+	remaining := len(streams[key])
 	streamsMu.Unlock()
 	if remaining == 0 {
-		if err := sendControl("stop"); err != nil {
+		if err := sendControl(clinic, "stop"); err != nil {
 			log.Printf("feed stop error (ignored): %v", err)
 		}
 	}
