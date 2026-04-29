@@ -31,12 +31,19 @@ var (
 	storageFile = "data.json"
 	fileMutex   sync.Mutex
 
-	// feedConns maps clinicName -> websocket.Conn
+	// feedConns maps clinicName -> websocket.Conn (camera)
 	feedConns = make(map[string]*websocket.Conn)
 	wsMutex   sync.Mutex
 
-	streams   = make(map[string]map[*websocket.Conn]bool) // key: clinic|patient
+	streams   = make(map[string]map[*websocket.Conn]bool) // key: clinic|patient (camera)
 	streamsMu sync.Mutex
+
+	// audioFeedConns maps clinicName -> websocket.Conn (mic feed from desktop)
+	audioFeedConns = make(map[string]*websocket.Conn)
+	audioFeedMu    sync.Mutex
+
+	audioStreams   = make(map[string]map[*websocket.Conn]bool) // key: clinic (audio subscribers)
+	audioStreamsMu sync.Mutex
 )
 
 func main() {
@@ -56,12 +63,15 @@ func main() {
 
 	http.HandleFunc("/api/ingest", handleIngest)
 	http.HandleFunc("/ws/feed", handleFeedWS)
-	http.HandleFunc("/ws/stream", handleStreamWS) // clinic & patient query params
+	http.HandleFunc("/ws/stream", handleStreamWS)
+	http.HandleFunc("/ws/audio-feed", handleAudioFeedWS)
+	http.HandleFunc("/ws/audio-stream", handleAudioStreamWS)
 	http.HandleFunc("/api/feed/start", handleFeedStart)
 	http.HandleFunc("/api/feed/stop", handleFeedStop)
 	http.HandleFunc("/api/clinics", authMiddleware(handleClinics))
-	http.HandleFunc("/clinics", authMiddleware(handleClinics))  // simple alias
-	http.HandleFunc("/api/camera/control", handleCameraControl) // optionally protect this too? Let's leave it for now
+	http.HandleFunc("/clinics", authMiddleware(handleClinics))
+	http.HandleFunc("/api/camera/control", handleCameraControl)
+	http.HandleFunc("/api/mic/control", handleMicControl)
 	http.HandleFunc("/api/clinic/", authMiddleware(handleClinicRoutes))
 	http.HandleFunc("/api/patient/", authMiddleware(handlePatientRoutes))
 	http.HandleFunc("/api/patients", authMiddleware(handleAllPatients))
@@ -438,6 +448,156 @@ func safe(s string) string {
 		return "unknown"
 	}
 	return s
+}
+
+// --- Audio streaming ---
+
+// broadcastAudio forwards a raw PCM chunk to all audio-stream subscribers for a clinic.
+func broadcastAudio(clinic string, data []byte) {
+	audioStreamsMu.Lock()
+	conns := audioStreams[clinic]
+	if len(conns) == 0 {
+		audioStreamsMu.Unlock()
+		return
+	}
+	for c := range conns {
+		if err := c.WriteMessage(websocket.BinaryMessage, data); err != nil {
+			c.Close()
+			delete(conns, c)
+		}
+	}
+	if len(conns) == 0 {
+		delete(audioStreams, clinic)
+	}
+	audioStreamsMu.Unlock()
+}
+
+// handleAudioFeedWS is the desktop-side audio producer endpoint (/ws/audio-feed).
+// The desktop registers its clinic via a JSON text message, then streams raw PCM
+// as binary frames. Binary frames from the browser (doctor mic) are also forwarded here.
+func handleAudioFeedWS(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Audio feed WS upgrade error: %v", err)
+		return
+	}
+	var currentClinic string
+	log.Printf("Audio feed WS connected")
+
+	for {
+		mt, msg, err := conn.ReadMessage()
+		if err != nil {
+			log.Printf("Audio feed WS read error: %v", err)
+			break
+		}
+		if mt == websocket.BinaryMessage {
+			// Patient mic audio → broadcast to browser subscribers
+			broadcastAudio(safe(currentClinic), msg)
+		} else {
+			var meta struct {
+				Clinic string `json:"clinic_name"`
+			}
+			if err := json.Unmarshal(msg, &meta); err == nil && meta.Clinic != "" {
+				old := currentClinic
+				currentClinic = meta.Clinic
+				audioFeedMu.Lock()
+				if old != "" && old != currentClinic {
+					delete(audioFeedConns, old)
+				}
+				audioFeedConns[currentClinic] = conn
+				audioFeedMu.Unlock()
+				log.Printf("Audio feed WS registered for clinic: %s", currentClinic)
+			}
+		}
+	}
+
+	if currentClinic != "" {
+		audioFeedMu.Lock()
+		if audioFeedConns[currentClinic] == conn {
+			delete(audioFeedConns, currentClinic)
+			log.Printf("Audio feed WS disconnected for clinic: %s", currentClinic)
+		}
+		audioFeedMu.Unlock()
+	}
+	conn.Close()
+}
+
+// handleAudioStreamWS is the browser subscriber endpoint (/ws/audio-stream?clinic=...).
+// It receives patient mic audio as binary and can also send doctor mic audio back.
+func handleAudioStreamWS(w http.ResponseWriter, r *http.Request) {
+	clinic := r.URL.Query().Get("clinic")
+	if clinic == "" {
+		http.Error(w, "clinic required", http.StatusBadRequest)
+		return
+	}
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Audio stream WS upgrade error: %v", err)
+		return
+	}
+
+	audioStreamsMu.Lock()
+	if audioStreams[clinic] == nil {
+		audioStreams[clinic] = make(map[*websocket.Conn]bool)
+	}
+	audioStreams[clinic][conn] = true
+	audioStreamsMu.Unlock()
+
+	log.Printf("Audio stream subscriber connected: %s", clinic)
+
+	for {
+		mt, msg, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+		if mt == websocket.BinaryMessage {
+			// Doctor mic audio → forward to desktop via audio-feed connection
+			audioFeedMu.Lock()
+			desktop, ok := audioFeedConns[clinic]
+			audioFeedMu.Unlock()
+			if ok {
+				_ = desktop.WriteMessage(websocket.BinaryMessage, msg)
+			}
+		}
+	}
+
+	audioStreamsMu.Lock()
+	if m := audioStreams[clinic]; m != nil {
+		delete(m, conn)
+		if len(m) == 0 {
+			delete(audioStreams, clinic)
+		}
+	}
+	audioStreamsMu.Unlock()
+	conn.Close()
+	log.Printf("Audio stream subscriber disconnected: %s", clinic)
+}
+
+// handleMicControl sends mic-on / mic-off commands to the desktop via the existing feed WS.
+func handleMicControl(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+	var req struct {
+		Clinic  string `json:"clinic_name"`
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.Command == "" {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if err := sendControl(req.Clinic, req.Command); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok"})
 }
 
 // Handlers are now in api.go

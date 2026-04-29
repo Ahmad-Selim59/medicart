@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -134,6 +135,12 @@ var (
 	wsMu          sync.Mutex
 	wsCancel      context.CancelFunc
 	streamCancel  context.CancelFunc
+
+	// Audio mic WS (separate connection to /ws/audio-feed)
+	micWsConn       *websocket.Conn
+	micWsMu         sync.Mutex
+	micWsCancel     context.CancelFunc
+	micStreamCancel context.CancelFunc
 )
 
 func main() {
@@ -660,6 +667,241 @@ func main() {
 		}()
 	}
 
+	// --- Microphone streaming (audio) ---
+
+	var btnMicStart, btnMicStop *widget.Button
+	micLog := func(msg string) {
+		log(fmt.Sprintf("[MIC] %s", msg))
+	}
+
+	var connectMicWS func() error
+	var startMicStreaming func()
+	var stopMicStreaming func()
+
+	stopMicStreaming = func() {
+		micWsMu.Lock()
+		if micStreamCancel == nil {
+			micWsMu.Unlock()
+			return
+		}
+		micStreamCancel()
+		micStreamCancel = nil
+		micWsMu.Unlock()
+		micLog("Mic stream stopped")
+		fyne.Do(func() {
+			btnMicStart.Enable()
+			btnMicStop.Disable()
+		})
+	}
+
+	startMicStreaming = func() {
+		micWsMu.Lock()
+		if micWsConn == nil {
+			micWsMu.Unlock()
+			micLog("Connecting mic WS…")
+			if err := connectMicWS(); err != nil {
+				micLog(fmt.Sprintf("Mic WS connect failed: %v", err))
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		} else {
+			micWsMu.Unlock()
+		}
+
+		micWsMu.Lock()
+		if micStreamCancel != nil {
+			micWsMu.Unlock()
+			micLog("Mic already streaming")
+			return
+		}
+		micWsMu.Unlock()
+
+		device, err := detectDefaultMicDevice()
+		if err != nil {
+			micLog(fmt.Sprintf("Mic detect error: %v", err))
+			return
+		}
+		micLog(fmt.Sprintf("Detected mic: %s", device))
+
+		ffArgs := buildFFmpegArgsForAudio(device)
+		micLog(fmt.Sprintf("ffmpeg %s", strings.Join(ffArgs, " ")))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		micWsMu.Lock()
+		micStreamCancel = cancel
+		micWsMu.Unlock()
+
+		fyne.Do(func() {
+			btnMicStart.Disable()
+			btnMicStop.Enable()
+		})
+
+		go func() {
+			defer stopMicStreaming()
+
+			// Register clinic on the audio feed WS
+			currentClinic := strings.TrimSpace(clinicNameEntry.Text)
+			meta, _ := json.Marshal(map[string]string{"clinic_name": currentClinic})
+			micWsMu.Lock()
+			c := micWsConn
+			micWsMu.Unlock()
+			if c == nil {
+				micLog("Mic WS not connected")
+				return
+			}
+			_ = c.WriteMessage(websocket.TextMessage, meta)
+
+			cmd := exec.CommandContext(ctx, "ffmpeg", ffArgs...)
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				micLog(fmt.Sprintf("ffmpeg pipe error: %v", err))
+				return
+			}
+			if err := cmd.Start(); err != nil {
+				micLog(fmt.Sprintf("ffmpeg start error: %v", err))
+				return
+			}
+			defer cmd.Wait()
+
+			// Read 100 ms chunks: 16000 Hz × 2 bytes × 1 ch × 0.1 s = 3200 bytes
+			const chunkSize = 3200
+			buf := make([]byte, chunkSize)
+			for {
+				if ctx.Err() != nil {
+					return
+				}
+				_, err := io.ReadFull(stdout, buf)
+				if err != nil {
+					if ctx.Err() == nil {
+						micLog(fmt.Sprintf("ffmpeg read error: %v", err))
+					}
+					return
+				}
+				chunk := make([]byte, chunkSize)
+				copy(chunk, buf)
+				micWsMu.Lock()
+				c := micWsConn
+				micWsMu.Unlock()
+				if c == nil {
+					return
+				}
+				if err := c.WriteMessage(websocket.BinaryMessage, chunk); err != nil {
+					micLog(fmt.Sprintf("WS send error: %v", err))
+					return
+				}
+			}
+		}()
+	}
+
+	connectMicWS = func() error {
+		micWsMu.Lock()
+		if micWsConn != nil {
+			micWsMu.Unlock()
+			return nil
+		}
+		micWsMu.Unlock()
+
+		base := strings.TrimSpace(serverBaseEntry.Text)
+		if base == "" {
+			return fmt.Errorf("missing base URL")
+		}
+		u := audioFeedWSURL(base)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		c, _, err := websocket.DefaultDialer.DialContext(ctx, u, nil)
+		if err != nil {
+			cancel()
+			return err
+		}
+
+		micWsMu.Lock()
+		micWsConn = c
+		micWsCancel = cancel
+		micWsMu.Unlock()
+		micLog("Mic WS connected to " + u)
+
+		// Register clinic immediately
+		clinic := strings.TrimSpace(clinicNameEntry.Text)
+		if clinic != "" {
+			meta, _ := json.Marshal(map[string]string{"clinic_name": clinic})
+			_ = c.WriteMessage(websocket.TextMessage, meta)
+		}
+
+		go func() {
+			defer func() {
+				micWsMu.Lock()
+				if micWsConn != nil {
+					micWsConn.Close()
+				}
+				micWsConn = nil
+				if micWsCancel != nil {
+					micWsCancel()
+				}
+				micWsCancel = nil
+				micWsMu.Unlock()
+				micLog("Mic WS disconnected")
+			}()
+
+			// Incoming binary = doctor mic audio → play via ffplay
+			var ffplayCmd *exec.Cmd
+			var ffplayStdin io.WriteCloser
+			startFFPlay := func() {
+				if ffplayCmd != nil {
+					return
+				}
+				cmd := exec.Command("ffplay",
+					"-f", "s16le", "-ar", "16000", "-ac", "1",
+					"-nodisp", "-autoexit", "-loglevel", "quiet", "-",
+				)
+				var err error
+				ffplayStdin, err = cmd.StdinPipe()
+				if err != nil {
+					micLog(fmt.Sprintf("ffplay stdin error: %v", err))
+					return
+				}
+				if err := cmd.Start(); err != nil {
+					micLog(fmt.Sprintf("ffplay not found — install ffplay for audio playback: %v", err))
+					ffplayStdin = nil
+					return
+				}
+				ffplayCmd = cmd
+				micLog("Audio playback started (ffplay)")
+			}
+
+			for {
+				mt, msg, err := c.ReadMessage()
+				if err != nil {
+					break
+				}
+				if mt == websocket.BinaryMessage && len(msg) > 0 {
+					if ffplayStdin == nil {
+						startFFPlay()
+					}
+					if ffplayStdin != nil {
+						_, _ = ffplayStdin.Write(msg)
+					}
+				}
+			}
+
+			if ffplayCmd != nil {
+				if ffplayStdin != nil {
+					ffplayStdin.Close()
+				}
+				_ = ffplayCmd.Wait()
+			}
+		}()
+
+		return nil
+	}
+
+	btnMicStart = widget.NewButtonWithIcon("Unmute Mic", theme.MediaRecordIcon(), func() {
+		go startMicStreaming()
+	})
+	btnMicStop = widget.NewButtonWithIcon("Mute Mic", theme.MediaStopIcon(), func() {
+		go stopMicStreaming()
+	})
+	btnMicStop.Disable()
+
 	btnPreviewStart = widget.NewButtonWithIcon("Start Preview", theme.VisibilityIcon(), startPreview)
 	btnPreviewStop = widget.NewButtonWithIcon("Stop Preview", theme.VisibilityOffIcon(), stopPreview)
 
@@ -714,6 +956,13 @@ func main() {
 		})
 		log("WS connected")
 
+		// Auto-connect mic WS so audio channel is ready as soon as camera connects
+		go func() {
+			if err := connectMicWS(); err != nil {
+				log(fmt.Sprintf("Mic WS auto-connect failed (non-fatal): %v", err))
+			}
+		}()
+
 		// Send identity immediately so server registers this clinic connection
 		clinic := strings.TrimSpace(clinicNameEntry.Text)
 		if clinic != "" {
@@ -751,6 +1000,12 @@ func main() {
 			case "stop":
 				cameraLog("WS command: stop streaming")
 				go stopStreaming()
+			case "mic-on":
+				cameraLog("WS command: mic on")
+				go startMicStreaming()
+			case "mic-off":
+				cameraLog("WS command: mic off")
+				go stopMicStreaming()
 			case "move-left", "move-right", "move-up", "move-down":
 				cameraLog(fmt.Sprintf("WS camera command: %s", cmd))
 				runCameraCommand(cmd, []string{"-" + cmd})
@@ -867,6 +1122,9 @@ func main() {
 			container.NewGridWithColumns(2, btnBroadcastStart, btnBroadcastStop),
 			advancedBtn,
 			advancedContainer,
+		)),
+		widget.NewCard("Microphone", "Auto-connects when camera connects — mute/unmute to control", container.NewVBox(
+			container.NewGridWithColumns(2, btnMicStart, btnMicStop),
 		)),
 		widget.NewCard("Camera Status", "", cameraLogLabel),
 		widget.NewCard("Camera Control", "Precision Pan-Tilt-Zoom", container.NewVBox(
@@ -1140,6 +1398,92 @@ func detectDefaultCameraDevice() (string, error) {
 }
 
 // normalizeWindowsDeviceName ensures dshow format video="Name" without double-wrapping quotes.
+// audioFeedWSURL derives the WebSocket audio-feed endpoint from a base URL.
+func audioFeedWSURL(base string) string {
+	u := strings.TrimRight(base, "/")
+	u = strings.Replace(u, "https://", "wss://", 1)
+	u = strings.Replace(u, "http://", "ws://", 1)
+	if !strings.HasPrefix(u, "ws") {
+		u = "ws://" + u
+	}
+	return u + "/ws/audio-feed"
+}
+
+// detectDefaultMicDevice finds the first available audio input device.
+func detectDefaultMicDevice() (string, error) {
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command("ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy")
+		var stderr bytes.Buffer
+		cmd.Stdout = &stderr
+		cmd.Stderr = &stderr
+		_ = cmd.Run()
+		lines := strings.Split(stderr.String(), "\n")
+		for _, ln := range lines {
+			ln = strings.TrimSpace(ln)
+			if strings.Contains(ln, "(audio)") && strings.Count(ln, "\"") >= 2 {
+				start := strings.Index(ln, "\"")
+				end := strings.LastIndex(ln, "\"")
+				if start >= 0 && end > start {
+					name := ln[start+1 : end]
+					if name != "" {
+						return name, nil
+					}
+				}
+			}
+		}
+		return "", fmt.Errorf("no audio devices found")
+	}
+
+	if runtime.GOOS == "darwin" {
+		cmd := exec.Command("ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", "")
+		var stderr bytes.Buffer
+		cmd.Stdout = &stderr
+		cmd.Stderr = &stderr
+		_ = cmd.Run()
+		lines := strings.Split(stderr.String(), "\n")
+		inAudioSection := false
+		for _, ln := range lines {
+			ln = strings.TrimSpace(ln)
+			// Both old (input device) and new (indev) ffmpeg output contain "AVFoundation"
+			if strings.Contains(ln, "AVFoundation") && strings.Contains(strings.ToLower(ln), "audio devices") {
+				inAudioSection = true
+				continue
+			}
+			if inAudioSection && strings.Contains(ln, "AVFoundation") && strings.Contains(ln, "] [") {
+				parts := strings.Split(ln, "] [")
+				if len(parts) >= 2 {
+					idxEnd := strings.Index(parts[1], "]")
+					if idxEnd > 0 {
+						idx := strings.TrimSpace(parts[1][:idxEnd])
+						if idx != "" {
+							return idx, nil
+						}
+					}
+				}
+			}
+		}
+		return "", fmt.Errorf("no audio devices found on macOS")
+	}
+
+	// Linux: default alsa/pulse device
+	return "default", nil
+}
+
+// buildFFmpegArgsForAudio returns ffmpeg args to stream mic audio as raw s16le PCM to stdout.
+// Output is signed 16-bit little-endian, 16 kHz, mono — ready to be chunked over WebSocket.
+func buildFFmpegArgsForAudio(device string) []string {
+	out := []string{"-f", "s16le", "-ar", "16000", "-ac", "1", "-"}
+	switch runtime.GOOS {
+	case "windows":
+		return append([]string{"-f", "dshow", "-i", `audio="` + device + `"`}, out...)
+	case "darwin":
+		// "none:<audio_idx>" captures audio only; accepted by both old and new ffmpeg builds.
+		return append([]string{"-f", "avfoundation", "-i", "none:" + device}, out...)
+	default:
+		return append([]string{"-f", "alsa", "-i", device}, out...)
+	}
+}
+
 func normalizeWindowsDeviceName(device string) string {
 	d := strings.TrimSpace(device)
 	if d == "" {
