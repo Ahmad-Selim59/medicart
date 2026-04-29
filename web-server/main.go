@@ -49,8 +49,10 @@ func main() {
 	// Also try loading from current working directory as fallback
 	_ = godotenv.Load()
 
+	loadConfig()
+
 	ensureStorageFile()
-	ensureDataDir()
+	initStorage()
 
 	http.HandleFunc("/api/ingest", handleIngest)
 	http.HandleFunc("/ws/feed", handleFeedWS)
@@ -158,9 +160,6 @@ func saveRecord(record Record) error {
 	defer fileMutex.Unlock()
 
 	dir := filepath.Join("data", safe(record.ClinicName), safe(record.PatientName))
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
 
 	baseFilename := metricFile(record.RawData)
 	if baseFilename == "" {
@@ -176,7 +175,7 @@ func saveRecord(record Record) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return saveFile(path, data)
 }
 
 func ensureDataDir() {

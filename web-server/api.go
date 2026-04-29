@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -64,44 +63,35 @@ func getAllClinics(allowedClinics []string) []Clinic {
 
 	// 2. Add local folders (only if no authorized list provided at all)
 	// We check len(allowedClinics) == 0 to see if the query param was missing
-	entries, _ := os.ReadDir("data")
-	for _, e := range entries {
-		if e.IsDir() {
-			name := e.Name()
-			
-			// count patients in folder
-			patientEntries, _ := os.ReadDir(filepath.Join("data", name))
-			patientCount := 0
-			for _, pe := range patientEntries {
-				if pe.IsDir() {
-					patientCount++
-				}
-			}
+	entries, _ := listDirs("data")
+	for _, name := range entries {
+		// count patients in folder
+		patientEntries, _ := listDirs(filepath.Join("data", name))
+		patientCount := len(patientEntries)
 
-			if !clinicsMap[name] {
-				// ONLY fallback to local folders if NO allowed list was provided
-				// This prevents unauthorized users from seeing everything
-				if len(allowedClinics) == 0 {
-					clinics = append(clinics, Clinic{
-						ID:           name,
-						Name:         name,
-						Address:      "Address N/A",
-						Phone:        "N/A",
-						Email:        "N/A",
-						Website:      "N/A",
-						Action:       "View",
-						PatientCount: patientCount,
-						Status:       "active",
-					})
-					clinicsMap[name] = true
-				}
-			} else {
-				// Update patient count for the already added clinic
-				for i := range clinics {
-					if clinics[i].Name == name {
-						clinics[i].PatientCount = patientCount
-						break
-					}
+		if !clinicsMap[name] {
+			// ONLY fallback to local folders if NO allowed list was provided
+			// This prevents unauthorized users from seeing everything
+			if len(allowedClinics) == 0 {
+				clinics = append(clinics, Clinic{
+					ID:           name,
+					Name:         name,
+					Address:      "Address N/A",
+					Phone:        "N/A",
+					Email:        "N/A",
+					Website:      "N/A",
+					Action:       "View",
+					PatientCount: patientCount,
+					Status:       "active",
+				})
+				clinicsMap[name] = true
+			}
+		} else {
+			// Update patient count for the already added clinic
+			for i := range clinics {
+				if clinics[i].Name == name {
+					clinics[i].PatientCount = patientCount
+					break
 				}
 			}
 		}
@@ -114,18 +104,14 @@ func getAllClinics(allowedClinics []string) []Clinic {
 
 func buildPatient(clinicName string, patientName string) Patient {
 	dir := filepath.Join("data", clinicName, patientName)
-	files, err := os.ReadDir(dir)
+	files, err := listFiles(dir)
 
 	realData := make(map[string]interface{})
 
 	if err == nil {
-		for _, f := range files {
-			if f.IsDir() {
-				continue
-			}
-			name := f.Name()
+		for _, name := range files {
 			if strings.HasSuffix(name, ".json") {
-				b, err := os.ReadFile(filepath.Join(dir, name))
+				b, err := readFile(filepath.Join(dir, name))
 				if err != nil {
 					continue
 				}
@@ -177,14 +163,12 @@ func getAllPatients(allowedClinics []string) []Patient {
 	var patients []Patient
 	clinics := getAllClinics(allowedClinics)
 	for _, c := range clinics {
-		entries, err := os.ReadDir(filepath.Join("data", c.Name))
+		entries, err := listDirs(filepath.Join("data", c.Name))
 		if err != nil {
 			continue
 		}
-		for _, e := range entries {
-			if e.IsDir() {
-				patients = append(patients, buildPatient(c.Name, e.Name()))
-			}
+		for _, name := range entries {
+			patients = append(patients, buildPatient(c.Name, name))
 		}
 	}
 	return patients
@@ -335,19 +319,15 @@ func handlePatientData(w http.ResponseWriter, r *http.Request, clinicID, patient
 		return
 	}
 	dir := filepath.Join("data", clinicID, patientID)
-	files, err := os.ReadDir(dir)
+	files, err := listFiles(dir)
 	if err != nil {
 		http.Error(w, "Failed to read patient data", http.StatusInternalServerError)
 		return
 	}
 	result := map[string]interface{}{}
-	for _, f := range files {
-		if f.IsDir() {
-			continue
-		}
-		name := f.Name()
+	for _, name := range files {
 		if strings.HasSuffix(name, ".json") {
-			b, err := os.ReadFile(filepath.Join(dir, name))
+			b, err := readFile(filepath.Join(dir, name))
 			if err != nil {
 				continue
 			}
@@ -365,5 +345,15 @@ func handlePatientCamera(w http.ResponseWriter, r *http.Request, clinicID, patie
 		return
 	}
 	path := filepath.Join("data", clinicID, patientID, "camera.jpg")
+	if CloudStoreEnabled {
+		b, err := readFile(path)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Write(b)
+		return
+	}
 	http.ServeFile(w, r, path)
 }
