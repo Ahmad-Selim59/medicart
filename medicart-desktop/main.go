@@ -25,7 +25,43 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/gorilla/websocket"
+	xdraw "golang.org/x/image/draw"
 )
+
+// previewMaxSize is the fixed render size for the local preview image.
+// Capping the rendered frame ensures the layout never expands when ffmpeg
+// returns a larger native frame (e.g. 640x480 or 1920x1080).
+const previewMaxW, previewMaxH = 320, 240
+
+// blankFrame is a 1x1 fully transparent image used in place of nil so that
+// canvas.Image always has content. A visible canvas.Image with nil content
+// thrashes the GL texture cache (see fyne issue #4345), evicting cached
+// button text glyphs and making every button in the window look blank.
+var blankFrame = func() *image.RGBA {
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	return img
+}()
+
+// fitToPreview returns a copy of src scaled to fit within previewMaxW x previewMaxH,
+// preserving aspect ratio.
+func fitToPreview(src image.Image) *image.RGBA {
+	b := src.Bounds()
+	sw, sh := b.Dx(), b.Dy()
+	if sw <= 0 || sh <= 0 {
+		return image.NewRGBA(image.Rect(0, 0, previewMaxW, previewMaxH))
+	}
+	dw, dh := previewMaxW, previewMaxH
+	srcRatio := float64(sw) / float64(sh)
+	dstRatio := float64(dw) / float64(dh)
+	if srcRatio > dstRatio {
+		dh = int(float64(dw) / srcRatio)
+	} else {
+		dw = int(float64(dh) * srcRatio)
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, dw, dh))
+	xdraw.ApproxBiLinear.Scale(dst, dst.Bounds(), src, b, xdraw.Over, nil)
+	return dst
+}
 
 // LineParser function signature
 type LineParser func(line string) (interface{}, error)
@@ -148,6 +184,11 @@ func main() {
 	logArea.Disable()
 	logArea.SetMinRowsVisible(10)
 
+	// Camera-specific log shown inside the Comms tab so camera errors
+	// don't pollute the readings Live Console.
+	cameraLogLabel := widget.NewLabel("")
+	cameraLogLabel.Wrapping = fyne.TextWrapWord
+
 	// Camera Device Input (for ffmpeg dshow)
 	cameraLabel := widget.NewLabel("Camera Device (optional):")
 	cameraEntry := widget.NewSelect([]string{}, nil)
@@ -170,14 +211,10 @@ func main() {
 	}
 
 	// Camera Preview
-	previewImage := canvas.NewImageFromImage(nil)
+	previewImage := canvas.NewImageFromImage(blankFrame)
 	previewImage.FillMode = canvas.ImageFillContain
-	previewImage.SetMinSize(fyne.NewSize(320, 240))
+	previewImage.SetMinSize(fyne.NewSize(previewMaxW, previewMaxH))
 	previewImageFlip := false
-
-	// Buttons that may need refresh on redraw glitches
-	refreshButtons := []*widget.Button{}
-	buttonDefaults := map[*widget.Button]string{}
 
 	log := func(msg string) {
 		fyne.Do(func() {
@@ -210,19 +247,13 @@ func main() {
 				}
 			}
 			statusLabel.Refresh()
+		})
+	}
 
-			// Force redraw of buttons only if they are actually missing text
-			// and only every few log messages to avoid flooding the UI thread
-			if len(logArea.Text)%5 == 0 {
-				for _, b := range refreshButtons {
-					if b != nil && b.Text == "" {
-						if txt, ok := buttonDefaults[b]; ok && txt != "" {
-							b.SetText(txt)
-							b.Refresh()
-						}
-					}
-				}
-			}
+	cameraLog := func(msg string) {
+		fyne.Do(func() {
+			timestamp := time.Now().Format("15:04:05")
+			cameraLogLabel.SetText(fmt.Sprintf("[%s] %s", timestamp, msg))
 		})
 	}
 
@@ -258,9 +289,7 @@ func main() {
 
 		stopBtn.Enable()
 		go runCLIAndSend(name, args, parser, targetURL, clinicName, patientName, log, func() {
-			fyne.Do(func() {
-				stopBtn.Disable()
-			})
+			fyne.Do(func() { stopBtn.Disable() })
 		})
 	}
 
@@ -268,7 +297,7 @@ func main() {
 		cmdMutex.Lock()
 		defer cmdMutex.Unlock()
 		if cancelFunc != nil {
-			cancelFunc() // Cancel the context
+			cancelFunc()
 			log("Stopping process...")
 		}
 	})
@@ -358,7 +387,7 @@ func main() {
 
 	runCameraCommand := func(action string, args []string) {
 		go func() {
-			log(fmt.Sprintf("Camera: %s ...", action))
+			cameraLog(fmt.Sprintf("Camera: %s ...", action))
 
 			cmdPath := "camera_cli.exe"
 			if _, err := exec.LookPath(cmdPath); err != nil {
@@ -370,20 +399,20 @@ func main() {
 			output := strings.TrimSpace(string(outputBytes))
 
 			if output != "" {
-				log(fmt.Sprintf("Camera output: %s", output))
+				cameraLog(fmt.Sprintf("Camera output: %s", output))
 			}
 			if err != nil {
-				log(fmt.Sprintf("Error running camera %s: %v", action, err))
+				cameraLog(fmt.Sprintf("Error running camera %s: %v", action, err))
 				return
 			}
 
 			upper := strings.ToUpper(output)
 			if strings.HasPrefix(upper, "DATA:ERROR") {
-				log(fmt.Sprintf("Camera %s reported error: %s", action, output))
+				cameraLog(fmt.Sprintf("Camera %s reported error: %s", action, output))
 				return
 			}
 
-			log(fmt.Sprintf("Camera %s completed", action))
+			cameraLog(fmt.Sprintf("Camera %s completed", action))
 		}()
 	}
 
@@ -418,18 +447,24 @@ func main() {
 	// Camera Preview (snapshot via ffmpeg dshow)
 	stopPreviewInternal := func(logMsg string) {
 		previewMu.Lock()
-		if previewCancel != nil {
-			previewCancel()
-			previewCancel = nil
-			if logMsg != "" {
-				log(logMsg)
-			}
-			fyne.Do(func() {
-				btnPreviewStart.Enable()
-				btnPreviewStop.Disable()
-			})
+		if previewCancel == nil {
+			previewMu.Unlock()
+			return
 		}
+		previewCancel()
+		previewCancel = nil
 		previewMu.Unlock()
+		// Release lock before all UI work to avoid nesting fyne.Do inside a mutex hold.
+		if logMsg != "" {
+			log(logMsg)
+		}
+		fyne.Do(func() {
+			// Use a placeholder rather than nil — see fyne issue #4345.
+			previewImage.Image = blankFrame
+			previewImage.Refresh()
+			btnPreviewStart.Enable()
+			btnPreviewStop.Disable()
+		})
 	}
 
 	startPreview := func() {
@@ -437,9 +472,9 @@ func main() {
 		if device == "" {
 			if autoDevice, err := detectDefaultCameraDevice(); err == nil && autoDevice != "" {
 				device = autoDevice
-				log(fmt.Sprintf("Using detected camera: %s", device))
+				cameraLog(fmt.Sprintf("Using detected camera: %s", device))
 			} else {
-				log("Error: No camera device found. Set a device name (advanced options).")
+				cameraLog("Error: No camera device found. Set a device name (advanced options).")
 				return
 			}
 		}
@@ -447,16 +482,18 @@ func main() {
 		previewMu.Lock()
 		if previewCancel != nil {
 			previewMu.Unlock()
-			log("Error: Preview already running")
+			cameraLog("Preview already running")
 			return
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		previewCancel = cancel
 		previewMu.Unlock()
 
-		log(fmt.Sprintf("Starting camera preview for %s", device))
-		btnPreviewStart.Disable()
-		btnPreviewStop.Enable()
+		cameraLog(fmt.Sprintf("Starting camera preview for %s", device))
+		fyne.Do(func() {
+			btnPreviewStart.Disable()
+			btnPreviewStop.Enable()
+		})
 
 		go func() {
 			ticker := time.NewTicker(1 * time.Second)
@@ -468,35 +505,40 @@ func main() {
 				case <-ticker.C:
 					img, err := captureSnapshot(ctx, device)
 					if err != nil {
-						log(fmt.Sprintf("Error capturing frame: %v", err))
+						// ffmpeg returns "signal: killed" when we cancel ctx; that's expected.
+						if ctx.Err() != nil {
+							return
+						}
+						cameraLog(fmt.Sprintf("Capture error: %v", err))
 						continue
 					}
-					// Avoid re-entering render loop while UI might be mid-refresh.
-					go func(img image.Image, flip bool) {
-						fyne.Do(func() {
-							if flip {
-								b := img.Bounds()
-								flipped := image.NewRGBA(b)
-								h := b.Dy()
-								for y := 0; y < h; y++ {
-									for x := b.Min.X; x < b.Max.X; x++ {
-										flipped.Set(x, b.Min.Y+(h-1)-(y-b.Min.Y), img.At(x, y+b.Min.Y))
-									}
-								}
-								previewImage.Image = flipped
-							} else {
-								previewImage.Image = img
+					// Always downscale to a fixed preview size so the canvas
+					// never asks the layout for more space than we want.
+					scaled := fitToPreview(img)
+					var rendered image.Image = scaled
+					if previewImageFlip {
+						b := scaled.Bounds()
+						flipped := image.NewRGBA(b)
+						h := b.Dy()
+						for y := 0; y < h; y++ {
+							for x := b.Min.X; x < b.Max.X; x++ {
+								flipped.Set(x, b.Min.Y+(h-1)-(y-b.Min.Y), scaled.At(x, y+b.Min.Y))
 							}
-							previewImage.Refresh()
-						})
-					}(img, previewImageFlip)
+						}
+						rendered = flipped
+					}
+					fyne.Do(func() {
+						previewImage.Image = rendered
+						previewImage.Refresh()
+					})
 				}
 			}
 		}()
 	}
 
 	stopPreview := func() {
-		stopPreviewInternal("Camera preview stopped")
+		stopPreviewInternal("")
+		cameraLog("Camera preview stopped")
 	}
 
 	// Streaming helpers
@@ -505,7 +547,7 @@ func main() {
 		if device == "" {
 			if autoDevice, err := detectDefaultCameraDevice(); err == nil && autoDevice != "" {
 				device = autoDevice
-				log(fmt.Sprintf("Using detected camera: %s", device))
+				cameraLog(fmt.Sprintf("Using detected camera: %s", device))
 			} else {
 				return "", fmt.Errorf("no camera device found")
 			}
@@ -515,16 +557,18 @@ func main() {
 
 	stopStreaming := func() {
 		wsMu.Lock()
-		if streamCancel != nil {
-			streamCancel()
-			streamCancel = nil
-			log("Stream stopped")
-			fyne.Do(func() {
-				btnBroadcastStart.Enable()
-				btnBroadcastStop.Disable()
-			})
+		if streamCancel == nil {
+			wsMu.Unlock()
+			return
 		}
+		streamCancel()
+		streamCancel = nil
 		wsMu.Unlock()
+		cameraLog("Stream stopped")
+		fyne.Do(func() {
+			btnBroadcastStart.Enable()
+			btnBroadcastStop.Disable()
+		})
 	}
 
 	startStreaming := func() {
@@ -545,14 +589,14 @@ func main() {
 		wsMu.Lock()
 		if streamCancel != nil {
 			wsMu.Unlock()
-			log("Error: Stream already running")
+			cameraLog("Stream already running")
 			return
 		}
 		wsMu.Unlock()
 
 		device, err := resolveDevice(cameraEntry.Selected)
 		if err != nil {
-			log(fmt.Sprintf("Error: %v", err))
+			cameraLog(fmt.Sprintf("Error: %v", err))
 			return
 		}
 
@@ -561,9 +605,11 @@ func main() {
 		streamCancel = cancel
 		wsMu.Unlock()
 
-		log(fmt.Sprintf("Starting stream for %s", device))
-		btnBroadcastStart.Disable()
-		btnBroadcastStop.Enable()
+		cameraLog(fmt.Sprintf("Starting stream for %s", device))
+		fyne.Do(func() {
+			btnBroadcastStart.Disable()
+			btnBroadcastStop.Enable()
+		})
 
 		go func() {
 			ticker := time.NewTicker(1 * time.Second)
@@ -575,7 +621,10 @@ func main() {
 				case <-ticker.C:
 					img, err := captureSnapshot(ctx, device)
 					if err != nil {
-						log(fmt.Sprintf("Error capturing frame: %v", err))
+						if ctx.Err() != nil {
+							return
+						}
+						cameraLog(fmt.Sprintf("Stream capture error: %v", err))
 						continue
 					}
 					go func(img image.Image) {
@@ -595,14 +644,13 @@ func main() {
 						c := wsConn
 						wsMu.Unlock()
 						if c == nil {
-							log("WS disconnected during stream")
+							cameraLog("WS disconnected during stream")
 							stopStreaming()
 							return
 						}
-						// send meta
 						_ = c.WriteMessage(websocket.TextMessage, metaJSON)
 						if err := c.WriteMessage(websocket.BinaryMessage, buf.Bytes()); err != nil {
-							log(fmt.Sprintf("WS send error: %v", err))
+							cameraLog(fmt.Sprintf("WS send error: %v", err))
 							stopStreaming()
 							return
 						}
@@ -625,7 +673,6 @@ func main() {
 	btnBroadcastStart = widget.NewButtonWithIcon("Go Live", theme.MediaPlayIcon(), startBroadcast)
 	btnBroadcastStop = widget.NewButtonWithIcon("End Stream", theme.MediaStopIcon(), stopBroadcast)
 	btnBroadcastStop.Disable()
-
 	btnPreviewStop.Disable()
 
 	// WebSocket to server for camera feed control
@@ -697,27 +744,27 @@ func main() {
 					return
 				}
 				cmd := strings.ToLower(strings.TrimSpace(string(msg)))
-				switch cmd {
-				case "start":
-					log("WS command: start streaming")
-					fyne.Do(func() { startStreaming() })
-				case "stop":
-					log("WS command: stop streaming")
-					fyne.Do(func() { stopStreaming() })
-				case "move-left", "move-right", "move-up", "move-down":
-					log(fmt.Sprintf("WS camera command: %s", cmd))
-					runCameraCommand(cmd, []string{"-" + cmd})
-				case "flip":
-					fyne.Do(func() {
-						previewImageFlip = !previewImageFlip
-						log("WS camera command: flip preview")
-						if previewImage.Image != nil {
-							previewImage.Refresh()
-						}
-					})
-				default:
-					log(fmt.Sprintf("WS unknown command: %s", cmd))
-				}
+			switch cmd {
+			case "start":
+				cameraLog("WS command: start streaming")
+				go startStreaming()
+			case "stop":
+				cameraLog("WS command: stop streaming")
+				go stopStreaming()
+			case "move-left", "move-right", "move-up", "move-down":
+				cameraLog(fmt.Sprintf("WS camera command: %s", cmd))
+				runCameraCommand(cmd, []string{"-" + cmd})
+			case "flip":
+				fyne.Do(func() {
+					previewImageFlip = !previewImageFlip
+					cameraLog("WS camera command: flip preview")
+					if previewImage.Image != nil {
+						previewImage.Refresh()
+					}
+				})
+			default:
+				cameraLog(fmt.Sprintf("WS unknown command: %s", cmd))
+			}
 			}
 		}()
 
@@ -758,23 +805,6 @@ func main() {
 	})
 	btnSaveSettings.Importance = widget.HighImportance
 
-	// Collect buttons for refresh
-	// Collect buttons for refresh
-	refreshButtons = append(refreshButtons,
-		stopBtn,
-		btnHeartRate, btnNIBP, btnGlucose, btnTemp,
-		btnStethoscopeList, btnStethoscopeConnect,
-		btnCamList, btnCamLeft, btnCamRight, btnCamUp, btnCamDown, btnCamFlip,
-		btnPreviewStart, btnPreviewStop,
-		wsConnectBtn, wsDisconnectBtn,
-		btnBroadcastStart, btnBroadcastStop,
-		advancedBtn, btnSaveSettings,
-	)
-	for _, b := range refreshButtons {
-		if b != nil && b.Text != "" {
-			buttonDefaults[b] = b.Text
-		}
-	}
 
 	// --- Layout Refactor ---
 
@@ -838,6 +868,7 @@ func main() {
 			advancedBtn,
 			advancedContainer,
 		)),
+		widget.NewCard("Camera Status", "", cameraLogLabel),
 		widget.NewCard("Camera Control", "Precision Pan-Tilt-Zoom", container.NewVBox(
 			btnCamList,
 			container.NewCenter(
