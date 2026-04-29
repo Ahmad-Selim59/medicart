@@ -658,8 +658,7 @@ func main() {
 	)
 
 	patientsContent := container.NewVBox(
-		widget.NewCard("Identity Context", "Select Clinic and Patient", container.NewVBox(
-			clinicNameLabel, clinicNameEntry,
+		widget.NewCard("Identity Context", "Select Patient", container.NewVBox(
 			patientNameLabel, patientNameEntry,
 		)),
 		widget.NewCard("Patient Overview", "", patientOverview),
@@ -719,6 +718,9 @@ func main() {
 	// Mimicking the Configuration Settings section
 	settingsContent := container.NewVBox(
 		widget.NewCard("Configuration Settings", "Manage hospital connectivity", container.NewVBox(
+			widget.NewLabelWithStyle("Clinic Identity", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			clinicNameLabel, clinicNameEntry,
+			widget.NewSeparator(),
 			widget.NewLabelWithStyle("Server Environment", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 			urlLabel, urlEntry,
 			widget.NewSeparator(),
@@ -942,17 +944,19 @@ func detectDefaultCameraDevice() (string, error) {
 		lines := strings.Split(stderr.String(), "\n")
 		for _, ln := range lines {
 			ln = strings.TrimSpace(ln)
-			// Match lines like: [AVFoundation input device @ ...] [0] FaceTime HD Camera
-			if strings.Contains(ln, "AVFoundation input device") && strings.Contains(ln, "] [") {
+			// Older ffmpeg: [AVFoundation input device @ ...] [0] Camera
+			// Newer ffmpeg: [AVFoundation indev @ ...] [0] Camera
+			if strings.Contains(ln, "AVFoundation") && strings.Contains(ln, "] [") {
 				parts := strings.Split(ln, "] [")
 				if len(parts) >= 2 {
-					// Extract index between '[' and ']' after split
-					// e.g. "...] [0] FaceTime HD Camera"
 					idxEnd := strings.Index(parts[1], "]")
 					if idxEnd > 0 {
 						idx := strings.TrimSpace(parts[1][:idxEnd])
-						if idx != "" {
-							return idx, nil // avfoundation expects numeric index like "0"
+						deviceName := strings.TrimSpace(parts[1][idxEnd+1:])
+						
+						// Skip audio devices if they appear here, and skip screen capture
+						if idx != "" && !strings.Contains(strings.ToLower(deviceName), "capture screen") && !strings.Contains(strings.ToLower(ln), "audio devices") {
+							return idx, nil
 						}
 					}
 				}
