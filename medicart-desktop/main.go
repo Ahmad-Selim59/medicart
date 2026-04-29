@@ -9,7 +9,9 @@ import (
 	"image"
 	"image/jpeg"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -27,6 +29,64 @@ import (
 
 // LineParser function signature
 type LineParser func(line string) (interface{}, error)
+
+// AppConfig holds all persisted settings.
+type AppConfig struct {
+	ServerBase  string `json:"server_base"`
+	ClinicName  string `json:"clinic_name"`
+	PatientName string `json:"patient_name"`
+	StethMAC    string `json:"steth_mac"`
+	LightMode   bool   `json:"light_mode"`
+}
+
+func configFilePath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".medicart_config.json"
+	}
+	return filepath.Join(home, ".medicart", "config.json")
+}
+
+func loadAppConfig() AppConfig {
+	cfg := AppConfig{ServerBase: "http://localhost:8081"}
+	data, err := os.ReadFile(configFilePath())
+	if err != nil {
+		return cfg
+	}
+	_ = json.Unmarshal(data, &cfg)
+	if cfg.ServerBase == "" {
+		cfg.ServerBase = "http://localhost:8081"
+	}
+	return cfg
+}
+
+func saveAppConfig(cfg AppConfig) error {
+	p := configFilePath()
+	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, data, 0600)
+}
+
+// ingestURL derives the HTTP ingest endpoint from a base URL.
+func ingestURL(base string) string {
+	return strings.TrimRight(base, "/") + "/api/ingest"
+}
+
+// feedWSURL derives the WebSocket feed endpoint from a base URL.
+func feedWSURL(base string) string {
+	u := strings.TrimRight(base, "/")
+	u = strings.Replace(u, "https://", "wss://", 1)
+	u = strings.Replace(u, "http://", "ws://", 1)
+	if !strings.HasPrefix(u, "ws") {
+		u = "ws://" + u
+	}
+	return u + "/ws/feed"
+}
 
 var (
 	currentCmd    *exec.Cmd
@@ -48,46 +108,39 @@ func main() {
 	var btnPreviewStart, btnPreviewStop *widget.Button
 	var btnBroadcastStart, btnBroadcastStop *widget.Button
 
-	// Theme Toggle
+	// Load persisted settings from ~/.medicart/config.json
+	cfg := loadAppConfig()
+
+	// Theme Toggle — applies immediately, persisted on Save
 	lightModeCheck := widget.NewCheck("Light Mode", func(checked bool) {
 		if checked {
 			myApp.Settings().SetTheme(theme.LightTheme())
 		} else {
 			myApp.Settings().SetTheme(theme.DarkTheme())
 		}
-		myApp.Preferences().SetBool("light_mode", checked)
 	})
-	lightModeCheck.Checked = myApp.Preferences().Bool("light_mode")
+	lightModeCheck.Checked = cfg.LightMode
 	if lightModeCheck.Checked {
 		myApp.Settings().SetTheme(theme.LightTheme())
 	}
 
-	// URL Input
-	urlLabel := widget.NewLabel("Web Server URL:")
-	urlEntry := widget.NewEntry()
-	urlEntry.SetPlaceHolder("http://your-server.com/api/ingest")
-	urlEntry.Text = myApp.Preferences().StringWithFallback("server_url", "http://localhost:8081/api/ingest")
-	urlEntry.OnChanged = func(s string) {
-		myApp.Preferences().SetString("server_url", s)
-	}
+	// Server Base URL (e.g. http://localhost:8081) — /api/ingest and /ws/feed are derived
+	serverBaseLabel := widget.NewLabel("Server Base URL:")
+	serverBaseEntry := widget.NewEntry()
+	serverBaseEntry.SetPlaceHolder("http://your-server.com")
+	serverBaseEntry.SetText(cfg.ServerBase)
 
 	// Patient Name Input
 	patientNameLabel := widget.NewLabel("Patient Name:")
 	patientNameEntry := widget.NewEntry()
 	patientNameEntry.SetPlaceHolder("Enter patient name")
-	patientNameEntry.Text = myApp.Preferences().String("patient_name")
-	patientNameEntry.OnChanged = func(s string) {
-		myApp.Preferences().SetString("patient_name", s)
-	}
+	patientNameEntry.SetText(cfg.PatientName)
 
 	// Clinic Name Input
 	clinicNameLabel := widget.NewLabel("Clinic Name:")
 	clinicNameEntry := widget.NewEntry()
 	clinicNameEntry.SetPlaceHolder("Enter clinic name")
-	clinicNameEntry.Text = myApp.Preferences().String("clinic_name")
-	clinicNameEntry.OnChanged = func(s string) {
-		myApp.Preferences().SetString("clinic_name", s)
-	}
+	clinicNameEntry.SetText(cfg.ClinicName)
 
 	// Status Area
 	statusLabel := widget.NewRichTextFromMarkdown("Status: Idle")
@@ -185,9 +238,9 @@ func main() {
 		}
 		cmdMutex.Unlock()
 
-		targetURL := urlEntry.Text
-		if targetURL == "" {
-			log("Error: Please enter a Web Server URL")
+		targetURL := ingestURL(strings.TrimSpace(serverBaseEntry.Text))
+		if strings.TrimSpace(serverBaseEntry.Text) == "" {
+			log("Error: Please enter a Server Base URL in Settings")
 			return
 		}
 
@@ -248,10 +301,7 @@ func main() {
 
 	stethMacEntry = widget.NewEntry()
 	stethMacEntry.SetPlaceHolder("AA:BB:CC:DD:EE:FF")
-	stethMacEntry.Text = myApp.Preferences().String("steth_mac")
-	stethMacEntry.OnChanged = func(s string) {
-		myApp.Preferences().SetString("steth_mac", s)
-	}
+	stethMacEntry.SetText(cfg.StethMAC)
 
 	btnStethoscopeConnect := widget.NewButtonWithIcon("Connect", theme.MediaPlayIcon(), func() {
 		mac := strings.TrimSpace(stethMacEntry.Text)
@@ -579,12 +629,6 @@ func main() {
 	btnPreviewStop.Disable()
 
 	// WebSocket to server for camera feed control
-	wsURLLabel := widget.NewLabel("WebSocket URL:")
-	wsURLEntry := widget.NewEntry()
-	wsURLEntry.SetText(myApp.Preferences().StringWithFallback("ws_url", "ws://localhost:8081/ws/feed"))
-	wsURLEntry.OnChanged = func(s string) {
-		myApp.Preferences().SetString("ws_url", s)
-	}
 	wsStatus := widget.NewLabel("WS: Disconnected")
 
 	// Declare connectWS early so it can be used by startStreaming
@@ -599,11 +643,12 @@ func main() {
 		}
 		wsMu.Unlock()
 
-		u := strings.TrimSpace(wsURLEntry.Text)
-		if u == "" {
-			log("Error: Enter WS URL")
-			return fmt.Errorf("missing URL")
+		base := strings.TrimSpace(serverBaseEntry.Text)
+		if base == "" {
+			log("Error: Enter a Server Base URL in Settings")
+			return fmt.Errorf("missing base URL")
 		}
+		u := feedWSURL(base)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		c, _, err := websocket.DefaultDialer.DialContext(ctx, u, nil)
@@ -697,6 +742,22 @@ func main() {
 	wsConnectBtn := widget.NewButtonWithIcon("Connect", theme.SettingsIcon(), func() { connectWS() })
 	wsDisconnectBtn := widget.NewButtonWithIcon("Disconnect", theme.CancelIcon(), disconnectWS)
 
+	btnSaveSettings := widget.NewButtonWithIcon("Save Settings", theme.DocumentSaveIcon(), func() {
+		newCfg := AppConfig{
+			ServerBase:  strings.TrimSpace(serverBaseEntry.Text),
+			ClinicName:  strings.TrimSpace(clinicNameEntry.Text),
+			PatientName: strings.TrimSpace(patientNameEntry.Text),
+			StethMAC:    strings.TrimSpace(stethMacEntry.Text),
+			LightMode:   lightModeCheck.Checked,
+		}
+		if err := saveAppConfig(newCfg); err != nil {
+			log(fmt.Sprintf("Error saving settings: %v", err))
+		} else {
+			log(fmt.Sprintf("Settings saved (server: %s)", newCfg.ServerBase))
+		}
+	})
+	btnSaveSettings.Importance = widget.HighImportance
+
 	// Collect buttons for refresh
 	// Collect buttons for refresh
 	refreshButtons = append(refreshButtons,
@@ -707,7 +768,7 @@ func main() {
 		btnPreviewStart, btnPreviewStop,
 		wsConnectBtn, wsDisconnectBtn,
 		btnBroadcastStart, btnBroadcastStop,
-		advancedBtn,
+		advancedBtn, btnSaveSettings,
 	)
 	for _, b := range refreshButtons {
 		if b != nil && b.Text != "" {
@@ -793,17 +854,18 @@ func main() {
 	)
 
 	// 4. Settings Tab
-	// Mimicking the Configuration Settings section
 	settingsContent := container.NewVBox(
-		widget.NewCard("Configuration Settings", "Manage hospital connectivity", container.NewVBox(
+		widget.NewCard("Configuration", "Saved to ~/.medicart/config.json", container.NewVBox(
 			widget.NewLabelWithStyle("Clinic Identity", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 			clinicNameLabel, clinicNameEntry,
 			widget.NewSeparator(),
-			widget.NewLabelWithStyle("Server Environment", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-			urlLabel, urlEntry,
+			widget.NewLabelWithStyle("Server", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			serverBaseLabel, serverBaseEntry,
+			widget.NewLabelWithStyle("  → ingest: {base}/api/ingest\n  → feed:   {base}/ws/feed", fyne.TextAlignLeading, fyne.TextStyle{Italic: true}),
 			widget.NewSeparator(),
-			widget.NewLabelWithStyle("WebSocket Feed Control", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-			wsURLLabel, wsURLEntry,
+			btnSaveSettings,
+		)),
+		widget.NewCard("Camera Feed Connection", "", container.NewVBox(
 			wsStatus,
 			container.NewGridWithColumns(2, wsConnectBtn, wsDisconnectBtn),
 		)),
