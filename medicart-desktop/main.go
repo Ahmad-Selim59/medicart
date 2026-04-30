@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ebitengine/oto/v3"
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
@@ -108,6 +109,33 @@ var (
 	avConfigMu    sync.Mutex
 	avConfigCache = map[string]avConfig{}
 )
+
+// otoState holds the single shared oto audio context.
+// It is initialised once on first use (lazy, so the main window appears
+// immediately) and never closed for the lifetime of the process.
+var (
+	otoCtx      *oto.Context
+	otoCtxOnce  sync.Once
+	otoCtxErr   error
+)
+
+func getOtoContext() (*oto.Context, error) {
+	otoCtxOnce.Do(func() {
+		op := &oto.NewContextOptions{
+			SampleRate:   16000,
+			ChannelCount: 1,
+			Format:       oto.FormatSignedInt16LE,
+		}
+		ctx, ready, err := oto.NewContext(op)
+		if err != nil {
+			otoCtxErr = err
+			return
+		}
+		<-ready
+		otoCtx = ctx
+	})
+	return otoCtx, otoCtxErr
+}
 
 // probeAVFoundationConfig runs ffmpeg twice with deliberately invalid options
 // to make avfoundation dump the device's supported framerates and pixel formats
@@ -1127,54 +1155,44 @@ func main() {
 				micLog("Mic WS disconnected")
 			}()
 
-			// Incoming binary = doctor mic audio → play via ffplay.
-			// ffplayCmd/Stdin are reset to nil whenever ffplay exits so the
-			// next incoming chunk automatically restarts it. This means audio
-			// resumes correctly after any gap/pause without needing -autoexit.
-			var ffplayCmd *exec.Cmd
-			var ffplayStdin io.WriteCloser
+			// Incoming binary = doctor mic audio → play via oto (native audio,
+			// no external binary required). Each chunk is s16le 16 kHz mono,
+			// matching what the browser sends.
+			otoContext, otoErr := getOtoContext()
+			if otoErr != nil {
+				micLog(fmt.Sprintf("Audio init error: %v — doctor audio playback unavailable", otoErr))
+			}
 
-			stopFFPlay := func() {
-				if ffplayStdin != nil {
-					ffplayStdin.Close()
-					ffplayStdin = nil
+			var (
+				audioPlayer  *oto.Player
+				audioPipeW   *io.PipeWriter
+			)
+
+			startPlayer := func() {
+				if audioPlayer != nil {
+					audioPlayer.Close()
 				}
-				if ffplayCmd != nil {
-					_ = ffplayCmd.Wait()
-					ffplayCmd = nil
+				pr, pw := io.Pipe()
+				audioPipeW = pw
+				p := otoContext.NewPlayer(pr)
+				audioPlayer = p
+				audioPlayer.Play()
+				micLog("Audio playback started")
+			}
+
+			stopPlayer := func() {
+				if audioPipeW != nil {
+					audioPipeW.Close()
+					audioPipeW = nil
+				}
+				if audioPlayer != nil {
+					audioPlayer.Close()
+					audioPlayer = nil
 				}
 			}
 
-			startFFPlay := func() bool {
-				stopFFPlay()
-				cmd := exec.Command("ffplay",
-					"-f", "s16le", "-ar", "16000", "-ac", "1",
-					"-nodisp", "-loglevel", "warning", "-",
-				)
-				var err error
-				ffplayStdin, err = cmd.StdinPipe()
-				if err != nil {
-					micLog(fmt.Sprintf("ffplay stdin error: %v", err))
-					return false
-				}
-				if err := cmd.Start(); err != nil {
-					micLog(fmt.Sprintf("ffplay not found — install ffplay for audio playback: %v", err))
-					ffplayStdin = nil
-					return false
-				}
-				ffplayCmd = cmd
-				micLog("Audio playback started (ffplay)")
-				// Reap ffplay when it exits so we know when to restart.
-				go func() {
-					_ = cmd.Wait()
-					micLog("Audio playback ended (ffplay exited)")
-					// Only nil out if it's still the same instance.
-					if ffplayCmd == cmd {
-						ffplayCmd = nil
-						ffplayStdin = nil
-					}
-				}()
-				return true
+			if otoContext != nil {
+				startPlayer()
 			}
 
 			for {
@@ -1182,22 +1200,14 @@ func main() {
 				if err != nil {
 					break
 				}
-				if mt == websocket.BinaryMessage && len(msg) > 0 {
-					// Restart ffplay if it isn't running.
-					if ffplayCmd == nil {
-						if !startFFPlay() {
-							continue
-						}
-					}
-					if _, werr := ffplayStdin.Write(msg); werr != nil {
-						// ffplay pipe broke — restart on next chunk.
-						micLog(fmt.Sprintf("ffplay write error (will restart): %v", werr))
-						stopFFPlay()
+				if mt == websocket.BinaryMessage && len(msg) > 0 && audioPipeW != nil {
+					if _, werr := audioPipeW.Write(msg); werr != nil {
+						micLog(fmt.Sprintf("Audio write error: %v", werr))
 					}
 				}
 			}
 
-			stopFFPlay()
+			stopPlayer()
 		}()
 
 		return nil
