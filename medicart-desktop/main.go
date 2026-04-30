@@ -1165,29 +1165,34 @@ func main() {
 			// no external binary required). Each chunk is s16le 16 kHz mono,
 			// matching what the browser sends.
 			//
-			// getOtoContext initialises the audio device; on some old Windows
-			// builds this can take a moment (or time out). We run it in a
-			// separate goroutine and feed audio via a buffered channel so the
-			// WS receive loop never blocks waiting for the audio driver.
+			// Audio init runs in its own goroutine so a slow/failing audio
+			// driver never blocks the WS receive loop. Chunks are buffered in
+			// a channel; once oto is ready they are drained and played.
 			type audioChunk = []byte
-			audioCh := make(chan audioChunk, 64)
+			audioCh := make(chan audioChunk, 128)
 
 			go func() {
 				defer func() {
-					// drain channel on exit
 					for range audioCh {
-					}
+					} // drain on exit
 				}()
+				micLog("Audio: initialising output device…")
 				otoContext, otoErr := getOtoContext()
 				if otoErr != nil {
-					micLog(fmt.Sprintf("Audio init error: %v — doctor audio unavailable", otoErr))
+					micLog(fmt.Sprintf("Audio init FAILED: %v — doctor audio unavailable", otoErr))
 					return
 				}
+				micLog("Audio: output device ready, starting player")
 				pr, pw := io.Pipe()
 				p := otoContext.NewPlayer(pr)
 				p.Play()
-				micLog("Audio playback ready")
+				micLog("Audio playback active — doctor audio will be played through speakers")
+				chunkCount := 0
 				for chunk := range audioCh {
+					if chunkCount == 0 {
+						micLog("Audio: first doctor audio chunk received")
+					}
+					chunkCount++
 					if _, werr := pw.Write(chunk); werr != nil {
 						micLog(fmt.Sprintf("Audio write error: %v", werr))
 						break
@@ -1206,7 +1211,9 @@ func main() {
 					select {
 					case audioCh <- msg:
 					default:
-						// channel full (audio driver stalled) — drop chunk
+						// channel full — audio driver too slow, drop oldest
+						<-audioCh
+						audioCh <- msg
 					}
 				}
 			}
@@ -1322,12 +1329,9 @@ func main() {
 			case "stop":
 				cameraLog("WS command: stop streaming")
 				go stopStreaming()
-			case "mic-on":
-				cameraLog("WS command: mic on")
-				go startMicStreaming()
-			case "mic-off":
-				cameraLog("WS command: mic off")
-				go stopMicStreaming()
+		case "mic-on", "mic-off":
+			// Doctor mic-toggle commands — no action on the clinic side.
+			// The clinic mic is controlled solely by the local Unmute/Mute buttons.
 			case "move-left", "move-right", "move-up", "move-down":
 				cameraLog(fmt.Sprintf("WS camera command: %s", cmd))
 				runCameraCommand(cmd, []string{"-" + cmd})
