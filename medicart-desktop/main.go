@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -34,6 +35,12 @@ import (
 // returns a larger native frame (e.g. 640x480 or 1920x1080).
 const previewMaxW, previewMaxH = 320, 240
 
+// cameraFPS is kept for the existing function signature but unused now: the
+// pipeline runs at the camera's native rate (typically 30 fps) and we don't
+// dictate a framerate to the device — older ffmpeg on Windows + cameras that
+// only support 15/30 fps reject anything else and refuse to open.
+const cameraFPS = 30
+
 // blankFrame is a 1x1 fully transparent image used in place of nil so that
 // canvas.Image always has content. A visible canvas.Image with nil content
 // thrashes the GL texture cache (see fyne issue #4345), evicting cached
@@ -42,6 +49,278 @@ var blankFrame = func() *image.RGBA {
 	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
 	return img
 }()
+
+// splitMJPEGFrames reads a concatenated MJPEG byte stream and emits complete JPEG buffers.
+func splitMJPEGFrames(ctx context.Context, r io.Reader, out chan<- []byte) {
+	defer close(out)
+	pending := make([]byte, 0, 64*1024)
+	buf := make([]byte, 32*1024)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		n, err := r.Read(buf)
+		if n > 0 {
+			pending = append(pending, buf[:n]...)
+			for {
+				si := bytes.Index(pending, []byte{0xFF, 0xD8})
+				if si < 0 {
+					if len(pending) > 512*1024 {
+						pending = pending[len(pending)-1024:]
+					}
+					break
+				}
+				if si > 0 {
+					pending = pending[si:]
+				}
+				ei := bytes.Index(pending[2:], []byte{0xFF, 0xD9})
+				if ei < 0 {
+					break
+				}
+				end := ei + 4
+				frame := make([]byte, end)
+				copy(frame, pending[:end])
+				pending = pending[end:]
+				select {
+				case out <- frame:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// avConfig captures the parameters avfoundation needs to actually open a given
+// camera. avfoundation has built-in defaults (29.97 fps, yuv420p) that real
+// hardware almost never accepts, so we have to probe and tell ffmpeg explicitly.
+type avConfig struct {
+	framerate string
+	pixfmt    string
+}
+
+var (
+	avConfigMu    sync.Mutex
+	avConfigCache = map[string]avConfig{}
+)
+
+// probeAVFoundationConfig runs ffmpeg twice with deliberately invalid options
+// to make avfoundation dump the device's supported framerates and pixel formats
+// to stderr. It then returns the highest framerate and a preferred pixel format.
+// Cached per device so we only pay this cost once.
+func probeAVFoundationConfig(ctx context.Context, device string) avConfig {
+	avConfigMu.Lock()
+	if c, ok := avConfigCache[device]; ok {
+		avConfigMu.Unlock()
+		return c
+	}
+	avConfigMu.Unlock()
+
+	cfg := avConfig{
+		framerate: probeAVFramerate(ctx, device),
+	}
+	cfg.pixfmt = probeAVPixelFormat(ctx, device, cfg.framerate)
+
+	avConfigMu.Lock()
+	avConfigCache[device] = cfg
+	avConfigMu.Unlock()
+	return cfg
+}
+
+func probeAVFramerate(ctx context.Context, device string) string {
+	pctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(pctx, "ffmpeg",
+		"-nostdin", "-hide_banner",
+		"-f", "avfoundation", "-framerate", "9999", "-i", device,
+		"-f", "null", "-",
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	_ = cmd.Run()
+
+	re := regexp.MustCompile(`@\[([^\]]+)\]fps`)
+	var best float64
+	for _, m := range re.FindAllStringSubmatch(stderr.String(), -1) {
+		for _, f := range strings.Fields(m[1]) {
+			v, err := strconv.ParseFloat(f, 64)
+			if err == nil && v > best {
+				best = v
+			}
+		}
+	}
+	if best <= 0 {
+		return ""
+	}
+	if best == float64(int(best)) {
+		return strconv.Itoa(int(best))
+	}
+	return strconv.FormatFloat(best, 'f', -1, 64)
+}
+
+func probeAVPixelFormat(ctx context.Context, device, framerate string) string {
+	pctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	args := []string{"-nostdin", "-hide_banner", "-f", "avfoundation"}
+	if framerate != "" {
+		args = append(args, "-framerate", framerate)
+	}
+	// We pass yuv420p — a real, parseable pixel format that nearly all
+	// avfoundation cameras refuse. ffmpeg responds by printing the device's
+	// "Supported pixel formats" list to stderr, which we then parse. Using a
+	// nonsense name like "zzzzzz" doesn't work: ffmpeg rejects it at argument
+	// parse time, before it ever tries to talk to the camera.
+	args = append(args, "-pixel_format", "yuv420p", "-i", device, "-f", "null", "-")
+	cmd := exec.CommandContext(pctx, "ffmpeg", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	_ = cmd.Run()
+
+	out := stderr.String()
+	idx := strings.Index(out, "Supported pixel formats:")
+	if idx < 0 {
+		return ""
+	}
+	// (?m) so ^/$ anchor at line boundaries within the captured chunk.
+	lineRE := regexp.MustCompile(`(?m)^\[(?:avfoundation|AVFoundation[^\]]*)[^\]]*\]\s+(\w+)\s*$`)
+	var available []string
+	for _, m := range lineRE.FindAllStringSubmatch(out[idx:], -1) {
+		available = append(available, m[1])
+	}
+	preferred := []string{"uyvy422", "yuyv422", "nv12", "0rgb", "bgr0"}
+	for _, p := range preferred {
+		for _, a := range available {
+			if a == p {
+				return p
+			}
+		}
+	}
+	if len(available) > 0 {
+		return available[0]
+	}
+	return ""
+}
+
+// runMJPEGPipe starts ffmpeg writing continuous MJPEG to stdout. Caller must cancel ctx to stop.
+func runMJPEGPipe(ctx context.Context, device string, _ int, logFn func(string)) (<-chan []byte, error) {
+	var darwinCfg avConfig
+	if runtime.GOOS == "darwin" {
+		darwinCfg = probeAVFoundationConfig(ctx, device)
+		if darwinCfg.framerate != "" || darwinCfg.pixfmt != "" {
+			logFn(fmt.Sprintf("Camera config: framerate=%s pixel_format=%s",
+				or(darwinCfg.framerate, "default"), or(darwinCfg.pixfmt, "default")))
+		}
+	}
+	args := buildFFmpegArgsForMJPEGPipe(device, darwinCfg)
+	logFn(fmt.Sprintf("ffmpeg %s", strings.Join(args, " ")))
+
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
+	var stderrBuf bytes.Buffer
+	var stderrMu sync.Mutex
+	go func() {
+		b := make([]byte, 4096)
+		for {
+			n, rerr := stderrPipe.Read(b)
+			if n > 0 {
+				stderrMu.Lock()
+				stderrBuf.Write(b[:n])
+				stderrMu.Unlock()
+			}
+			if rerr != nil {
+				return
+			}
+		}
+	}()
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	out := make(chan []byte, 4)
+	go func() {
+		// Read stdout into MJPEG frames until ffmpeg closes its stdout (exit or kill).
+		splitMJPEGFrames(ctx, stdout, out)
+		// Now reap and log ALWAYS — even if ctx was cancelled — so we never lose the
+		// real ffmpeg error message.
+		waitErr := cmd.Wait()
+		stderrMu.Lock()
+		msg := strings.TrimSpace(stderrBuf.String())
+		stderrMu.Unlock()
+		if len(msg) > 1500 {
+			msg = msg[len(msg)-1500:]
+		}
+		switch {
+		case waitErr != nil && msg != "":
+			logFn(fmt.Sprintf("ffmpeg exited: %v — %s", waitErr, msg))
+		case waitErr != nil:
+			logFn(fmt.Sprintf("ffmpeg exited: %v", waitErr))
+		case msg != "":
+			logFn(fmt.Sprintf("ffmpeg stderr: %s", msg))
+		}
+	}()
+
+	return out, nil
+}
+
+// or returns a if non-empty, else b.
+func or(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+// buildFFmpegArgsForMJPEGPipe builds the ffmpeg argv for a continuous MJPEG
+// stream over stdout. On macOS we pass framerate and pixel_format that the
+// camera actually supports; avfoundation's defaults (29.97 fps, yuv420p)
+// would otherwise be rejected by most real webcams.
+//
+// Critical: -use_wallclock_as_timestamps 1 (input) and -vsync passthrough
+// (output). Without these, avfoundation hands ffmpeg frames with a bogus
+// 1,000,000 fps timebase, causing ffmpeg to "fill in" missing frames by
+// duplicating the very first frame thousands of times — which is what makes
+// the preview look frozen on one image. Wall-clock timestamps + passthrough
+// vsync make ffmpeg emit each captured frame exactly once.
+func buildFFmpegArgsForMJPEGPipe(device string, darwin avConfig) []string {
+	globals := []string{"-nostdin", "-hide_banner", "-loglevel", "error"}
+	// -vsync passthrough: emit each input frame once, never duplicate or drop.
+	// (Newer ffmpeg also exposes this as -fps_mode passthrough; -vsync still
+	// works in current builds and is the only spelling older ffmpeg knows.)
+	tail := []string{"-an", "-vsync", "passthrough", "-f", "mjpeg", "-q:v", "6", "-"}
+	var mid []string
+	switch runtime.GOOS {
+	case "windows":
+		device = normalizeWindowsDeviceName(device)
+		mid = []string{"-f", "dshow", "-i", device}
+	case "darwin":
+		mid = []string{"-f", "avfoundation"}
+		if darwin.framerate != "" {
+			mid = append(mid, "-framerate", darwin.framerate)
+		}
+		if darwin.pixfmt != "" {
+			mid = append(mid, "-pixel_format", darwin.pixfmt)
+		}
+		// -use_wallclock_as_timestamps overrides avfoundation's broken
+		// device timebase so each frame gets a real, monotonic timestamp.
+		mid = append(mid, "-use_wallclock_as_timestamps", "1", "-i", device)
+	default:
+		mid = []string{"-f", "v4l2", "-i", device}
+	}
+	return append(append(globals, mid...), tail...)
+}
 
 // fitToPreview returns a copy of src scaled to fit within previewMaxW x previewMaxH,
 // preserving aspect ratio.
@@ -451,7 +730,7 @@ func main() {
 		applyPreview()
 	})
 
-	// Camera Preview (snapshot via ffmpeg dshow)
+	// Camera Preview (continuous MJPEG from ffmpeg, ~cameraFPS fps)
 	stopPreviewInternal := func(logMsg string) {
 		previewMu.Lock()
 		if previewCancel == nil {
@@ -503,24 +782,25 @@ func main() {
 		})
 
 		go func() {
-			ticker := time.NewTicker(1 * time.Second)
-			defer ticker.Stop()
+			frames, err := runMJPEGPipe(ctx, device, cameraFPS, cameraLog)
+			if err != nil {
+				cameraLog(fmt.Sprintf("Preview ffmpeg error: %v", err))
+				stopPreviewInternal("")
+				return
+			}
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case <-ticker.C:
-					img, err := captureSnapshot(ctx, device)
+				case jpegBytes, ok := <-frames:
+					if !ok {
+						stopPreviewInternal("Camera preview ended")
+						return
+					}
+					img, err := jpeg.Decode(bytes.NewReader(jpegBytes))
 					if err != nil {
-						// ffmpeg returns "signal: killed" when we cancel ctx; that's expected.
-						if ctx.Err() != nil {
-							return
-						}
-						cameraLog(fmt.Sprintf("Capture error: %v", err))
 						continue
 					}
-					// Always downscale to a fixed preview size so the canvas
-					// never asks the layout for more space than we want.
 					scaled := fitToPreview(img)
 					var rendered image.Image = scaled
 					if previewImageFlip {
@@ -619,49 +899,39 @@ func main() {
 		})
 
 		go func() {
-			ticker := time.NewTicker(1 * time.Second)
-			defer ticker.Stop()
+			frames, err := runMJPEGPipe(ctx, device, cameraFPS, cameraLog)
+			if err != nil {
+				cameraLog(fmt.Sprintf("Stream ffmpeg error: %v", err))
+				stopStreaming()
+				return
+			}
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case <-ticker.C:
-					img, err := captureSnapshot(ctx, device)
-					if err != nil {
-						if ctx.Err() != nil {
-							return
-						}
-						cameraLog(fmt.Sprintf("Stream capture error: %v", err))
-						continue
+				case jpegBytes, ok := <-frames:
+					if !ok {
+						cameraLog("Stream: ffmpeg ended")
+						stopStreaming()
+						return
 					}
-					go func(img image.Image) {
-						// Always use the latest clinic name from the entry
-						currentClinic := strings.TrimSpace(clinicNameEntry.Text)
-						meta := map[string]string{
-							"clinic_name": currentClinic,
-						}
-						metaJSON, _ := json.Marshal(meta)
-
-						var buf bytes.Buffer
-						if err := jpeg.Encode(&buf, img, nil); err != nil {
-							log(fmt.Sprintf("Encode error: %v", err))
-							return
-						}
-						wsMu.Lock()
-						c := wsConn
-						wsMu.Unlock()
-						if c == nil {
-							cameraLog("WS disconnected during stream")
-							stopStreaming()
-							return
-						}
-						_ = c.WriteMessage(websocket.TextMessage, metaJSON)
-						if err := c.WriteMessage(websocket.BinaryMessage, buf.Bytes()); err != nil {
-							cameraLog(fmt.Sprintf("WS send error: %v", err))
-							stopStreaming()
-							return
-						}
-					}(img)
+					currentClinic := strings.TrimSpace(clinicNameEntry.Text)
+					meta := map[string]string{"clinic_name": currentClinic}
+					metaJSON, _ := json.Marshal(meta)
+					wsMu.Lock()
+					c := wsConn
+					wsMu.Unlock()
+					if c == nil {
+						cameraLog("WS disconnected during stream")
+						stopStreaming()
+						return
+					}
+					_ = c.WriteMessage(websocket.TextMessage, metaJSON)
+					if err := c.WriteMessage(websocket.BinaryMessage, jpegBytes); err != nil {
+						cameraLog(fmt.Sprintf("WS send error: %v", err))
+						stopStreaming()
+						return
+					}
 				}
 			}
 		}()
@@ -757,6 +1027,14 @@ func main() {
 				micLog(fmt.Sprintf("ffmpeg pipe error: %v", err))
 				return
 			}
+			stderrPipe, err := cmd.StderrPipe()
+			if err != nil {
+				micLog(fmt.Sprintf("ffmpeg stderr pipe error: %v", err))
+				return
+			}
+			var stderrBuf bytes.Buffer
+			go func() { _, _ = io.Copy(&stderrBuf, stderrPipe) }()
+
 			if err := cmd.Start(); err != nil {
 				micLog(fmt.Sprintf("ffmpeg start error: %v", err))
 				return
@@ -774,6 +1052,13 @@ func main() {
 				if err != nil {
 					if ctx.Err() == nil {
 						micLog(fmt.Sprintf("ffmpeg read error: %v", err))
+						msg := strings.TrimSpace(stderrBuf.String())
+						if msg != "" {
+							if len(msg) > 1500 {
+								msg = msg[len(msg)-1500:]
+							}
+							micLog(fmt.Sprintf("ffmpeg stderr: %s", msg))
+						}
 					}
 					return
 				}
@@ -1473,14 +1758,15 @@ func detectDefaultMicDevice() (string, error) {
 // Output is signed 16-bit little-endian, 16 kHz, mono — ready to be chunked over WebSocket.
 func buildFFmpegArgsForAudio(device string) []string {
 	out := []string{"-f", "s16le", "-ar", "16000", "-ac", "1", "-"}
+	pre := []string{"-nostdin", "-hide_banner"}
 	switch runtime.GOOS {
 	case "windows":
-		return append([]string{"-f", "dshow", "-i", `audio="` + device + `"`}, out...)
+		return append(append(pre, "-f", "dshow", "-i", `audio="`+device+`"`), out...)
 	case "darwin":
 		// "none:<audio_idx>" captures audio only; accepted by both old and new ffmpeg builds.
-		return append([]string{"-f", "avfoundation", "-i", "none:" + device}, out...)
+		return append(append(pre, "-f", "avfoundation", "-i", "none:"+device), out...)
 	default:
-		return append([]string{"-f", "alsa", "-i", device}, out...)
+		return append(append(pre, "-f", "alsa", "-i", device), out...)
 	}
 }
 
