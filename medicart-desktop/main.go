@@ -1761,7 +1761,11 @@ func buildFFmpegArgsForAudio(device string) []string {
 	pre := []string{"-nostdin", "-hide_banner"}
 	switch runtime.GOOS {
 	case "windows":
-		return append(append(pre, "-f", "dshow", "-i", `audio="`+device+`"`), out...)
+		// exec.Command passes args directly to the OS — no shell quoting.
+		// dshow expects audio=Device Name (no embedded quotes).
+		// Strip any quotes the detection step may have left in.
+		device = strings.Trim(device, `"`)
+		return append(append(pre, "-f", "dshow", "-i", "audio="+device), out...)
 	case "darwin":
 		// "none:<audio_idx>" captures audio only; accepted by both old and new ffmpeg builds.
 		return append(append(pre, "-f", "avfoundation", "-i", "none:"+device), out...)
