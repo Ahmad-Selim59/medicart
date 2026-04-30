@@ -1127,30 +1127,54 @@ func main() {
 				micLog("Mic WS disconnected")
 			}()
 
-			// Incoming binary = doctor mic audio → play via ffplay
+			// Incoming binary = doctor mic audio → play via ffplay.
+			// ffplayCmd/Stdin are reset to nil whenever ffplay exits so the
+			// next incoming chunk automatically restarts it. This means audio
+			// resumes correctly after any gap/pause without needing -autoexit.
 			var ffplayCmd *exec.Cmd
 			var ffplayStdin io.WriteCloser
-			startFFPlay := func() {
-				if ffplayCmd != nil {
-					return
+
+			stopFFPlay := func() {
+				if ffplayStdin != nil {
+					ffplayStdin.Close()
+					ffplayStdin = nil
 				}
+				if ffplayCmd != nil {
+					_ = ffplayCmd.Wait()
+					ffplayCmd = nil
+				}
+			}
+
+			startFFPlay := func() bool {
+				stopFFPlay()
 				cmd := exec.Command("ffplay",
 					"-f", "s16le", "-ar", "16000", "-ac", "1",
-					"-nodisp", "-autoexit", "-loglevel", "quiet", "-",
+					"-nodisp", "-loglevel", "warning", "-",
 				)
 				var err error
 				ffplayStdin, err = cmd.StdinPipe()
 				if err != nil {
 					micLog(fmt.Sprintf("ffplay stdin error: %v", err))
-					return
+					return false
 				}
 				if err := cmd.Start(); err != nil {
 					micLog(fmt.Sprintf("ffplay not found — install ffplay for audio playback: %v", err))
 					ffplayStdin = nil
-					return
+					return false
 				}
 				ffplayCmd = cmd
 				micLog("Audio playback started (ffplay)")
+				// Reap ffplay when it exits so we know when to restart.
+				go func() {
+					_ = cmd.Wait()
+					micLog("Audio playback ended (ffplay exited)")
+					// Only nil out if it's still the same instance.
+					if ffplayCmd == cmd {
+						ffplayCmd = nil
+						ffplayStdin = nil
+					}
+				}()
+				return true
 			}
 
 			for {
@@ -1159,21 +1183,21 @@ func main() {
 					break
 				}
 				if mt == websocket.BinaryMessage && len(msg) > 0 {
-					if ffplayStdin == nil {
-						startFFPlay()
+					// Restart ffplay if it isn't running.
+					if ffplayCmd == nil {
+						if !startFFPlay() {
+							continue
+						}
 					}
-					if ffplayStdin != nil {
-						_, _ = ffplayStdin.Write(msg)
+					if _, werr := ffplayStdin.Write(msg); werr != nil {
+						// ffplay pipe broke — restart on next chunk.
+						micLog(fmt.Sprintf("ffplay write error (will restart): %v", werr))
+						stopFFPlay()
 					}
 				}
 			}
 
-			if ffplayCmd != nil {
-				if ffplayStdin != nil {
-					ffplayStdin.Close()
-				}
-				_ = ffplayCmd.Wait()
-			}
+			stopFFPlay()
 		}()
 
 		return nil
