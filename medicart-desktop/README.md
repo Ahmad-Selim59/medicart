@@ -43,6 +43,14 @@ To build a standalone executable:
 go build -o MedicartUploader .
 ```
 
+to build in windows 32 bit:
+```bash
+GOOS=windows GOARCH=386 CGO_ENABLED=1 \
+  CC=i686-w64-mingw32-gcc \
+  CXX=i686-w64-mingw32-g++ \
+  go build -o medicart-desktop-windows-386.exe .
+```
+
 ## Usage
 
 1.  **Web Server URL**: Enter the full URL of your backend API endpoint (e.g., `http://myserver.com/api/readings`).
