@@ -119,6 +119,97 @@ var (
 	otoCtxErr   error
 )
 
+// audioRingBuffer is a non-blocking reader designed for oto's audio thread.
+//
+// Why not io.Pipe? io.Pipe is fully synchronous: Read blocks until Write is
+// called and vice-versa. Audio backends (CoreAudio on macOS, WASAPI on
+// Windows) call Read from a real-time callback that CANNOT block — if it
+// does, the entire audio output stalls. Using io.Pipe causes oto to never
+// pull data and produce no sound, even though Write succeeds (we observed
+// this directly: 100 chunks queued, 0 consumed).
+//
+// audioRingBuffer instead returns whatever bytes are buffered immediately,
+// padding with silence (zeros) when empty. Oto's audio thread always
+// returns quickly, the device keeps playing, and gaps become brief silences
+// rather than total stalls.
+type audioRingBuffer struct {
+	mu     sync.Mutex
+	buf    []byte
+	closed bool
+}
+
+func newAudioRingBuffer() *audioRingBuffer {
+	return &audioRingBuffer{buf: make([]byte, 0, 1<<20)} // 1 MiB cap is plenty
+}
+
+// Read returns up to len(p) bytes. Never blocks while open: pads with zeros
+// when no data is buffered. Returns io.EOF only after Close.
+func (a *audioRingBuffer) Read(p []byte) (int, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed && len(a.buf) == 0 {
+		return 0, io.EOF
+	}
+	if len(a.buf) == 0 {
+		// No data ready — emit silence so the audio thread never blocks.
+		for i := range p {
+			p[i] = 0
+		}
+		return len(p), nil
+	}
+	n := copy(p, a.buf)
+	a.buf = a.buf[n:]
+	if len(a.buf) > 0 && cap(a.buf) > 4*1024*1024 {
+		// Compact occasionally so cap doesn't grow forever.
+		nb := make([]byte, len(a.buf))
+		copy(nb, a.buf)
+		a.buf = nb
+	}
+	if n < len(p) {
+		// Pad the remainder with silence.
+		for i := n; i < len(p); i++ {
+			p[i] = 0
+		}
+		return len(p), nil
+	}
+	return n, nil
+}
+
+func (a *audioRingBuffer) Write(p []byte) (int, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return 0, io.ErrClosedPipe
+	}
+	// Cap the backlog at ~2 s of audio (16k * 2 = 32 KB/s, so 64 KB) — when
+	// we exceed that, drop the oldest data so latency stays bounded.
+	const maxBacklog = 64 * 1024
+	if len(a.buf)+len(p) > maxBacklog {
+		drop := len(a.buf) + len(p) - maxBacklog
+		if drop > len(a.buf) {
+			drop = len(a.buf)
+		}
+		a.buf = a.buf[drop:]
+	}
+	a.buf = append(a.buf, p...)
+	return len(p), nil
+}
+
+func (a *audioRingBuffer) Close() error {
+	a.mu.Lock()
+	a.closed = true
+	a.mu.Unlock()
+	return nil
+}
+
+func (a *audioRingBuffer) Len() int {
+	a.mu.Lock()
+	n := len(a.buf)
+	a.mu.Unlock()
+	return n
+}
+
+
 func getOtoContext() (*oto.Context, error) {
 	otoCtxOnce.Do(func() {
 		op := &oto.NewContextOptions{
@@ -1139,86 +1230,270 @@ func main() {
 		micWsMu.Unlock()
 		micLog("Mic WS connected to " + u)
 
-		// Register clinic immediately
+		// Register clinic immediately so the server forwards doctor audio to us.
 		clinic := strings.TrimSpace(clinicNameEntry.Text)
 		if clinic != "" {
 			meta, _ := json.Marshal(map[string]string{"clinic_name": clinic})
-			_ = c.WriteMessage(websocket.TextMessage, meta)
+			if err := c.WriteMessage(websocket.TextMessage, meta); err != nil {
+				micLog(fmt.Sprintf("Mic WS clinic register failed: %v", err))
+			} else {
+				micLog(fmt.Sprintf("Mic WS registered as clinic %q", clinic))
+			}
+		} else {
+			micLog("WARN: clinic name is empty — doctor audio will NOT be routed here")
 		}
 
+	go func() {
+		defer func() {
+			micWsMu.Lock()
+			if micWsConn != nil {
+				micWsConn.Close()
+			}
+			micWsConn = nil
+			if micWsCancel != nil {
+				micWsCancel()
+			}
+			micWsCancel = nil
+			micWsMu.Unlock()
+			micLog("Mic WS disconnected")
+		}()
+
+		// Keep-alive: send a WebSocket ping every 20 s so idle connections
+		// survive reverse-proxy / load-balancer TCP timeouts (typically 60 s).
+		// Reset the read deadline on every pong so the receive loop only breaks
+		// when the connection is truly dead.
+		const (
+			pingInterval  = 20 * time.Second
+			pongDeadline  = 60 * time.Second
+		)
+		c.SetReadDeadline(time.Now().Add(pongDeadline))
+		c.SetPongHandler(func(string) error {
+			c.SetReadDeadline(time.Now().Add(pongDeadline))
+			return nil
+		})
+		pingStop := make(chan struct{})
 		go func() {
-			defer func() {
-				micWsMu.Lock()
-				if micWsConn != nil {
-					micWsConn.Close()
-				}
-				micWsConn = nil
-				if micWsCancel != nil {
-					micWsCancel()
-				}
-				micWsCancel = nil
-				micWsMu.Unlock()
-				micLog("Mic WS disconnected")
-			}()
-
-			// Incoming binary = doctor mic audio → play via oto (native audio,
-			// no external binary required). Each chunk is s16le 16 kHz mono,
-			// matching what the browser sends.
-			//
-			// Audio init runs in its own goroutine so a slow/failing audio
-			// driver never blocks the WS receive loop. Chunks are buffered in
-			// a channel; once oto is ready they are drained and played.
-			type audioChunk = []byte
-			audioCh := make(chan audioChunk, 128)
-
-			go func() {
-				defer func() {
-					for range audioCh {
-					} // drain on exit
-				}()
-				micLog("Audio: initialising output device…")
-				otoContext, otoErr := getOtoContext()
-				if otoErr != nil {
-					micLog(fmt.Sprintf("Audio init FAILED: %v — doctor audio unavailable", otoErr))
+			ticker := time.NewTicker(pingInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					deadline := time.Now().Add(5 * time.Second)
+					if err := c.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+						return
+					}
+				case <-pingStop:
 					return
 				}
-				micLog("Audio: output device ready, starting player")
-				pr, pw := io.Pipe()
-				p := otoContext.NewPlayer(pr)
-				p.Play()
-				micLog("Audio playback active — doctor audio will be played through speakers")
-				chunkCount := 0
-				for chunk := range audioCh {
-					if chunkCount == 0 {
-						micLog("Audio: first doctor audio chunk received")
-					}
-					chunkCount++
-					if _, werr := pw.Write(chunk); werr != nil {
-						micLog(fmt.Sprintf("Audio write error: %v", werr))
-						break
-					}
-				}
-				pw.Close()
-				p.Close()
-			}()
+			}
+		}()
+		defer close(pingStop)
 
-			for {
-				mt, msg, err := c.ReadMessage()
-				if err != nil {
-					break
+		// Incoming binary = doctor mic audio (s16le 16 kHz mono).
+		//
+		// Playback strategy is platform-specific:
+		//   macOS  → ffmpeg piped to -f audiotoolbox (CoreAudio output device).
+		//            ffplay 8 silently drops raw-PCM frames; oto's CoreAudio
+		//            backend stalls inside fyne (likely run-loop conflict).
+		//            ffmpeg + audiotoolbox actually decodes and plays.
+		//   Linux  → ffmpeg piped to -f alsa.
+		//   Windows → oto/v3 (works reliably; ffplay's SDL is broken on
+		//             old Win32 builds).
+		var sinkWriter io.WriteCloser
+		var ffmpegCmd *exec.Cmd
+
+		switch runtime.GOOS {
+		case "windows":
+			micLog("Audio: initialising output (oto)…")
+			otoContext, otoErr := getOtoContext()
+			if otoErr != nil {
+				micLog(fmt.Sprintf("Audio init FAILED: %v — doctor audio unavailable", otoErr))
+			} else {
+				ringBuf := newAudioRingBuffer()
+				p := otoContext.NewPlayer(ringBuf)
+				p.SetVolume(1.0)
+				p.Play()
+				if perr := p.Err(); perr != nil {
+					micLog(fmt.Sprintf("Audio player error: %v", perr))
+					p.Close()
+				} else {
+					sinkWriter = ringBuf
+					micLog("Audio playback active (oto)")
+					go func() {
+						<-pingStop
+						_ = ringBuf.Close()
+						p.Close()
+					}()
 				}
-				if mt == websocket.BinaryMessage && len(msg) > 0 {
-					select {
-					case audioCh <- msg:
-					default:
-						// channel full — audio driver too slow, drop oldest
-						<-audioCh
-						audioCh <- msg
+			}
+
+		default:
+			// macOS / Linux — pipe PCM into ffmpeg's audio output device.
+			//
+			// Latency-critical flags:
+			//   -nostdin                  don't capture our terminal stdin
+			//   -fflags +nobuffer         no input-side accumulation
+			//   -flush_packets 1          (output) push each packet to the
+			//                             device immediately
+			//   -probesize 32 / -analyzeduration 0
+			//                             skip format probing (we already
+			//                             specify s16le/16k/mono)
+			//
+			// We do NOT add aresample here. The doctor browser stops sending
+			// any frames at all when their mic is muted — so ffmpeg sees a
+			// hard input gap. aresample stretches by ~1k samples/s which
+			// can't mask multi-second silences; the audiotoolbox device
+			// underruns and refuses to restart. Instead we generate our own
+			// silence in the sink driver below, so ffmpeg's input is always
+			// continuous and audiotoolbox never sees a gap.
+			outFmt := "audiotoolbox"
+			if runtime.GOOS == "linux" {
+				outFmt = "alsa"
+			}
+			cmd := exec.Command("ffmpeg",
+				"-hide_banner", "-loglevel", "warning", "-nostdin",
+				"-fflags", "+nobuffer",
+				"-probesize", "32", "-analyzeduration", "0",
+				"-f", "s16le", "-ar", "16000", "-ac", "1",
+				"-i", "pipe:0",
+				"-flush_packets", "1",
+				"-f", outFmt, "-",
+			)
+			cmd.Stdout = io.Discard // audiotoolbox doesn't write stdout, but be explicit
+			stdin, perr := cmd.StdinPipe()
+			if perr != nil {
+				micLog(fmt.Sprintf("ffmpeg stdin error: %v", perr))
+			} else {
+				stderrPipe, _ := cmd.StderrPipe()
+				if err := cmd.Start(); err != nil {
+					micLog(fmt.Sprintf("ffmpeg playback start error: %v", err))
+				} else {
+					ffmpegCmd = cmd
+					sinkWriter = stdin
+					micLog(fmt.Sprintf("Audio playback active (ffmpeg → %s, pid=%d)", outFmt, cmd.Process.Pid))
+					if stderrPipe != nil {
+						go func() {
+							buf := make([]byte, 1024)
+							for {
+								n, err := stderrPipe.Read(buf)
+								if n > 0 {
+									if msg := strings.TrimSpace(string(buf[:n])); msg != "" {
+										micLog("ffmpeg-out: " + msg)
+									}
+								}
+								if err != nil {
+									return
+								}
+							}
+						}()
+					}
+					go func() {
+						_ = cmd.Wait()
+						micLog("ffmpeg playback process exited")
+					}()
+				}
+			}
+		}
+
+		// Sink driver — owns sinkWriter exclusively.
+		//
+		// Pulls real audio chunks off audioCh and writes them. If 50 ms pass
+		// with no real chunk, writes 50 ms of silence (1600 bytes of zeros)
+		// instead. This keeps ffmpeg's stdin continuously fed even when the
+		// doctor mutes their mic, so audiotoolbox never underruns and never
+		// has to be re-armed.
+		audioCh := make(chan []byte, 16) // small: we want low latency, not buffering
+		const silenceMs = 50
+		const silenceBytes = 16000 * 2 / 1000 * silenceMs // 1600 B
+		silenceChunk := make([]byte, silenceBytes)
+
+		sinkDone := make(chan struct{})
+		go func() {
+			defer close(sinkDone)
+			timer := time.NewTimer(silenceMs * time.Millisecond)
+			defer timer.Stop()
+			for {
+				select {
+				case chunk, ok := <-audioCh:
+					if !ok {
+						return
+					}
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(silenceMs * time.Millisecond)
+					if sinkWriter != nil {
+						if _, err := sinkWriter.Write(chunk); err != nil {
+							micLog(fmt.Sprintf("Sink write error (audio): %v", err))
+							sinkWriter = nil
+						}
+					}
+				case <-timer.C:
+					timer.Reset(silenceMs * time.Millisecond)
+					if sinkWriter != nil {
+						if _, err := sinkWriter.Write(silenceChunk); err != nil {
+							micLog(fmt.Sprintf("Sink write error (silence): %v", err))
+							sinkWriter = nil
+						}
 					}
 				}
 			}
-			close(audioCh)
 		}()
+
+		// Cleanup: close audioCh → sink drains → close sink → kill ffmpeg.
+		audioChClosed := false
+		closeAudioCh := func() {
+			if !audioChClosed {
+				audioChClosed = true
+				close(audioCh)
+			}
+		}
+		defer func() {
+			closeAudioCh()
+			<-sinkDone
+			if w := sinkWriter; w != nil {
+				_ = w.Close()
+			}
+			if ffmpegCmd != nil && ffmpegCmd.Process != nil {
+				_ = ffmpegCmd.Process.Kill()
+			}
+		}()
+
+		var chunkCount uint64
+		var byteCount uint64
+		var dropped uint64
+		for {
+			mt, msg, err := c.ReadMessage()
+			if err != nil {
+				micLog(fmt.Sprintf("Mic WS read ended: %v (rx=%d chunks / %d bytes, dropped=%d)", err, chunkCount, byteCount, dropped))
+				break
+			}
+			if mt != websocket.BinaryMessage || len(msg) == 0 {
+				continue
+			}
+			chunkCount++
+			byteCount += uint64(len(msg))
+			if chunkCount == 1 {
+				micLog(fmt.Sprintf("Audio: first doctor chunk received (%d bytes)", len(msg)))
+			} else if chunkCount%50 == 0 {
+				micLog(fmt.Sprintf("Audio: rx=%d chunks / %d bytes (dropped=%d)", chunkCount, byteCount, dropped))
+			}
+			if audioChClosed {
+				continue
+			}
+			// Non-blocking send. If the sink is briefly behind, drop the
+			// chunk rather than back up the WS receive loop. The silence
+			// timer will paper over the dropped chunk.
+			select {
+			case audioCh <- msg:
+			default:
+				dropped++
+			}
+		}
+	}()
 
 		return nil
 	}
@@ -1314,6 +1589,27 @@ func main() {
 				wsMu.Unlock()
 				fyne.Do(func() { wsStatus.SetText("WS: Disconnected") })
 			}()
+
+			// Keep-alive pings (same reason as mic WS — reverse-proxy timeouts).
+			c.SetReadDeadline(time.Now().Add(60 * time.Second))
+			c.SetPongHandler(func(string) error {
+				c.SetReadDeadline(time.Now().Add(60 * time.Second))
+				return nil
+			})
+			wsPingStop := make(chan struct{})
+			go func() {
+				ticker := time.NewTicker(20 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						_ = c.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
+					case <-wsPingStop:
+						return
+					}
+				}
+			}()
+			defer close(wsPingStop)
 
 			for {
 				_, msg, err := c.ReadMessage()
