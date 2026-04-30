@@ -131,8 +131,14 @@ func getOtoContext() (*oto.Context, error) {
 			otoCtxErr = err
 			return
 		}
-		<-ready
-		otoCtx = ctx
+		// Guard against audio drivers that never signal ready (common on old
+		// Windows builds where the audio device can stall indefinitely).
+		select {
+		case <-ready:
+			otoCtx = ctx
+		case <-time.After(5 * time.Second):
+			otoCtxErr = fmt.Errorf("audio device init timed out after 5s")
+		}
 	})
 	return otoCtx, otoCtxErr
 }
@@ -1158,56 +1164,53 @@ func main() {
 			// Incoming binary = doctor mic audio → play via oto (native audio,
 			// no external binary required). Each chunk is s16le 16 kHz mono,
 			// matching what the browser sends.
-			otoContext, otoErr := getOtoContext()
-			if otoErr != nil {
-				micLog(fmt.Sprintf("Audio init error: %v — doctor audio playback unavailable", otoErr))
-			}
+			//
+			// getOtoContext initialises the audio device; on some old Windows
+			// builds this can take a moment (or time out). We run it in a
+			// separate goroutine and feed audio via a buffered channel so the
+			// WS receive loop never blocks waiting for the audio driver.
+			type audioChunk = []byte
+			audioCh := make(chan audioChunk, 64)
 
-			var (
-				audioPlayer  *oto.Player
-				audioPipeW   *io.PipeWriter
-			)
-
-			startPlayer := func() {
-				if audioPlayer != nil {
-					audioPlayer.Close()
+			go func() {
+				defer func() {
+					// drain channel on exit
+					for range audioCh {
+					}
+				}()
+				otoContext, otoErr := getOtoContext()
+				if otoErr != nil {
+					micLog(fmt.Sprintf("Audio init error: %v — doctor audio unavailable", otoErr))
+					return
 				}
 				pr, pw := io.Pipe()
-				audioPipeW = pw
 				p := otoContext.NewPlayer(pr)
-				audioPlayer = p
-				audioPlayer.Play()
-				micLog("Audio playback started")
-			}
-
-			stopPlayer := func() {
-				if audioPipeW != nil {
-					audioPipeW.Close()
-					audioPipeW = nil
+				p.Play()
+				micLog("Audio playback ready")
+				for chunk := range audioCh {
+					if _, werr := pw.Write(chunk); werr != nil {
+						micLog(fmt.Sprintf("Audio write error: %v", werr))
+						break
+					}
 				}
-				if audioPlayer != nil {
-					audioPlayer.Close()
-					audioPlayer = nil
-				}
-			}
-
-			if otoContext != nil {
-				startPlayer()
-			}
+				pw.Close()
+				p.Close()
+			}()
 
 			for {
 				mt, msg, err := c.ReadMessage()
 				if err != nil {
 					break
 				}
-				if mt == websocket.BinaryMessage && len(msg) > 0 && audioPipeW != nil {
-					if _, werr := audioPipeW.Write(msg); werr != nil {
-						micLog(fmt.Sprintf("Audio write error: %v", werr))
+				if mt == websocket.BinaryMessage && len(msg) > 0 {
+					select {
+					case audioCh <- msg:
+					default:
+						// channel full (audio driver stalled) — drop chunk
 					}
 				}
 			}
-
-			stopPlayer()
+			close(audioCh)
 		}()
 
 		return nil
