@@ -20,7 +20,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ebitengine/oto/v3"
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
@@ -109,130 +108,6 @@ var (
 	avConfigMu    sync.Mutex
 	avConfigCache = map[string]avConfig{}
 )
-
-// otoState holds the single shared oto audio context.
-// It is initialised once on first use (lazy, so the main window appears
-// immediately) and never closed for the lifetime of the process.
-var (
-	otoCtx      *oto.Context
-	otoCtxOnce  sync.Once
-	otoCtxErr   error
-)
-
-// audioRingBuffer is a non-blocking reader designed for oto's audio thread.
-//
-// Why not io.Pipe? io.Pipe is fully synchronous: Read blocks until Write is
-// called and vice-versa. Audio backends (CoreAudio on macOS, WASAPI on
-// Windows) call Read from a real-time callback that CANNOT block — if it
-// does, the entire audio output stalls. Using io.Pipe causes oto to never
-// pull data and produce no sound, even though Write succeeds (we observed
-// this directly: 100 chunks queued, 0 consumed).
-//
-// audioRingBuffer instead returns whatever bytes are buffered immediately,
-// padding with silence (zeros) when empty. Oto's audio thread always
-// returns quickly, the device keeps playing, and gaps become brief silences
-// rather than total stalls.
-type audioRingBuffer struct {
-	mu     sync.Mutex
-	buf    []byte
-	closed bool
-}
-
-func newAudioRingBuffer() *audioRingBuffer {
-	return &audioRingBuffer{buf: make([]byte, 0, 1<<20)} // 1 MiB cap is plenty
-}
-
-// Read returns up to len(p) bytes. Never blocks while open: pads with zeros
-// when no data is buffered. Returns io.EOF only after Close.
-func (a *audioRingBuffer) Read(p []byte) (int, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.closed && len(a.buf) == 0 {
-		return 0, io.EOF
-	}
-	if len(a.buf) == 0 {
-		// No data ready — emit silence so the audio thread never blocks.
-		for i := range p {
-			p[i] = 0
-		}
-		return len(p), nil
-	}
-	n := copy(p, a.buf)
-	a.buf = a.buf[n:]
-	if len(a.buf) > 0 && cap(a.buf) > 4*1024*1024 {
-		// Compact occasionally so cap doesn't grow forever.
-		nb := make([]byte, len(a.buf))
-		copy(nb, a.buf)
-		a.buf = nb
-	}
-	if n < len(p) {
-		// Pad the remainder with silence.
-		for i := n; i < len(p); i++ {
-			p[i] = 0
-		}
-		return len(p), nil
-	}
-	return n, nil
-}
-
-func (a *audioRingBuffer) Write(p []byte) (int, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.closed {
-		return 0, io.ErrClosedPipe
-	}
-	// Cap the backlog at ~2 s of audio (16k * 2 = 32 KB/s, so 64 KB) — when
-	// we exceed that, drop the oldest data so latency stays bounded.
-	const maxBacklog = 64 * 1024
-	if len(a.buf)+len(p) > maxBacklog {
-		drop := len(a.buf) + len(p) - maxBacklog
-		if drop > len(a.buf) {
-			drop = len(a.buf)
-		}
-		a.buf = a.buf[drop:]
-	}
-	a.buf = append(a.buf, p...)
-	return len(p), nil
-}
-
-func (a *audioRingBuffer) Close() error {
-	a.mu.Lock()
-	a.closed = true
-	a.mu.Unlock()
-	return nil
-}
-
-func (a *audioRingBuffer) Len() int {
-	a.mu.Lock()
-	n := len(a.buf)
-	a.mu.Unlock()
-	return n
-}
-
-
-func getOtoContext() (*oto.Context, error) {
-	otoCtxOnce.Do(func() {
-		op := &oto.NewContextOptions{
-			SampleRate:   16000,
-			ChannelCount: 1,
-			Format:       oto.FormatSignedInt16LE,
-		}
-		ctx, ready, err := oto.NewContext(op)
-		if err != nil {
-			otoCtxErr = err
-			return
-		}
-		// Guard against audio drivers that never signal ready (common on old
-		// Windows builds where the audio device can stall indefinitely).
-		select {
-		case <-ready:
-			otoCtx = ctx
-		case <-time.After(5 * time.Second):
-			otoCtxErr = fmt.Errorf("audio device init timed out after 5s")
-		}
-	})
-	return otoCtx, otoCtxErr
-}
 
 // probeAVFoundationConfig runs ffmpeg twice with deliberately invalid options
 // to make avfoundation dump the device's supported framerates and pixel formats
@@ -1304,27 +1179,18 @@ func main() {
 
 		switch runtime.GOOS {
 		case "windows":
-			micLog("Audio: initialising output (oto)…")
-			otoContext, otoErr := getOtoContext()
-			if otoErr != nil {
-				micLog(fmt.Sprintf("Audio init FAILED: %v — doctor audio unavailable", otoErr))
+			// Native WinMM waveOut with 16-bit PCM. Works on every Windows
+			// release (unlike oto's WASAPI/IAudioClient2 path, which needs
+			// Win8+) and matches the s16le wire format exactly. The sink
+			// driver below feeds it via sinkWriter; the deferred cleanup
+			// closes it.
+			micLog("Audio: initialising output (WinMM PCM)…")
+			player, perr := newWindowsPCMPlayer(16000, 1, 16)
+			if perr != nil {
+				micLog(fmt.Sprintf("Audio init FAILED: %v — doctor audio unavailable", perr))
 			} else {
-				ringBuf := newAudioRingBuffer()
-				p := otoContext.NewPlayer(ringBuf)
-				p.SetVolume(1.0)
-				p.Play()
-				if perr := p.Err(); perr != nil {
-					micLog(fmt.Sprintf("Audio player error: %v", perr))
-					p.Close()
-				} else {
-					sinkWriter = ringBuf
-					micLog("Audio playback active (oto)")
-					go func() {
-						<-pingStop
-						_ = ringBuf.Close()
-						p.Close()
-					}()
-				}
+				sinkWriter = player
+				micLog("Audio playback active (WinMM PCM)")
 			}
 
 		default:
@@ -1397,47 +1263,58 @@ func main() {
 
 		// Sink driver — owns sinkWriter exclusively.
 		//
-		// Pulls real audio chunks off audioCh and writes them. If 50 ms pass
-		// with no real chunk, writes 50 ms of silence (1600 bytes of zeros)
-		// instead. This keeps ffmpeg's stdin continuously fed even when the
-		// doctor mutes their mic, so audiotoolbox never underruns and never
-		// has to be re-armed.
-		audioCh := make(chan []byte, 16) // small: we want low latency, not buffering
-		const silenceMs = 50
-		const silenceBytes = 16000 * 2 / 1000 * silenceMs // 1600 B
-		silenceChunk := make([]byte, silenceBytes)
+		// Real-time paced playback with a bounded jitter buffer. We emit a
+		// fixed-size frame on every tick, so the OS audio device queue never
+		// grows beyond one frame — this is what keeps doctor→patient latency
+		// low. Incoming chunks are appended to a small jitter buffer; if the
+		// doctor's audio arrives in a burst (network jitter, server flush)
+		// and the buffer exceeds maxJitterBytes, we drop the OLDEST audio so
+		// latency stays bounded instead of accumulating permanently (the old
+		// "write every chunk immediately" approach let bursts inflate the
+		// audiotoolbox queue and that delay never drained). When the buffer
+		// runs dry we emit silence so the device never underruns.
+		audioCh := make(chan []byte, 32)
+		const (
+			frameMs        = 20
+			bytesPerMs     = 16000 * 2 / 1000     // 32 B/ms (s16le 16 kHz mono)
+			frameBytes     = frameMs * bytesPerMs // 640 B per tick
+			maxJitterBytes = 120 * bytesPerMs     // ~120 ms ceiling before dropping
+		)
+		silenceFrame := make([]byte, frameBytes)
 
 		sinkDone := make(chan struct{})
 		go func() {
 			defer close(sinkDone)
-			timer := time.NewTimer(silenceMs * time.Millisecond)
-			defer timer.Stop()
+			jitter := make([]byte, 0, maxJitterBytes+frameBytes)
+			frame := make([]byte, frameBytes)
+			ticker := time.NewTicker(frameMs * time.Millisecond)
+			defer ticker.Stop()
 			for {
 				select {
 				case chunk, ok := <-audioCh:
 					if !ok {
 						return
 					}
-					if !timer.Stop() {
-						select {
-						case <-timer.C:
-						default:
-						}
+					jitter = append(jitter, chunk...)
+					if len(jitter) > maxJitterBytes {
+						// Drop oldest audio to bound latency.
+						jitter = jitter[len(jitter)-maxJitterBytes:]
 					}
-					timer.Reset(silenceMs * time.Millisecond)
-					if sinkWriter != nil {
-						if _, err := sinkWriter.Write(chunk); err != nil {
-							micLog(fmt.Sprintf("Sink write error (audio): %v", err))
-							sinkWriter = nil
-						}
+				case <-ticker.C:
+					if sinkWriter == nil {
+						continue
 					}
-				case <-timer.C:
-					timer.Reset(silenceMs * time.Millisecond)
-					if sinkWriter != nil {
-						if _, err := sinkWriter.Write(silenceChunk); err != nil {
-							micLog(fmt.Sprintf("Sink write error (silence): %v", err))
-							sinkWriter = nil
+					out := silenceFrame
+					if n := copy(frame, jitter); n > 0 {
+						for i := n; i < frameBytes; i++ {
+							frame[i] = 0 // pad a short tail with silence
 						}
+						jitter = jitter[n:]
+						out = frame
+					}
+					if _, err := sinkWriter.Write(out); err != nil {
+						micLog(fmt.Sprintf("Sink write error: %v", err))
+						sinkWriter = nil
 					}
 				}
 			}
