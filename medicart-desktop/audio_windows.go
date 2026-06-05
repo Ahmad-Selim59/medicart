@@ -45,8 +45,9 @@ const (
 	_WHDR_PREPARED   = 0x00000002
 
 	// Number of reusable buffers. Each holds one paced frame, so this bounds
-	// how far ahead of real time we can queue.
-	winmmMaxHeaders   = 8
+	// how far ahead of real time we can queue (12 × 20 ms ≈ 240 ms of device
+	// cushion, which smooths network jitter without adding much latency).
+	winmmMaxHeaders   = 12
 	winmmHeaderBufLen = 8192 // bytes; one paced frame (~640 B) fits easily
 )
 

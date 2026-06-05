@@ -1176,6 +1176,10 @@ func main() {
 		//             old Win32 builds).
 		var sinkWriter io.WriteCloser
 		var ffmpegCmd *exec.Cmd
+		// devicePaced is true when sinkWriter is throttled by the audio
+		// hardware itself (WinMM): writes block until a buffer drains, so the
+		// device clock paces playback and we must NOT also pace with a ticker.
+		var devicePaced bool
 
 		switch runtime.GOOS {
 		case "windows":
@@ -1190,6 +1194,7 @@ func main() {
 				micLog(fmt.Sprintf("Audio init FAILED: %v — doctor audio unavailable", perr))
 			} else {
 				sinkWriter = player
+				devicePaced = true
 				micLog("Audio playback active (WinMM PCM)")
 			}
 
@@ -1273,23 +1278,88 @@ func main() {
 		// "write every chunk immediately" approach let bursts inflate the
 		// audiotoolbox queue and that delay never drained). When the buffer
 		// runs dry we emit silence so the device never underruns.
-		audioCh := make(chan []byte, 32)
+		audioCh := make(chan []byte, 64)
 		const (
 			frameMs        = 20
 			bytesPerMs     = 16000 * 2 / 1000     // 32 B/ms (s16le 16 kHz mono)
-			frameBytes     = frameMs * bytesPerMs // 640 B per tick
-			maxJitterBytes = 120 * bytesPerMs     // ~120 ms ceiling before dropping
+			frameBytes     = frameMs * bytesPerMs // 640 B per frame
+			prebufferBytes = 100 * bytesPerMs     // ~100 ms cushion before playback starts
+			maxJitterBytes = 120 * bytesPerMs     // ~120 ms ceiling (ffmpeg path latency cap)
 		)
 		silenceFrame := make([]byte, frameBytes)
 
 		sinkDone := make(chan struct{})
 		go func() {
 			defer close(sinkDone)
+			var framesWritten, realFrames uint64
+
+			if devicePaced {
+				// Windows WinMM: the audio hardware paces playback. Blocking
+				// writes throttle us to the device rate, so there is no software
+				// ticker — Windows tickers fire too coarsely (~15 ms) and were
+				// starving the tiny buffers, which is what made the audio choppy
+				// and unintelligible. We prebuffer ~100 ms so ordinary network
+				// jitter can't underrun the device, rebuild that cushion after a
+				// real speech pause, and never inject silence mid-stream (that
+				// corrupts speech) — a genuine gap just lets the device idle.
+				jitter := make([]byte, 0, prebufferBytes*4+frameBytes)
+				started := false
+				lastData := time.Now()
+				drain := func() {
+					for len(jitter) >= frameBytes {
+						if sinkWriter == nil {
+							jitter = jitter[:0]
+							return
+						}
+						if _, err := sinkWriter.Write(jitter[:frameBytes]); err != nil {
+							micLog(fmt.Sprintf("Sink write error: %v", err))
+							sinkWriter = nil
+							jitter = jitter[:0]
+							return
+						}
+						jitter = jitter[frameBytes:]
+						framesWritten++
+						if realFrames == 0 {
+							micLog("Audio: first real frame written to device")
+						}
+						realFrames++
+						if framesWritten%100 == 0 {
+							micLog(fmt.Sprintf("Audio: wrote %d frames to device", framesWritten))
+						}
+					}
+				}
+				for {
+					chunk, ok := <-audioCh
+					if !ok {
+						drain()
+						return
+					}
+					now := time.Now()
+					if started && now.Sub(lastData) > 200*time.Millisecond {
+						// Long gap → the device almost certainly drained. Rebuild
+						// the cushion so speech doesn't resume choppy.
+						started = false
+					}
+					lastData = now
+					jitter = append(jitter, chunk...)
+					if !started {
+						if len(jitter) < prebufferBytes {
+							continue
+						}
+						started = true
+					}
+					drain()
+				}
+			}
+
+			// macOS / Linux (ffmpeg): software-paced continuous feed with
+			// silence on underrun, because audiotoolbox underruns hard on gaps
+			// and refuses to re-arm. The bounded jitter buffer drops the oldest
+			// audio on bursts so doctor→patient latency stays low.
 			jitter := make([]byte, 0, maxJitterBytes+frameBytes)
 			frame := make([]byte, frameBytes)
 			ticker := time.NewTicker(frameMs * time.Millisecond)
 			defer ticker.Stop()
-			var framesWritten, realFrames uint64
 			for {
 				select {
 				case chunk, ok := <-audioCh:
@@ -1298,7 +1368,6 @@ func main() {
 					}
 					jitter = append(jitter, chunk...)
 					if len(jitter) > maxJitterBytes {
-						// Drop oldest audio to bound latency.
 						jitter = jitter[len(jitter)-maxJitterBytes:]
 					}
 				case <-ticker.C:
@@ -1309,7 +1378,7 @@ func main() {
 					real := false
 					if n := copy(frame, jitter); n > 0 {
 						for i := n; i < frameBytes; i++ {
-							frame[i] = 0 // pad a short tail with silence
+							frame[i] = 0
 						}
 						jitter = jitter[n:]
 						out = frame
