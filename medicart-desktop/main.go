@@ -420,7 +420,104 @@ var (
 	micWsMu         sync.Mutex
 	micWsCancel     context.CancelFunc
 	micStreamCancel context.CancelFunc
+
+	// Shared Camera Manager
+	sharedCamMu     sync.Mutex
+	sharedCamRef    int
+	sharedCamDevice string
+	sharedCamCtx    context.Context
+	sharedCamCancel context.CancelFunc
+	sharedCamFrames []chan []byte
 )
+
+func subscribeSharedCamera(ctx context.Context, device string, fps int, logFn func(string)) (<-chan []byte, func(), error) {
+	sharedCamMu.Lock()
+	defer sharedCamMu.Unlock()
+
+	if sharedCamRef > 0 {
+		if sharedCamDevice != device {
+			return nil, nil, fmt.Errorf("camera already in use by %s", sharedCamDevice)
+		}
+		sharedCamRef++
+		ch := make(chan []byte, 4)
+		sharedCamFrames = append(sharedCamFrames, ch)
+
+		var unsubOnce sync.Once
+		unsub := func() {
+			unsubOnce.Do(func() { unsubscribeSharedCamera(ch) })
+		}
+		return ch, unsub, nil
+	}
+
+	sharedCamCtx, sharedCamCancel = context.WithCancel(context.Background())
+	srcFrames, err := runMJPEGPipe(sharedCamCtx, device, fps, logFn)
+	if err != nil {
+		sharedCamCancel()
+		return nil, nil, err
+	}
+
+	sharedCamDevice = device
+	sharedCamRef = 1
+	ch := make(chan []byte, 4)
+	sharedCamFrames = []chan []byte{ch}
+
+	go func(bgCtx context.Context) {
+		for {
+			select {
+			case <-bgCtx.Done():
+				return
+			case frame, ok := <-srcFrames:
+				if !ok {
+					sharedCamMu.Lock()
+					for _, c := range sharedCamFrames {
+						close(c)
+					}
+					sharedCamFrames = nil
+					sharedCamRef = 0
+					if sharedCamCancel != nil {
+						sharedCamCancel()
+						sharedCamCancel = nil
+					}
+					sharedCamMu.Unlock()
+					return
+				}
+				sharedCamMu.Lock()
+				for _, c := range sharedCamFrames {
+					select {
+					case c <- frame:
+					default:
+					}
+				}
+				sharedCamMu.Unlock()
+			}
+		}
+	}(sharedCamCtx)
+
+	var unsubOnce sync.Once
+	unsub := func() {
+		unsubOnce.Do(func() { unsubscribeSharedCamera(ch) })
+	}
+	return ch, unsub, nil
+}
+
+func unsubscribeSharedCamera(ch chan []byte) {
+	sharedCamMu.Lock()
+	defer sharedCamMu.Unlock()
+
+	for i, c := range sharedCamFrames {
+		if c == ch {
+			sharedCamFrames = append(sharedCamFrames[:i], sharedCamFrames[i+1:]...)
+			break
+		}
+	}
+	close(ch)
+
+	sharedCamRef--
+	if sharedCamRef == 0 && sharedCamCancel != nil {
+		sharedCamCancel()
+		sharedCamCancel = nil
+	}
+}
 
 func main() {
 	myApp := app.New()
@@ -775,6 +872,20 @@ func main() {
 		previewCancel = cancel
 		previewMu.Unlock()
 
+		frames, unsub, err := subscribeSharedCamera(ctx, device, cameraFPS, cameraLog)
+		if err != nil {
+			cameraLog(fmt.Sprintf("Preview ffmpeg error: %v", err))
+			stopPreviewInternal("")
+			return
+		}
+
+		previewMu.Lock()
+		previewCancel = func() {
+			unsub()
+			cancel()
+		}
+		previewMu.Unlock()
+
 		cameraLog(fmt.Sprintf("Starting camera preview for %s", device))
 		fyne.Do(func() {
 			btnPreviewStart.Disable()
@@ -782,12 +893,6 @@ func main() {
 		})
 
 		go func() {
-			frames, err := runMJPEGPipe(ctx, device, cameraFPS, cameraLog)
-			if err != nil {
-				cameraLog(fmt.Sprintf("Preview ffmpeg error: %v", err))
-				stopPreviewInternal("")
-				return
-			}
 			for {
 				select {
 				case <-ctx.Done():
@@ -888,8 +993,19 @@ func main() {
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
+		
+		frames, unsub, err := subscribeSharedCamera(ctx, device, cameraFPS, cameraLog)
+		if err != nil {
+			cameraLog(fmt.Sprintf("Stream ffmpeg error: %v", err))
+			cancel()
+			return
+		}
+
 		wsMu.Lock()
-		streamCancel = cancel
+		streamCancel = func() {
+			unsub()
+			cancel()
+		}
 		wsMu.Unlock()
 
 		cameraLog(fmt.Sprintf("Starting stream for %s", device))
@@ -899,12 +1015,6 @@ func main() {
 		})
 
 		go func() {
-			frames, err := runMJPEGPipe(ctx, device, cameraFPS, cameraLog)
-			if err != nil {
-				cameraLog(fmt.Sprintf("Stream ffmpeg error: %v", err))
-				stopStreaming()
-				return
-			}
 			for {
 				select {
 				case <-ctx.Done():
