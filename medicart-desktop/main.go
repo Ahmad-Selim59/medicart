@@ -1289,6 +1289,7 @@ func main() {
 			frame := make([]byte, frameBytes)
 			ticker := time.NewTicker(frameMs * time.Millisecond)
 			defer ticker.Stop()
+			var framesWritten, realFrames uint64
 			for {
 				select {
 				case chunk, ok := <-audioCh:
@@ -1305,16 +1306,29 @@ func main() {
 						continue
 					}
 					out := silenceFrame
+					real := false
 					if n := copy(frame, jitter); n > 0 {
 						for i := n; i < frameBytes; i++ {
 							frame[i] = 0 // pad a short tail with silence
 						}
 						jitter = jitter[n:]
 						out = frame
+						real = true
 					}
 					if _, err := sinkWriter.Write(out); err != nil {
 						micLog(fmt.Sprintf("Sink write error: %v", err))
 						sinkWriter = nil
+						continue
+					}
+					framesWritten++
+					if real {
+						if realFrames == 0 {
+							micLog("Audio: first real frame written to device")
+						}
+						realFrames++
+					}
+					if framesWritten%100 == 0 {
+						micLog(fmt.Sprintf("Audio: wrote %d frames to device (%d real / %d silence)", framesWritten, realFrames, framesWritten-realFrames))
 					}
 				}
 			}
