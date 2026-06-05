@@ -1280,11 +1280,12 @@ func main() {
 		// runs dry we emit silence so the device never underruns.
 		audioCh := make(chan []byte, 64)
 		const (
-			frameMs        = 20
-			bytesPerMs     = 16000 * 2 / 1000     // 32 B/ms (s16le 16 kHz mono)
-			frameBytes     = frameMs * bytesPerMs // 640 B per frame
-			prebufferBytes = 100 * bytesPerMs     // ~100 ms cushion before playback starts
-			maxJitterBytes = 120 * bytesPerMs     // ~120 ms ceiling (ffmpeg path latency cap)
+			frameMs         = 20
+			bytesPerMs      = 16000 * 2 / 1000     // 32 B/ms (s16le 16 kHz mono)
+			frameBytes      = frameMs * bytesPerMs // 640 B per frame
+			prebufferBytes  = 80 * bytesPerMs      // ~80 ms cushion before playback starts
+			maxJitterBytes  = 120 * bytesPerMs     // ~120 ms ceiling (ffmpeg path latency cap)
+			maxLatencyBytes = 300 * bytesPerMs     // device path: drop oldest beyond ~300 ms
 		)
 		silenceFrame := make([]byte, frameBytes)
 
@@ -1294,61 +1295,84 @@ func main() {
 			var framesWritten, realFrames uint64
 
 			if devicePaced {
-				// Windows WinMM: the audio hardware paces playback. Blocking
-				// writes throttle us to the device rate, so there is no software
-				// ticker — Windows tickers fire too coarsely (~15 ms) and were
-				// starving the tiny buffers, which is what made the audio choppy
-				// and unintelligible. We prebuffer ~100 ms so ordinary network
-				// jitter can't underrun the device, rebuild that cushion after a
-				// real speech pause, and never inject silence mid-stream (that
-				// corrupts speech) — a genuine gap just lets the device idle.
-				jitter := make([]byte, 0, prebufferBytes*4+frameBytes)
+				// Windows WinMM: the audio hardware paces playback — each
+				// sinkWriter.Write blocks until a device buffer drains, so the
+				// loop runs at the device rate (no software ticker; Windows
+				// tickers fire too coarsely (~15 ms) and starved the buffers,
+				// which made the audio choppy).
+				//
+				// We run a continuous jitter buffer: every cycle we write one
+				// frame — real audio when we have it, otherwise a short silence
+				// frame. Writing silence on a gap (instead of going idle) keeps
+				// the device clock running so playback self-heals smoothly
+				// without the stall-and-restart that caused "sometimes nothing
+				// comes out". A small prebuffer absorbs normal jitter, and we
+				// drop the oldest audio past maxLatencyBytes so delay can't
+				// creep up.
+				jitter := make([]byte, 0, maxLatencyBytes+frameBytes)
+				frame := make([]byte, frameBytes)
 				started := false
-				lastData := time.Now()
-				drain := func() {
-					for len(jitter) >= frameBytes {
-						if sinkWriter == nil {
-							jitter = jitter[:0]
-							return
-						}
-						if _, err := sinkWriter.Write(jitter[:frameBytes]); err != nil {
-							micLog(fmt.Sprintf("Sink write error: %v", err))
-							sinkWriter = nil
-							jitter = jitter[:0]
-							return
-						}
-						jitter = jitter[frameBytes:]
-						framesWritten++
-						if realFrames == 0 {
-							micLog("Audio: first real frame written to device")
-						}
-						realFrames++
-						if framesWritten%100 == 0 {
-							micLog(fmt.Sprintf("Audio: wrote %d frames to device", framesWritten))
-						}
-					}
-				}
 				for {
-					chunk, ok := <-audioCh
-					if !ok {
-						drain()
-						return
-					}
-					now := time.Now()
-					if started && now.Sub(lastData) > 200*time.Millisecond {
-						// Long gap → the device almost certainly drained. Rebuild
-						// the cushion so speech doesn't resume choppy.
-						started = false
-					}
-					lastData = now
-					jitter = append(jitter, chunk...)
 					if !started {
+						// Accumulate (blocking) until we have the prebuffer.
+						chunk, ok := <-audioCh
+						if !ok {
+							return
+						}
+						jitter = append(jitter, chunk...)
 						if len(jitter) < prebufferBytes {
 							continue
 						}
 						started = true
+					} else {
+						// Pull everything queued without blocking — we must keep
+						// feeding the device on schedule.
+					drainCh:
+						for {
+							select {
+							case chunk, ok := <-audioCh:
+								if !ok {
+									// Stream closed (hang-up). Stop promptly;
+									// dropping the last <300 ms is fine.
+									return
+								}
+								jitter = append(jitter, chunk...)
+							default:
+								break drainCh
+							}
+						}
 					}
-					drain()
+
+					if len(jitter) > maxLatencyBytes {
+						jitter = jitter[len(jitter)-maxLatencyBytes:]
+					}
+					if sinkWriter == nil {
+						return
+					}
+
+					out := silenceFrame
+					real := false
+					if len(jitter) >= frameBytes {
+						copy(frame, jitter[:frameBytes])
+						jitter = jitter[frameBytes:]
+						out = frame
+						real = true
+					}
+					if _, err := sinkWriter.Write(out); err != nil { // blocks at device rate
+						micLog(fmt.Sprintf("Sink write error: %v", err))
+						sinkWriter = nil
+						return
+					}
+					framesWritten++
+					if real {
+						if realFrames == 0 {
+							micLog("Audio: first real frame written to device")
+						}
+						realFrames++
+					}
+					if framesWritten%100 == 0 {
+						micLog(fmt.Sprintf("Audio: wrote %d frames to device (%d real / %d silence)", framesWritten, realFrames, framesWritten-realFrames))
+					}
 				}
 			}
 
