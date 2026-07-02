@@ -39,7 +39,7 @@ var (
 	feedConns = make(map[string]*websocket.Conn)
 	wsMutex   sync.Mutex
 
-	streams   = make(map[string]map[*websocket.Conn]bool) // key: clinic|patient (camera)
+	streams   = make(map[string]map[*streamSubscriber]bool) // key: clinic|patient (camera)
 	streamsMu sync.Mutex
 
 	// audioFeedConns maps clinicName -> websocket.Conn (mic feed from desktop)
@@ -345,7 +345,14 @@ func ensureDataDir() {
 }
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin:     func(r *http.Request) bool { return true },
+	ReadBufferSize:  4096,
+	WriteBufferSize: 256 * 1024,
+}
+
+type streamSubscriber struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
 }
 
 func handleFeedWS(w http.ResponseWriter, r *http.Request) {
@@ -376,7 +383,7 @@ func handleFeedWS(w http.ResponseWriter, r *http.Request) {
 			if err := json.Unmarshal(msg, &meta); err == nil {
 				if meta.Clinic != "" {
 					oldClinic := currentClinic
-					currentClinic = meta.Clinic
+					currentClinic = safe(meta.Clinic)
 
 					wsMutex.Lock()
 					if oldClinic != "" && oldClinic != currentClinic {
@@ -492,31 +499,42 @@ func streamKey(clinic, patient string) string {
 	return c + "|" + p
 }
 
+func removeStreamSubscriber(key string, sub *streamSubscriber) {
+	streamsMu.Lock()
+	defer streamsMu.Unlock()
+	if m := streams[key]; m != nil {
+		delete(m, sub)
+		if len(m) == 0 {
+			delete(streams, key)
+		}
+	}
+}
+
 func broadcastFrame(key string, frame []byte) {
 	streamsMu.Lock()
-	conns := streams[key]
-	if len(conns) == 0 {
+	room := streams[key]
+	if len(room) == 0 {
 		streamsMu.Unlock()
 		return // drop if no subscribers
 	}
-	targets := make([]*websocket.Conn, 0, len(conns))
-	for c := range conns {
-		targets = append(targets, c)
+	targets := make([]*streamSubscriber, 0, len(room))
+	for sub := range room {
+		targets = append(targets, sub)
 	}
 	streamsMu.Unlock()
 
-	for _, c := range targets {
-		if err := c.WriteMessage(websocket.BinaryMessage, frame); err != nil {
-			c.Close()
-			streamsMu.Lock()
-			if m := streams[key]; m != nil {
-				delete(m, c)
-				if len(m) == 0 {
-					delete(streams, key)
-				}
+	// Copy once; fan out without blocking the feed read loop on slow clients.
+	payload := append([]byte(nil), frame...)
+	for _, sub := range targets {
+		go func(s *streamSubscriber, data []byte) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if err := s.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+				log.Printf("Stream WS write error for %s: %v", key, err)
+				s.conn.Close()
+				removeStreamSubscriber(key, s)
 			}
-			streamsMu.Unlock()
-		}
+		}(sub, payload)
 	}
 }
 
@@ -533,12 +551,13 @@ func handleStreamWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := streamKey(clinic, patient)
+	sub := &streamSubscriber{conn: conn}
 
 	streamsMu.Lock()
 	if streams[key] == nil {
-		streams[key] = make(map[*websocket.Conn]bool)
+		streams[key] = make(map[*streamSubscriber]bool)
 	}
-	streams[key][conn] = true
+	streams[key][sub] = true
 	streamsMu.Unlock()
 
 	// Attempt to start feed when a subscriber connects
@@ -554,25 +573,12 @@ func handleStreamWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	streamsMu.Lock()
-	if m := streams[key]; m != nil {
-		delete(m, conn)
-		if len(m) == 0 {
-			delete(streams, key)
-		}
-	}
-	streamsMu.Unlock()
+	removeStreamSubscriber(key, sub)
 	conn.Close()
 
-	// If no subscribers remain for THIS clinic, try stopping feed
-	streamsMu.Lock()
-	remaining := len(streams[key])
-	streamsMu.Unlock()
-	if remaining == 0 {
-		if err := sendControl(clinic, "stop"); err != nil {
-			log.Printf("feed stop error (ignored): %v", err)
-		}
-	}
+	// Nurse controls broadcast lifecycle via End Stream on the desktop app.
+	// Do not send "stop" when a viewer disconnects — a brief WS hiccup was
+	// killing the entire clinic feed after the first frame.
 
 	log.Printf("Stream subscriber disconnected: %s", key)
 }
