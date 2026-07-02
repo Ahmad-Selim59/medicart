@@ -1817,7 +1817,7 @@ func main() {
 		stopStreaming(true)
 	}
 
-	btnBroadcastStart = widget.NewButtonWithIcon("Go Live", theme.MediaPlayIcon(), startBroadcast)
+	btnBroadcastStart = widget.NewButtonWithIcon("Go Live", theme.MediaPlayIcon(), func() { startBroadcast() })
 	btnBroadcastStop = widget.NewButtonWithIcon("End Stream", theme.MediaStopIcon(), stopBroadcast)
 	btnBroadcastStop.Disable()
 	btnPreviewStop.Disable()
@@ -2107,8 +2107,8 @@ func main() {
 		chatWsMu.Unlock()
 
 		fyne.Do(func() { chatStatusLabel.SetText("Chat: Connected") })
-		appendChatText("Connected to clinic chat.")
 		clearChatFeed()
+		appendChatText("Connected to clinic chat.")
 
 		register := map[string]string{
 			"type":        "register",
