@@ -1126,7 +1126,7 @@ func main() {
 		return device, nil
 	}
 
-	stopStreaming := func() {
+	stopStreaming := func(disconnectChat bool) {
 		wsMu.Lock()
 		if streamCancel == nil {
 			wsMu.Unlock()
@@ -1135,7 +1135,7 @@ func main() {
 		streamCancel()
 		streamCancel = nil
 		wsMu.Unlock()
-		if disconnectChatWS != nil {
+		if disconnectChat && disconnectChatWS != nil {
 			disconnectChatWS()
 		}
 		cameraLog("Stream stopped")
@@ -1209,7 +1209,7 @@ func main() {
 			wsMu.Unlock()
 			if c == nil {
 				cameraLog("WS disconnected before stream")
-				stopStreaming()
+				stopStreaming(false)
 				return
 			}
 			// Refresh clinic registration once (connectWS already sent on dial).
@@ -1225,7 +1225,7 @@ func main() {
 				case jpegBytes, ok := <-frames:
 					if !ok {
 						cameraLog("Stream: ffmpeg ended")
-						stopStreaming()
+						stopStreaming(false)
 						return
 					}
 					var ended bool
@@ -1236,17 +1236,17 @@ func main() {
 					wsMu.Unlock()
 					if c == nil {
 						cameraLog("WS disconnected during stream")
-						stopStreaming()
+						stopStreaming(false)
 						return
 					}
 					if err := c.WriteMessage(websocket.BinaryMessage, jpegBytes); err != nil {
 						cameraLog(fmt.Sprintf("WS send error: %v", err))
-						stopStreaming()
+						stopStreaming(false)
 						return
 					}
 					if ended {
 						cameraLog("Stream: ffmpeg ended")
-						stopStreaming()
+						stopStreaming(false)
 						return
 					}
 				}
@@ -1814,7 +1814,7 @@ func main() {
 		startStreaming()
 	}
 	stopBroadcast := func() {
-		stopStreaming()
+		stopStreaming(true)
 	}
 
 	btnBroadcastStart = widget.NewButtonWithIcon("Go Live", theme.MediaPlayIcon(), startBroadcast)
@@ -1925,10 +1925,13 @@ func main() {
 				go startStreaming()
 			case "stop":
 				cameraLog("WS command: stop streaming")
-				go stopStreaming()
-		case "mic-on", "mic-off":
-			// Doctor mic-toggle commands — no action on the clinic side.
-			// The clinic mic is controlled solely by the local Unmute/Mute buttons.
+				go stopStreaming(false)
+		case "mic-on":
+			micLog("WS command: mic-on — starting clinic mic stream")
+			go startMicStreaming()
+		case "mic-off":
+			micLog("WS command: mic-off — stopping clinic mic stream")
+			go stopMicStreaming()
 			case "move-left", "move-right", "move-up", "move-down":
 				cameraLog(fmt.Sprintf("WS camera command: %s", cmd))
 				runCameraCommand(cmd, []string{"-" + cmd})
@@ -2120,10 +2123,18 @@ func main() {
 		}
 
 		go func() {
-			defer disconnectChatWS()
-			c.SetReadDeadline(time.Now().Add(60 * time.Second))
-			c.SetPongHandler(func(string) error {
-				c.SetReadDeadline(time.Now().Add(60 * time.Second))
+			conn := c
+			defer func() {
+				chatWsMu.Lock()
+				if chatWsConn == conn {
+					chatWsConn = nil
+				}
+				chatWsMu.Unlock()
+				fyne.Do(func() { chatStatusLabel.SetText("Chat: Disconnected") })
+			}()
+			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			conn.SetPongHandler(func(string) error {
+				conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 				return nil
 			})
 			pingStop := make(chan struct{})
@@ -2133,8 +2144,10 @@ func main() {
 				for {
 					select {
 					case <-ticker.C:
-						_ = c.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
+						_ = conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
 					case <-pingStop:
+						return
+					case <-ctx.Done():
 						return
 					}
 				}
@@ -2142,8 +2155,13 @@ func main() {
 			defer close(pingStop)
 
 			for {
-				c.SetReadDeadline(time.Now().Add(60 * time.Second))
-				_, msg, err := c.ReadMessage()
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+				_, msg, err := conn.ReadMessage()
 				if err != nil {
 					if ctx.Err() != context.Canceled {
 						appendChatText(fmt.Sprintf("Chat disconnected: %v", err))
@@ -2170,11 +2188,10 @@ func main() {
 	}
 
 	startBroadcast = func() {
-		go func() {
-			if err := connectChatWS(); err != nil {
-				log(fmt.Sprintf("Chat auto-connect failed (non-fatal): %v", err))
-			}
-		}()
+		if err := connectChatWS(); err != nil {
+			log(fmt.Sprintf("Chat auto-connect failed (non-fatal): %v", err))
+		}
+		go startMicStreaming()
 		startStreaming()
 	}
 
