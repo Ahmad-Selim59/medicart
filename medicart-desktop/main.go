@@ -648,6 +648,7 @@ func main() {
 	var disconnectChatWS func()
 	var btnPreviewStart, btnPreviewStop *widget.Button
 	var btnBroadcastStart, btnBroadcastStop *widget.Button
+	var startBroadcast func()
 	var ageEntry, weightEntry, heightEntry *widget.Entry
 	var genderSelect *widget.Select
 
@@ -1163,6 +1164,13 @@ func main() {
 		if streamCancel != nil {
 			wsMu.Unlock()
 			cameraLog("Stream already running")
+			go func() {
+				if connectChatWS != nil {
+					if err := connectChatWS(); err != nil {
+						log(fmt.Sprintf("Chat auto-connect failed (non-fatal): %v", err))
+					}
+				}
+			}()
 			return
 		}
 		wsMu.Unlock()
@@ -1194,14 +1202,6 @@ func main() {
 			btnBroadcastStart.Disable()
 			btnBroadcastStop.Enable()
 		})
-
-		go func() {
-			if connectChatWS != nil {
-				if err := connectChatWS(); err != nil {
-					log(fmt.Sprintf("Chat auto-connect failed (non-fatal): %v", err))
-				}
-			}
-		}()
 
 		go func() {
 			wsMu.Lock()
@@ -1810,7 +1810,7 @@ func main() {
 	btnPreviewStart = widget.NewButtonWithIcon("Start Preview", theme.VisibilityIcon(), startPreview)
 	btnPreviewStop = widget.NewButtonWithIcon("Stop Preview", theme.VisibilityOffIcon(), stopPreview)
 
-	startBroadcast := func() {
+	startBroadcast = func() {
 		startStreaming()
 	}
 	stopBroadcast := func() {
@@ -2142,6 +2142,7 @@ func main() {
 			defer close(pingStop)
 
 			for {
+				c.SetReadDeadline(time.Now().Add(60 * time.Second))
 				_, msg, err := c.ReadMessage()
 				if err != nil {
 					if ctx.Err() != context.Canceled {
@@ -2166,6 +2167,15 @@ func main() {
 		}()
 
 		return nil
+	}
+
+	startBroadcast = func() {
+		go func() {
+			if err := connectChatWS(); err != nil {
+				log(fmt.Sprintf("Chat auto-connect failed (non-fatal): %v", err))
+			}
+		}()
+		startStreaming()
 	}
 
 	chatInput := widget.NewEntry()
