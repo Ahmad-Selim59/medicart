@@ -149,3 +149,15 @@ func listFiles(prefix string) ([]string, error) {
 	}
 	return files, nil
 }
+
+func deleteFile(p string) error {
+	if CloudStoreEnabled {
+		key := toS3Key(p)
+		_, err := s3Client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+			Bucket: aws.String(S3BucketName),
+			Key:    aws.String(key),
+		})
+		return err
+	}
+	return os.Remove(p)
+}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -55,6 +56,32 @@ func loadPatientProfile(clinicName, patientName string) PatientProfile {
 		return PatientProfile{}
 	}
 	return profile
+}
+
+func readingTimestamp(item interface{}) int64 {
+	m, ok := item.(map[string]interface{})
+	if !ok {
+		return 0
+	}
+	switch ts := m["timestamp"].(type) {
+	case string:
+		if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+			return parsed.Unix()
+		}
+	case float64:
+		return int64(ts)
+	}
+	return 0
+}
+
+func trimToLastReadings(items []interface{}, keep int) []interface{} {
+	if keep <= 0 || len(items) <= keep {
+		return items
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return readingTimestamp(items[i]) < readingTimestamp(items[j])
+	})
+	return items[len(items)-keep:]
 }
 
 func getAllClinics(allowedClinics []string) []Clinic {
@@ -179,6 +206,12 @@ func buildPatient(clinicName string, patientName string) Patient {
 					}
 				}
 			}
+		}
+	}
+
+	for key, val := range realData {
+		if items, ok := val.([]interface{}); ok {
+			realData[key] = trimToLastReadings(items, maxReadingsPerMetric)
 		}
 	}
 

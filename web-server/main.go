@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +17,8 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 )
+
+const maxReadingsPerMetric = 3
 
 type DataStorage struct {
 	Records []Record `json:"records"`
@@ -225,7 +229,56 @@ func saveRecord(record Record) error {
 	if err != nil {
 		return err
 	}
-	return saveFile(path, data)
+	if err := saveFile(path, data); err != nil {
+		return err
+	}
+	return pruneMetricReadings(dir, baseFilename, maxReadingsPerMetric)
+}
+
+func metricFilenameTS(filename string) int64 {
+	name := strings.TrimSuffix(filename, ".json")
+	lastIdx := strings.LastIndex(name, "_")
+	if lastIdx == -1 {
+		return 0
+	}
+	ts, err := strconv.ParseInt(name[lastIdx+1:], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return ts
+}
+
+func pruneMetricReadings(dir, metric string, keep int) error {
+	if keep <= 0 {
+		return nil
+	}
+
+	files, err := listFiles(dir)
+	if err != nil {
+		return err
+	}
+
+	prefix := metric + "_"
+	var metricFiles []string
+	for _, name := range files {
+		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, ".json") {
+			metricFiles = append(metricFiles, name)
+		}
+	}
+	if len(metricFiles) <= keep {
+		return nil
+	}
+
+	sort.Slice(metricFiles, func(i, j int) bool {
+		return metricFilenameTS(metricFiles[i]) < metricFilenameTS(metricFiles[j])
+	})
+
+	for _, name := range metricFiles[:len(metricFiles)-keep] {
+		if err := deleteFile(filepath.Join(dir, name)); err != nil {
+			log.Printf("prune: failed to delete %s: %v", name, err)
+		}
+	}
+	return nil
 }
 
 func savePatientProfile(record Record) error {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -197,5 +198,96 @@ func TestSaveRecord(t *testing.T) {
 	
 	if len(files) != 2 {
 		t.Errorf("expected 2 files after second reading with different timestamp, got %d", len(files))
+	}
+}
+
+func TestPruneMetricReadings(t *testing.T) {
+	os.RemoveAll("data")
+	defer os.RemoveAll("data")
+
+	dir := filepath.Join("data", "TestClinic", "Ahmad")
+	base := time.Unix(1700000000, 0)
+
+	for i := 0; i < 5; i++ {
+		record := Record{
+			Timestamp:   base.Add(time.Duration(i) * time.Minute),
+			PatientName: "Ahmad",
+			ClinicName:  "TestClinic",
+			RawData: map[string]interface{}{
+				"pr":   70 + i,
+				"spo2": 98,
+			},
+		}
+		if err := saveRecord(record); err != nil {
+			t.Fatalf("saveRecord %d failed: %v", i, err)
+		}
+	}
+
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("failed to read dir: %v", err)
+	}
+
+	var hrFiles []string
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "heart_rate_") {
+			hrFiles = append(hrFiles, f.Name())
+		}
+	}
+	if len(hrFiles) != 3 {
+		t.Fatalf("expected 3 heart_rate files after pruning, got %d: %v", len(hrFiles), hrFiles)
+	}
+
+	patient := buildPatient("TestClinic", "Ahmad")
+	hr, ok := patient.Data["heartRate"].([]interface{})
+	if !ok {
+		t.Fatalf("expected heartRate data")
+	}
+	if len(hr) != 3 {
+		t.Fatalf("expected 3 heartRate readings in API response, got %d", len(hr))
+	}
+}
+
+func TestPruneMetricReadingsKeepsFewerThanLimit(t *testing.T) {
+	os.RemoveAll("data")
+	defer os.RemoveAll("data")
+
+	dir := filepath.Join("data", "TestClinic", "Ahmad")
+	base := time.Unix(1700000000, 0)
+
+	for i := 0; i < 2; i++ {
+		record := Record{
+			Timestamp:   base.Add(time.Duration(i) * time.Minute),
+			PatientName: "Ahmad",
+			ClinicName:  "TestClinic",
+			RawData: map[string]interface{}{
+				"pr":   70 + i,
+				"spo2": 98,
+			},
+		}
+		if err := saveRecord(record); err != nil {
+			t.Fatalf("saveRecord %d failed: %v", i, err)
+		}
+	}
+
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("failed to read dir: %v", err)
+	}
+
+	var hrFiles []string
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "heart_rate_") {
+			hrFiles = append(hrFiles, f.Name())
+		}
+	}
+	if len(hrFiles) != 2 {
+		t.Fatalf("expected 2 heart_rate files when under limit, got %d", len(hrFiles))
+	}
+
+	patient := buildPatient("TestClinic", "Ahmad")
+	hr, ok := patient.Data["heartRate"].([]interface{})
+	if !ok || len(hr) != 2 {
+		t.Fatalf("expected 2 heartRate readings in API response, got %v", patient.Data["heartRate"])
 	}
 }
