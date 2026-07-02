@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"image"
 	"image/jpeg"
+	_ "image/gif"
+	_ "image/png"
 	"io"
 	"net/http"
 	"os"
@@ -24,6 +27,7 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/gorilla/websocket"
@@ -40,6 +44,14 @@ const previewMaxW, previewMaxH = 320, 240
 // dictate a framerate to the device — older ffmpeg on Windows + cameras that
 // only support 15/30 fps reject anything else and refuse to open.
 const cameraFPS = 30
+const maxChatImageBytes = 2 * 1024 * 1024
+
+// CLI reads can fail if the operator starts monitoring before the device is
+// ready (e.g. NIBP cuff not yet started). Retry a few times before giving up.
+const (
+	cliMaxAttempts = 4
+	cliRetryDelay  = 2 * time.Second
+)
 
 // blankFrame is a 1x1 fully transparent image used in place of nil so that
 // canvas.Image always has content. A visible canvas.Image with nil content
@@ -348,11 +360,15 @@ type LineParser func(line string) (interface{}, error)
 
 // AppConfig holds all persisted settings.
 type AppConfig struct {
-	ServerBase  string `json:"server_base"`
-	ClinicName  string `json:"clinic_name"`
-	PatientName string `json:"patient_name"`
-	StethMAC    string `json:"steth_mac"`
-	LightMode   bool   `json:"light_mode"`
+	ServerBase    string `json:"server_base"`
+	ClinicName    string `json:"clinic_name"`
+	PatientName   string `json:"patient_name"`
+	PatientAge    string `json:"patient_age"`
+	PatientWeight string `json:"patient_weight"`
+	PatientHeight string `json:"patient_height"`
+	PatientGender string `json:"patient_gender"`
+	StethMAC      string `json:"steth_mac"`
+	LightMode     bool   `json:"light_mode"`
 }
 
 func configFilePath() string {
@@ -404,6 +420,64 @@ func feedWSURL(base string) string {
 	return u + "/ws/feed"
 }
 
+// chatWSURL derives the WebSocket chat endpoint from a base URL.
+func chatWSURL(base string) string {
+	u := strings.TrimRight(base, "/")
+	u = strings.Replace(u, "https://", "wss://", 1)
+	u = strings.Replace(u, "http://", "ws://", 1)
+	if !strings.HasPrefix(u, "ws") {
+		u = "ws://" + u
+	}
+	return u + "/ws/chat"
+}
+
+func mimeFromImagePath(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	default:
+		return "image/jpeg"
+	}
+}
+
+func prepareChatImageFile(path string) ([]byte, string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	mime := mimeFromImagePath(path)
+	if len(data) <= maxChatImageBytes {
+		return data, mime, nil
+	}
+
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, "", fmt.Errorf("unsupported image format")
+	}
+	bounds := img.Bounds()
+	w, h := bounds.Dx(), bounds.Dy()
+	maxDim := 1600
+	if w > maxDim || h > maxDim {
+		scale := float64(maxDim) / float64(max(w, h))
+		nw, nh := int(float64(w)*scale), int(float64(h)*scale)
+		resized := image.NewRGBA(image.Rect(0, 0, nw, nh))
+		xdraw.CatmullRom.Scale(resized, resized.Bounds(), img, bounds, xdraw.Over, nil)
+		img = resized
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85}); err != nil {
+		return nil, "", err
+	}
+	if buf.Len() > maxChatImageBytes {
+		return nil, "", fmt.Errorf("image too large (max 2 MB)")
+	}
+	return buf.Bytes(), "image/jpeg", nil
+}
+
 var (
 	currentCmd    *exec.Cmd
 	cmdMutex      sync.Mutex
@@ -420,6 +494,11 @@ var (
 	micWsMu         sync.Mutex
 	micWsCancel     context.CancelFunc
 	micStreamCancel context.CancelFunc
+
+	// Chat WS (/ws/chat)
+	chatWsConn   *websocket.Conn
+	chatWsMu     sync.Mutex
+	chatWsCancel context.CancelFunc
 
 	// Shared Camera Manager
 	sharedCamMu     sync.Mutex
@@ -524,8 +603,12 @@ func main() {
 	myWindow := myApp.NewWindow("Medicart Uploader")
 
 	var connectWS func() error
+	var connectChatWS func() error
+	var disconnectChatWS func()
 	var btnPreviewStart, btnPreviewStop *widget.Button
 	var btnBroadcastStart, btnBroadcastStop *widget.Button
+	var ageEntry, weightEntry, heightEntry *widget.Entry
+	var genderSelect *widget.Select
 
 	// Load persisted settings from ~/.medicart/config.json
 	cfg := loadAppConfig()
@@ -701,6 +784,54 @@ func main() {
 
 	btnTemp := widget.NewButtonWithIcon("Temperature", theme.MediaPlayIcon(), func() {
 		startProcess("Temperature", []string{"-temperature"}, parseTemperatureLine)
+	})
+
+	uploadECG := func(path string) {
+		base := strings.TrimSpace(serverBaseEntry.Text)
+		if base == "" {
+			log("Error: Enter a Server Base URL in Settings")
+			return
+		}
+		patientName := strings.TrimSpace(patientNameEntry.Text)
+		clinicName := strings.TrimSpace(clinicNameEntry.Text)
+		if patientName == "" {
+			log("Error: Enter a Patient Name in Patients tab")
+			return
+		}
+		if clinicName == "" {
+			log("Error: Enter a Clinic Name in Settings")
+			return
+		}
+
+		data, mime, err := prepareChatImageFile(path)
+		if err != nil {
+			log(fmt.Sprintf("ECG image error: %v", err))
+			return
+		}
+
+		payload := map[string]interface{}{
+			"patient_name": patientName,
+			"clinic_name":  clinicName,
+			"type":         "ecg",
+			"image":        base64.StdEncoding.EncodeToString(data),
+			"image_mime":   mime,
+		}
+		if err := sendData(ingestURL(base), payload); err != nil {
+			log(fmt.Sprintf("ECG upload failed: %v", err))
+			return
+		}
+		log("ECG uploaded successfully")
+	}
+
+	btnECGUpload := widget.NewButtonWithIcon("Upload ECG Image", theme.DocumentIcon(), func() {
+		dialog.ShowFileOpen(func(reader fyne.URIReadCloser, err error) {
+			if err != nil || reader == nil {
+				return
+			}
+			path := reader.URI().Path()
+			reader.Close()
+			go uploadECG(path)
+		}, myWindow)
 	})
 
 	// Stethoscope Buttons
@@ -956,6 +1087,9 @@ func main() {
 		streamCancel()
 		streamCancel = nil
 		wsMu.Unlock()
+		if disconnectChatWS != nil {
+			disconnectChatWS()
+		}
 		cameraLog("Stream stopped")
 		fyne.Do(func() {
 			btnBroadcastStart.Enable()
@@ -1013,6 +1147,14 @@ func main() {
 			btnBroadcastStart.Disable()
 			btnBroadcastStop.Enable()
 		})
+
+		go func() {
+			if connectChatWS != nil {
+				if err := connectChatWS(); err != nil {
+					log(fmt.Sprintf("Chat auto-connect failed (non-fatal): %v", err))
+				}
+			}
+		}()
 
 		go func() {
 			for {
@@ -1760,13 +1902,291 @@ func main() {
 	wsConnectBtn := widget.NewButtonWithIcon("Connect", theme.SettingsIcon(), func() { connectWS() })
 	wsDisconnectBtn := widget.NewButtonWithIcon("Disconnect", theme.CancelIcon(), disconnectWS)
 
+	// --- Chat (doctor ↔ nurse via web server) ---
+	chatStatusLabel := widget.NewLabel("Chat: Disconnected")
+	chatFeedBox := container.NewVBox()
+	chatScroll := container.NewVScroll(chatFeedBox)
+	chatScroll.SetMinSize(fyne.NewSize(0, 280))
+
+	appendChatText := func(line string) {
+		fyne.Do(func() {
+			lbl := widget.NewLabel(line)
+			lbl.Wrapping = fyne.TextWrapWord
+			chatFeedBox.Add(lbl)
+			chatFeedBox.Refresh()
+			chatScroll.ScrollToBottom()
+		})
+	}
+
+	clearChatFeed := func() {
+		fyne.Do(func() {
+			chatFeedBox.Objects = nil
+			chatFeedBox.Refresh()
+		})
+	}
+
+	formatChatHeader := func(msg map[string]interface{}) string {
+		sender, _ := msg["sender"].(string)
+		role, _ := msg["role"].(string)
+		ts, _ := msg["timestamp"].(string)
+		timeLabel := ts
+		if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+			timeLabel = parsed.Local().Format("15:04")
+		}
+		label := sender
+		if role != "" {
+			label = fmt.Sprintf("%s (%s)", sender, role)
+		}
+		if timeLabel != "" {
+			return fmt.Sprintf("[%s] %s", timeLabel, label)
+		}
+		return label
+	}
+
+	appendChatImage := func(header, imageB64, mime, caption string) {
+		fyne.Do(func() {
+			if header != "" {
+				lbl := widget.NewLabel(header)
+				lbl.Wrapping = fyne.TextWrapWord
+				chatFeedBox.Add(lbl)
+			}
+			data, err := base64.StdEncoding.DecodeString(imageB64)
+			if err != nil {
+				chatFeedBox.Add(widget.NewLabel("[Invalid image attachment]"))
+				chatFeedBox.Refresh()
+				chatScroll.ScrollToBottom()
+				return
+			}
+			img := canvas.NewImageFromResource(fyne.NewStaticResource("chat-image", data))
+			img.FillMode = canvas.ImageFillContain
+			img.SetMinSize(fyne.NewSize(220, 160))
+
+			imageData := append([]byte(nil), data...)
+			saveBtn := widget.NewButtonWithIcon("Save image", theme.DownloadIcon(), func() {
+				dialog.ShowFileSave(func(writer fyne.URIWriteCloser, err error) {
+					if err != nil || writer == nil {
+						return
+					}
+					defer writer.Close()
+					_, _ = writer.Write(imageData)
+				}, myWindow)
+			})
+
+			parts := []fyne.CanvasObject{img}
+			if caption != "" {
+				capLbl := widget.NewLabel(caption)
+				capLbl.Wrapping = fyne.TextWrapWord
+				parts = append(parts, capLbl)
+			}
+			parts = append(parts, saveBtn)
+			chatFeedBox.Add(container.NewVBox(parts...))
+			chatFeedBox.Refresh()
+			chatScroll.ScrollToBottom()
+		})
+	}
+
+	formatChatLine := func(msg map[string]interface{}) string {
+		header := formatChatHeader(msg)
+		text, _ := msg["text"].(string)
+		if text == "" {
+			return header
+		}
+		return fmt.Sprintf("%s: %s", header, text)
+	}
+
+	disconnectChatWS = func() {
+		chatWsMu.Lock()
+		if chatWsConn != nil {
+			_ = chatWsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "bye"))
+			chatWsConn.Close()
+		}
+		if chatWsCancel != nil {
+			chatWsCancel()
+		}
+		chatWsConn = nil
+		chatWsCancel = nil
+		chatWsMu.Unlock()
+		fyne.Do(func() { chatStatusLabel.SetText("Chat: Disconnected") })
+	}
+
+	connectChatWS = func() error {
+		chatWsMu.Lock()
+		if chatWsConn != nil {
+			chatWsMu.Unlock()
+			return nil
+		}
+		chatWsMu.Unlock()
+
+		base := strings.TrimSpace(serverBaseEntry.Text)
+		if base == "" {
+			return fmt.Errorf("enter a Server Base URL in Settings")
+		}
+		clinic := strings.TrimSpace(clinicNameEntry.Text)
+		if clinic == "" {
+			return fmt.Errorf("enter a Clinic Name in Settings")
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		c, _, err := websocket.DefaultDialer.DialContext(ctx, chatWSURL(base), nil)
+		if err != nil {
+			cancel()
+			return err
+		}
+
+		chatWsMu.Lock()
+		chatWsConn = c
+		chatWsCancel = cancel
+		chatWsMu.Unlock()
+
+		fyne.Do(func() { chatStatusLabel.SetText("Chat: Connected") })
+		appendChatText("Connected to clinic chat.")
+		clearChatFeed()
+
+		register := map[string]string{
+			"type":        "register",
+			"clinic_name": clinic,
+			"sender":      "Clinic Nurse",
+			"role":        "nurse",
+		}
+		regJSON, _ := json.Marshal(register)
+		if err := c.WriteMessage(websocket.TextMessage, regJSON); err != nil {
+			disconnectChatWS()
+			return err
+		}
+
+		go func() {
+			defer disconnectChatWS()
+			c.SetReadDeadline(time.Now().Add(60 * time.Second))
+			c.SetPongHandler(func(string) error {
+				c.SetReadDeadline(time.Now().Add(60 * time.Second))
+				return nil
+			})
+			pingStop := make(chan struct{})
+			go func() {
+				ticker := time.NewTicker(20 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						_ = c.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
+					case <-pingStop:
+						return
+					}
+				}
+			}()
+			defer close(pingStop)
+
+			for {
+				_, msg, err := c.ReadMessage()
+				if err != nil {
+					if ctx.Err() != context.Canceled {
+						appendChatText(fmt.Sprintf("Chat disconnected: %v", err))
+					}
+					return
+				}
+				var payload map[string]interface{}
+				if err := json.Unmarshal(msg, &payload); err != nil {
+					continue
+				}
+				if payload["type"] == "chat" {
+					if img, ok := payload["image"].(string); ok && img != "" {
+						mime, _ := payload["image_mime"].(string)
+						caption, _ := payload["text"].(string)
+						appendChatImage(formatChatHeader(payload), img, mime, caption)
+					} else {
+						appendChatText(formatChatLine(payload))
+					}
+				}
+			}
+		}()
+
+		return nil
+	}
+
+	chatInput := widget.NewEntry()
+	chatInput.SetPlaceHolder("Message the doctor…")
+
+	sendChatMessage := func() {
+		text := strings.TrimSpace(chatInput.Text)
+		if text == "" {
+			return
+		}
+		chatWsMu.Lock()
+		c := chatWsConn
+		chatWsMu.Unlock()
+		if c == nil {
+			appendChatText("Chat not connected — go live to enable chat.")
+			return
+		}
+		payload, _ := json.Marshal(map[string]string{
+			"type": "chat",
+			"text": text,
+		})
+		if err := c.WriteMessage(websocket.TextMessage, payload); err != nil {
+			appendChatText(fmt.Sprintf("Send failed: %v", err))
+			return
+		}
+		fyne.Do(func() { chatInput.SetText("") })
+	}
+
+	sendChatImage := func(path string) {
+		chatWsMu.Lock()
+		c := chatWsConn
+		chatWsMu.Unlock()
+		if c == nil {
+			appendChatText("Chat not connected — go live to enable chat.")
+			return
+		}
+
+		data, mime, err := prepareChatImageFile(path)
+		if err != nil {
+			appendChatText(fmt.Sprintf("Image error: %v", err))
+			return
+		}
+
+		msg := map[string]string{
+			"type":       "chat",
+			"image":      base64.StdEncoding.EncodeToString(data),
+			"image_mime": mime,
+		}
+		if text := strings.TrimSpace(chatInput.Text); text != "" {
+			msg["text"] = text
+		}
+		payload, _ := json.Marshal(msg)
+		if err := c.WriteMessage(websocket.TextMessage, payload); err != nil {
+			appendChatText(fmt.Sprintf("Send failed: %v", err))
+			return
+		}
+		fyne.Do(func() { chatInput.SetText("") })
+	}
+
+	btnChatAttach := widget.NewButtonWithIcon("", theme.ContentAddIcon(), func() {
+		dialog.ShowFileOpen(func(reader fyne.URIReadCloser, err error) {
+			if err != nil || reader == nil {
+				return
+			}
+			path := reader.URI().Path()
+			reader.Close()
+			go sendChatImage(path)
+		}, myWindow)
+	})
+	btnChatAttach.Importance = widget.LowImportance
+
+	btnChatSend := widget.NewButtonWithIcon("Send", theme.MailSendIcon(), sendChatMessage)
+	btnChatSend.Importance = widget.HighImportance
+	chatInput.OnSubmitted = func(string) { sendChatMessage() }
+
 	btnSaveSettings := widget.NewButtonWithIcon("Save Settings", theme.DocumentSaveIcon(), func() {
 		newCfg := AppConfig{
-			ServerBase:  strings.TrimSpace(serverBaseEntry.Text),
-			ClinicName:  strings.TrimSpace(clinicNameEntry.Text),
-			PatientName: strings.TrimSpace(patientNameEntry.Text),
-			StethMAC:    strings.TrimSpace(stethMacEntry.Text),
-			LightMode:   lightModeCheck.Checked,
+			ServerBase:    strings.TrimSpace(serverBaseEntry.Text),
+			ClinicName:    strings.TrimSpace(clinicNameEntry.Text),
+			PatientName:   strings.TrimSpace(patientNameEntry.Text),
+			PatientAge:    strings.TrimSpace(ageEntry.Text),
+			PatientWeight: strings.TrimSpace(weightEntry.Text),
+			PatientHeight: strings.TrimSpace(heightEntry.Text),
+			PatientGender: genderSelect.Selected,
+			StethMAC:      strings.TrimSpace(stethMacEntry.Text),
+			LightMode:     lightModeCheck.Checked,
 		}
 		if err := saveAppConfig(newCfg); err != nil {
 			log(fmt.Sprintf("Error saving settings: %v", err))
@@ -1780,16 +2200,90 @@ func main() {
 	// --- Layout Refactor ---
 
 	// 1. Patients Tab
-	// Mimicking the Patient Info & Overview section
-	ageEntry := widget.NewEntry()
-	ageEntry.SetText("62")
-	weightEntry := widget.NewEntry()
-	weightEntry.SetText("85")
-	heightEntry := widget.NewEntry()
-	heightEntry.SetText("180")
+	ageEntry = widget.NewEntry()
+	ageEntry.SetPlaceHolder("e.g. 62")
+	if cfg.PatientAge != "" {
+		ageEntry.SetText(cfg.PatientAge)
+	}
+	weightEntry = widget.NewEntry()
+	weightEntry.SetPlaceHolder("e.g. 85")
+	if cfg.PatientWeight != "" {
+		weightEntry.SetText(cfg.PatientWeight)
+	}
+	heightEntry = widget.NewEntry()
+	heightEntry.SetPlaceHolder("e.g. 180")
+	if cfg.PatientHeight != "" {
+		heightEntry.SetText(cfg.PatientHeight)
+	}
+	genderOptions := []string{"Male", "Female", "Other"}
+	genderSelect = widget.NewSelect(genderOptions, nil)
+	if cfg.PatientGender != "" {
+		genderSelect.SetSelected(cfg.PatientGender)
+	}
 
-	patientOverview := container.NewGridWithColumns(3,
+	savePatientProfile := func() {
+		base := strings.TrimSpace(serverBaseEntry.Text)
+		if base == "" {
+			log("Error: Enter a Server Base URL in Settings")
+			return
+		}
+		patientName := strings.TrimSpace(patientNameEntry.Text)
+		clinicName := strings.TrimSpace(clinicNameEntry.Text)
+		if patientName == "" {
+			log("Error: Enter a Patient Name")
+			return
+		}
+		if clinicName == "" {
+			log("Error: Enter a Clinic Name in Settings")
+			return
+		}
+		if genderSelect.Selected == "" {
+			log("Error: Select a gender")
+			return
+		}
+
+		age, _ := strconv.Atoi(strings.TrimSpace(ageEntry.Text))
+		weight, _ := strconv.ParseFloat(strings.TrimSpace(weightEntry.Text), 64)
+		height, _ := strconv.ParseFloat(strings.TrimSpace(heightEntry.Text), 64)
+
+		newCfg := AppConfig{
+			ServerBase:    base,
+			ClinicName:    clinicName,
+			PatientName:   patientName,
+			PatientAge:    strings.TrimSpace(ageEntry.Text),
+			PatientWeight: strings.TrimSpace(weightEntry.Text),
+			PatientHeight: strings.TrimSpace(heightEntry.Text),
+			PatientGender: genderSelect.Selected,
+			StethMAC:      strings.TrimSpace(stethMacEntry.Text),
+			LightMode:     lightModeCheck.Checked,
+		}
+		if err := saveAppConfig(newCfg); err != nil {
+			log(fmt.Sprintf("Error saving patient info locally: %v", err))
+			return
+		}
+
+		payload := map[string]interface{}{
+			"type":         "profile",
+			"patient_name": patientName,
+			"clinic_name":  clinicName,
+			"gender":       genderSelect.Selected,
+			"age":          age,
+			"weight":       weight,
+			"height":       height,
+		}
+		if err := sendData(ingestURL(base), payload); err != nil {
+			log(fmt.Sprintf("Patient profile upload failed: %v", err))
+			return
+		}
+		log("Patient profile saved")
+	}
+
+	btnSavePatient := widget.NewButtonWithIcon("Save Patient Info", theme.DocumentSaveIcon(), savePatientProfile)
+	btnSavePatient.Importance = widget.HighImportance
+
+	patientOverview := container.NewGridWithColumns(2,
 		container.NewVBox(widget.NewLabelWithStyle("AGE (YRS)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), ageEntry),
+		container.NewVBox(widget.NewLabelWithStyle("GENDER", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), genderSelect),
 		container.NewVBox(widget.NewLabelWithStyle("WEIGHT (KG)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), weightEntry),
 		container.NewVBox(widget.NewLabelWithStyle("HEIGHT (CM)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), heightEntry),
 	)
@@ -1797,8 +2291,9 @@ func main() {
 	patientsContent := container.NewVBox(
 		widget.NewCard("Identity Context", "Select Patient", container.NewVBox(
 			patientNameLabel, patientNameEntry,
+			btnSavePatient,
 		)),
-		widget.NewCard("Patient Overview", "", patientOverview),
+		widget.NewCard("Patient Overview", "Demographics associated with this patient", patientOverview),
 	)
 
 	// 2. Readings Tab
@@ -1812,6 +2307,10 @@ func main() {
 			btnGlucose,
 			btnTemp,
 		),
+		widget.NewSeparator(),
+		widget.NewCard("ECG", "Upload an ECG strip or snapshot image", container.NewVBox(
+			btnECGUpload,
+		)),
 		widget.NewSeparator(),
 		widget.NewCard("Connect Stethoscope", "Stream high-fidelity auscultation", container.NewVBox(
 			btnStethoscopeList,
@@ -1827,9 +2326,8 @@ func main() {
 		)),
 	)
 
-	// 3. Comms Tab
-	// Mimicking the Remote Comm & Camera section
-	commsContent := container.NewVBox(
+	// 3. Comms Tab — split into Video, Control, and Chat sub-tabs
+	videoContent := container.NewVBox(
 		widget.NewCard("Live Feed", "Local Preview", container.NewVBox(
 			container.NewGridWithColumns(2, btnPreviewStart, btnPreviewStop),
 			previewImage,
@@ -1843,13 +2341,16 @@ func main() {
 			container.NewGridWithColumns(2, btnMicStart, btnMicStop),
 		)),
 		widget.NewCard("Camera Status", "", cameraLogLabel),
+	)
+
+	controlContent := container.NewVBox(
 		widget.NewCard("Camera Control", "Precision Pan-Tilt-Zoom", container.NewVBox(
 			btnCamList,
 			container.NewCenter(
 				container.NewGridWithColumns(3,
 					widget.NewLabel(""), btnCamUp, widget.NewLabel(""),
 					btnCamLeft, widget.NewButtonWithIcon("Reset", theme.ViewRefreshIcon(), func() {
-						runCameraCommand("reset", []string{"-reset"}) // Assuming reset exists
+						runCameraCommand("reset", []string{"-reset"})
 					}), btnCamRight,
 					widget.NewLabel(""), btnCamDown, widget.NewLabel(""),
 				),
@@ -1857,6 +2358,24 @@ func main() {
 			btnCamFlip,
 		)),
 	)
+
+	chatContent := container.NewBorder(
+		container.NewVBox(
+			chatStatusLabel,
+			widget.NewLabel("Chat activates automatically when you go live."),
+		),
+		container.NewBorder(nil, nil, btnChatAttach, btnChatSend, chatInput),
+		nil,
+		nil,
+		chatScroll,
+	)
+
+	commsTabs := container.NewAppTabs(
+		container.NewTabItemWithIcon("Video", theme.MediaPlayIcon(), container.NewVScroll(videoContent)),
+		container.NewTabItemWithIcon("Control", theme.SettingsIcon(), container.NewVScroll(controlContent)),
+		container.NewTabItemWithIcon("Chat", theme.MailComposeIcon(), chatContent),
+	)
+	commsTabs.SetTabLocation(container.TabLocationTop)
 
 	// 4. Settings Tab
 	settingsContent := container.NewVBox(
@@ -1881,7 +2400,7 @@ func main() {
 	tabs := container.NewAppTabs(
 		container.NewTabItemWithIcon("Patients", theme.AccountIcon(), container.NewVScroll(patientsContent)),
 		container.NewTabItemWithIcon("Readings", theme.InfoIcon(), container.NewVScroll(readingsContent)),
-		container.NewTabItemWithIcon("Comms", theme.VisibilityIcon(), container.NewVScroll(commsContent)),
+		container.NewTabItemWithIcon("Comms", theme.VisibilityIcon(), commsTabs),
 		container.NewTabItemWithIcon("Settings", theme.SettingsIcon(), container.NewVScroll(settingsContent)),
 	)
 	tabs.SetTabLocation(container.TabLocationBottom) // Move tabs to bottom to mimic mobile/app feel from the designs
@@ -1890,6 +2409,111 @@ func main() {
 	myWindow.Resize(fyne.NewSize(480, 800))
 
 	myWindow.ShowAndRun()
+}
+
+type cliAttemptResult struct {
+	cancelled      bool
+	receivedOutput bool
+	errMsg         string
+}
+
+func (r cliAttemptResult) succeeded() bool {
+	return r.receivedOutput || r.errMsg == ""
+}
+
+func resolveCLIPath(name string) string {
+	cmdPath := "lepu_cli.exe"
+	if name == "StethoscopeList" || name == "StethoscopeStream" {
+		cmdPath = "MinttiCLI.exe"
+	}
+
+	if _, err := exec.LookPath(cmdPath); err != nil {
+		if name == "StethoscopeList" || name == "StethoscopeStream" {
+			return "./MinttiCLI.exe"
+		}
+		return "./lepu_cli.exe"
+	}
+	return cmdPath
+}
+
+func runCLIOnce(ctx context.Context, cmdPath string, args []string, parser LineParser, targetURL, clinicName, patientName string, log func(string)) cliAttemptResult {
+	result := cliAttemptResult{}
+
+	if ctx.Err() != nil {
+		result.cancelled = true
+		return result
+	}
+
+	cmd := exec.CommandContext(ctx, cmdPath, args...)
+
+	cmdMutex.Lock()
+	currentCmd = cmd
+	cmdMutex.Unlock()
+
+	defer func() {
+		cmdMutex.Lock()
+		if currentCmd == cmd {
+			currentCmd = nil
+		}
+		cmdMutex.Unlock()
+	}()
+
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		result.errMsg = fmt.Sprintf("error creating stdout pipe: %v", err)
+		return result
+	}
+
+	if err := cmd.Start(); err != nil {
+		result.errMsg = fmt.Sprintf("error starting process: %v", err)
+		return result
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		line := scanner.Text()
+		data, err := parser(line)
+		if err != nil {
+			continue
+		}
+
+		if data != nil {
+			result.receivedOutput = true
+
+			if dataMap, ok := data.(map[string]interface{}); ok {
+				dataMap["patient_name"] = patientName
+				dataMap["clinic_name"] = clinicName
+			}
+
+			log(fmt.Sprintf("Sending data: %v", data))
+			if err := sendData(targetURL, data); err != nil {
+				log(fmt.Sprintf("Error sending data: %v", err))
+			}
+		}
+	}
+
+	waitErr := cmd.Wait()
+	if ctx.Err() == context.Canceled {
+		result.cancelled = true
+		return result
+	}
+
+	if waitErr != nil {
+		result.errMsg = waitErr.Error()
+		if stderr := strings.TrimSpace(stderrBuf.String()); stderr != "" {
+			result.errMsg = fmt.Sprintf("%s: %s", result.errMsg, stderr)
+		}
+	} else if !result.receivedOutput {
+		result.errMsg = "no data received from device"
+		if stderr := strings.TrimSpace(stderrBuf.String()); stderr != "" {
+			result.errMsg = fmt.Sprintf("%s: %s", result.errMsg, stderr)
+		}
+	}
+
+	return result
 }
 
 func runCLIAndSend(name string, args []string, parser LineParser, targetURL string, clinicName string, patientName string, log func(string), onFinish func()) {
@@ -1908,71 +2532,41 @@ func runCLIAndSend(name string, args []string, parser LineParser, targetURL stri
 		cmdMutex.Unlock()
 	}()
 
-	cmdPath := "lepu_cli.exe"
-	if name == "StethoscopeList" || name == "StethoscopeStream" {
-		cmdPath = "MinttiCLI.exe"
-	}
+	cmdPath := resolveCLIPath(name)
+	var lastErr string
 
-	if _, err := exec.LookPath(cmdPath); err != nil {
-		if name == "StethoscopeList" || name == "StethoscopeStream" {
-			cmdPath = "./MinttiCLI.exe"
+	for attempt := 1; attempt <= cliMaxAttempts; attempt++ {
+		if attempt > 1 {
+			log(fmt.Sprintf("Retrying %s (attempt %d/%d)...", name, attempt, cliMaxAttempts))
+			select {
+			case <-ctx.Done():
+				log("Process stopped by user.")
+				return
+			case <-time.After(cliRetryDelay):
+			}
 		} else {
-			cmdPath = "./lepu_cli.exe"
-		}
-	}
-
-	log(fmt.Sprintf("Starting %s (%s)...", name, cmdPath))
-
-	cmd := exec.CommandContext(ctx, cmdPath, args...)
-
-	cmdMutex.Lock()
-	currentCmd = cmd
-	cmdMutex.Unlock()
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		log(fmt.Sprintf("Error creating stdout pipe: %v", err))
-		return
-	}
-
-	if err := cmd.Start(); err != nil {
-		log(fmt.Sprintf("Error starting process: %v", err))
-		return
-	}
-
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		line := scanner.Text()
-		data, err := parser(line)
-		if err != nil {
-			// Parser error usually means skip
-			continue
+			log(fmt.Sprintf("Starting %s (%s)...", name, cmdPath))
 		}
 
-		if data != nil {
-			// Inject Patient Name
-			if dataMap, ok := data.(map[string]interface{}); ok {
-				dataMap["patient_name"] = patientName
-				dataMap["clinic_name"] = clinicName
-			}
-
-			// Send to server
-			log(fmt.Sprintf("Sending data: %v", data))
-			if err := sendData(targetURL, data); err != nil {
-				log(fmt.Sprintf("Error sending data: %v", err))
-			}
-		}
-	}
-
-	if err := cmd.Wait(); err != nil {
-		if ctx.Err() == context.Canceled {
+		result := runCLIOnce(ctx, cmdPath, args, parser, targetURL, clinicName, patientName, log)
+		if result.cancelled {
 			log("Process stopped by user.")
-		} else {
-			log(fmt.Sprintf("Process finished with error: %v", err))
+			return
 		}
-	} else {
-		log("Process finished successfully.")
+		if result.succeeded() {
+			if result.receivedOutput {
+				log("Process finished successfully.")
+			}
+			return
+		}
+
+		lastErr = result.errMsg
+		if attempt < cliMaxAttempts {
+			log(fmt.Sprintf("Attempt %d failed: %s", attempt, lastErr))
+		}
 	}
+
+	log(fmt.Sprintf("Error: %s failed after %d attempts: %s", name, cliMaxAttempts, lastErr))
 }
 
 func sendData(url string, data interface{}) error {

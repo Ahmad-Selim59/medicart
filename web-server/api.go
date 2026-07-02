@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type Clinic struct {
@@ -25,10 +26,35 @@ type Patient struct {
 	Name        string                 `json:"name"`
 	Gender      string                 `json:"gender"`
 	Age         int                    `json:"age"`
+	Weight      float64                `json:"weight"`
+	Height      float64                `json:"height"`
 	Status      string                 `json:"status"`
 	Action      string                 `json:"action"`
 	LastChecked string                 `json:"lastChecked"`
 	Data        map[string]interface{} `json:"data"`
+}
+
+type PatientProfile struct {
+	PatientName string  `json:"patient_name"`
+	ClinicName  string  `json:"clinic_name"`
+	Gender      string  `json:"gender"`
+	Age         int     `json:"age"`
+	Weight      float64 `json:"weight"`
+	Height      float64 `json:"height"`
+	UpdatedAt   string  `json:"updated_at"`
+}
+
+func loadPatientProfile(clinicName, patientName string) PatientProfile {
+	path := filepath.Join("data", clinicName, patientName, "profile.json")
+	b, err := readFile(path)
+	if err != nil {
+		return PatientProfile{}
+	}
+	var profile PatientProfile
+	if err := json.Unmarshal(b, &profile); err != nil {
+		return PatientProfile{}
+	}
+	return profile
 }
 
 func getAllClinics(allowedClinics []string) []Clinic {
@@ -110,6 +136,9 @@ func buildPatient(clinicName string, patientName string) Patient {
 
 	if err == nil {
 		for _, name := range files {
+			if name == "profile.json" {
+				continue
+			}
 			if strings.HasSuffix(name, ".json") {
 				b, err := readFile(filepath.Join(dir, name))
 				if err != nil {
@@ -132,7 +161,14 @@ func buildPatient(clinicName string, patientName string) Patient {
 
 					var innerData []interface{}
 					for _, r := range recs {
-						innerData = append(innerData, r.RawData)
+						item := make(map[string]interface{}, len(r.RawData)+1)
+						for k, v := range r.RawData {
+							item[k] = v
+						}
+						if _, hasTS := item["timestamp"]; !hasTS {
+							item["timestamp"] = r.Timestamp.UTC().Format(time.RFC3339)
+						}
+						innerData = append(innerData, item)
 					}
 					if len(innerData) > 0 {
 						if existing, ok := realData[key]; ok {
@@ -146,15 +182,35 @@ func buildPatient(clinicName string, patientName string) Patient {
 		}
 	}
 
+	profile := loadPatientProfile(clinicName, patientName)
+	gender := "Unknown"
+	age := 0
+	weight := 0.0
+	height := 0.0
+	if profile.Gender != "" {
+		gender = profile.Gender
+	}
+	if profile.Age > 0 {
+		age = profile.Age
+	}
+	if profile.Weight > 0 {
+		weight = profile.Weight
+	}
+	if profile.Height > 0 {
+		height = profile.Height
+	}
+
 	return Patient{
 		ID:          patientName, // use name as ID
 		ClinicID:    clinicName,
 		Name:        patientName,
-		Gender:      "Unknown",
-		Age:         0,
+		Gender:      gender,
+		Age:         age,
+		Weight:      weight,
+		Height:      height,
 		Status:      "stable",
 		Action:      "View",
-		LastChecked: "",
+		LastChecked: profile.UpdatedAt,
 		Data:        realData,
 	}
 }

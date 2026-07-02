@@ -1,8 +1,0 @@
-[
-  {
-    "timestamp": "2026-03-30T18:00:00Z",
-    "patient_name": "Ahmad",
-    "clinic_name": "ClinicA",
-    "data": { "type": "result", "sys": 119, "dia": 77, "map": 91, "pr": 71, "irr": false }
-  }
-]

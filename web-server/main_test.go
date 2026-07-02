@@ -57,6 +57,16 @@ func TestMetricFile(t *testing.T) {
 			expected: "stethoscope",
 		},
 		{
+			name: "ECG Image",
+			payload: map[string]interface{}{
+				"patient_name": "Test",
+				"type":         "ecg",
+				"image":        "abc",
+				"image_mime":   "image/jpeg",
+			},
+			expected: "ecg",
+		},
+		{
 			name: "Misc Data",
 			payload: map[string]interface{}{
 				"patient_name": "Test",
@@ -76,6 +86,49 @@ func TestMetricFile(t *testing.T) {
 				t.Errorf("expected %q but got %q", tt.expected, result)
 			}
 		})
+	}
+}
+
+func TestSavePatientProfile(t *testing.T) {
+	os.RemoveAll("data")
+	defer os.RemoveAll("data")
+
+	record := Record{
+		Timestamp:   time.Now(),
+		PatientName: "Ahmad",
+		ClinicName:  "TestClinic",
+		RawData: map[string]interface{}{
+			"type":         "profile",
+			"patient_name": "Ahmad",
+			"clinic_name":  "TestClinic",
+			"gender":       "Male",
+			"age":          62,
+			"weight":       85.0,
+			"height":       180.0,
+		},
+	}
+
+	if err := savePatientProfile(record); err != nil {
+		t.Fatalf("savePatientProfile failed: %v", err)
+	}
+
+	profile := loadPatientProfile("TestClinic", "Ahmad")
+	if profile.Gender != "Male" {
+		t.Fatalf("expected gender Male, got %q", profile.Gender)
+	}
+	if profile.Age != 62 {
+		t.Fatalf("expected age 62, got %d", profile.Age)
+	}
+	if profile.Weight != 85 {
+		t.Fatalf("expected weight 85, got %v", profile.Weight)
+	}
+	if profile.Height != 180 {
+		t.Fatalf("expected height 180, got %v", profile.Height)
+	}
+
+	patient := buildPatient("TestClinic", "Ahmad")
+	if patient.Gender != "Male" || patient.Age != 62 || patient.Weight != 85 || patient.Height != 180 {
+		t.Fatalf("unexpected patient profile: %+v", patient)
 	}
 }
 

@@ -1,8 +1,0 @@
-[
-  {
-    "timestamp": "2024-03-23T14:20:00Z",
-    "patient_name": "Ahmad",
-    "clinic_name": "ClinicA",
-    "data": { "type": "data", "glu": 115 }
-  }
-]

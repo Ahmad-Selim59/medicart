@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"image"
 	"image/color"
 	"image/png"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -14,6 +17,82 @@ import (
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
 )
+
+func TestCLIAttemptSucceeded(t *testing.T) {
+	cases := []struct {
+		name   string
+		result cliAttemptResult
+		want   bool
+	}{
+		{
+			name:   "received output",
+			result: cliAttemptResult{receivedOutput: true, errMsg: "exit status 1"},
+			want:   true,
+		},
+		{
+			name:   "clean exit with no error message",
+			result: cliAttemptResult{},
+			want:   true,
+		},
+		{
+			name:   "failed with no output",
+			result: cliAttemptResult{errMsg: "exit status 1"},
+			want:   false,
+		},
+		{
+			name:   "no data received",
+			result: cliAttemptResult{errMsg: "no data received from device"},
+			want:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.result.succeeded(); got != tc.want {
+				t.Fatalf("succeeded() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunCLIOnceRetriesUntilOutput(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+
+	script := `if [ "$1" = "fail" ]; then exit 1; fi; echo "DATA:PR=75,SPO2=98"`
+	tmp, err := os.CreateTemp("", "medicart-cli-retry-*.sh")
+	if err != nil {
+		t.Fatalf("create temp script: %v", err)
+	}
+	defer os.Remove(tmp.Name())
+
+	if _, err := tmp.WriteString(script); err != nil {
+		t.Fatalf("write temp script: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatalf("close temp script: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var logs []string
+	logFn := func(msg string) { logs = append(logs, msg) }
+
+	result := runCLIOnce(ctx, "sh", []string{tmp.Name(), "fail"}, parseHeartRateLine, "http://127.0.0.1:1", "Clinic", "Patient", logFn)
+	if result.succeeded() {
+		t.Fatalf("expected failed attempt, got %+v", result)
+	}
+	if result.errMsg == "" {
+		t.Fatal("expected error message on failed attempt")
+	}
+
+	result = runCLIOnce(ctx, "sh", []string{tmp.Name(), "ok"}, parseHeartRateLine, "http://127.0.0.1:1", "Clinic", "Patient", logFn)
+	if !result.succeeded() || !result.receivedOutput {
+		t.Fatalf("expected successful attempt with output, got %+v", result)
+	}
+}
 
 // makeFakeFrame returns a solid-color image of the given size.
 func makeFakeFrame(w, h int, c color.Color) image.Image {

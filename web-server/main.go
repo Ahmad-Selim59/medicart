@@ -66,6 +66,7 @@ func main() {
 	http.HandleFunc("/ws/stream", handleStreamWS)
 	http.HandleFunc("/ws/audio-feed", handleAudioFeedWS)
 	http.HandleFunc("/ws/audio-stream", handleAudioStreamWS)
+	http.HandleFunc("/ws/chat", handleChatWS)
 	http.HandleFunc("/api/feed/start", handleFeedStart)
 	http.HandleFunc("/api/feed/stop", handleFeedStop)
 	http.HandleFunc("/api/clinics", authMiddleware(handleClinics))
@@ -140,6 +141,45 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 		clinicName = name
 	}
 
+	if t, ok := data["type"].(string); ok && t == "ecg" {
+		imageB64, _ := data["image"].(string)
+		mime, _ := data["image_mime"].(string)
+		if strings.TrimSpace(imageB64) == "" {
+			http.Error(w, "ECG image required", http.StatusBadRequest)
+			return
+		}
+		if err := validateChatImage(imageB64, mime); err != nil {
+			http.Error(w, "Invalid ECG image: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	if t, ok := data["type"].(string); ok && t == "profile" {
+		if strings.TrimSpace(patientName) == "" || patientName == "Unknown" {
+			http.Error(w, "patient_name required", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(clinicName) == "" || clinicName == "Unknown" {
+			http.Error(w, "clinic_name required", http.StatusBadRequest)
+			return
+		}
+		record := Record{
+			Timestamp:   time.Now(),
+			PatientName: patientName,
+			ClinicName:  clinicName,
+			RawData:     data,
+		}
+		if err := savePatientProfile(record); err != nil {
+			log.Printf("Error saving patient profile: %v", err)
+			http.Error(w, "Failed to save profile", http.StatusInternalServerError)
+			return
+		}
+		log.Printf("Saved profile for patient: %s", patientName)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Profile saved successfully")
+		return
+	}
+
 	record := Record{
 		Timestamp:   time.Now(),
 		PatientName: patientName,
@@ -186,6 +226,65 @@ func saveRecord(record Record) error {
 		return err
 	}
 	return saveFile(path, data)
+}
+
+func savePatientProfile(record Record) error {
+	fileMutex.Lock()
+	defer fileMutex.Unlock()
+
+	dir := filepath.Join("data", safe(record.ClinicName), safe(record.PatientName))
+	path := filepath.Join(dir, "profile.json")
+
+	profile := PatientProfile{
+		PatientName: record.PatientName,
+		ClinicName:  record.ClinicName,
+		Gender:      profileString(record.RawData, "gender"),
+		Age:         profileInt(record.RawData, "age"),
+		Weight:      profileFloat(record.RawData, "weight"),
+		Height:      profileFloat(record.RawData, "height"),
+		UpdatedAt:   record.Timestamp.UTC().Format(time.RFC3339),
+	}
+
+	data, err := json.MarshalIndent(profile, "", "  ")
+	if err != nil {
+		return err
+	}
+	return saveFile(path, data)
+}
+
+func profileString(data map[string]interface{}, key string) string {
+	if v, ok := data[key].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+func profileInt(data map[string]interface{}, key string) int {
+	switch v := data[key].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case json.Number:
+		i, _ := v.Int64()
+		return int(i)
+	default:
+		return 0
+	}
+}
+
+func profileFloat(data map[string]interface{}, key string) float64 {
+	switch v := data[key].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	case json.Number:
+		f, _ := v.Float64()
+		return f
+	default:
+		return 0
+	}
 }
 
 func ensureDataDir() {
@@ -427,6 +526,8 @@ func metricFile(data map[string]interface{}) string {
 		lowerKeys[strings.ToLower(k)] = true
 	}
 	switch {
+	case lowerKeys["type"] && payload["type"] == "ecg":
+		return "ecg"
 	case lowerKeys["pr"] || lowerKeys["spo2"]:
 		return "heart_rate"
 	case lowerKeys["sys"] || lowerKeys["dia"] || lowerKeys["cuff_pressure"]:
