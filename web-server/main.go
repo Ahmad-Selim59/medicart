@@ -499,16 +499,25 @@ func broadcastFrame(key string, frame []byte) {
 		streamsMu.Unlock()
 		return // drop if no subscribers
 	}
+	targets := make([]*websocket.Conn, 0, len(conns))
 	for c := range conns {
-		if err := c.WriteMessage(websocket.BinaryMessage, frame); err != nil {
-			c.Close()
-			delete(conns, c)
-		}
-	}
-	if len(conns) == 0 {
-		delete(streams, key)
+		targets = append(targets, c)
 	}
 	streamsMu.Unlock()
+
+	for _, c := range targets {
+		if err := c.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+			c.Close()
+			streamsMu.Lock()
+			if m := streams[key]; m != nil {
+				delete(m, c)
+				if len(m) == 0 {
+					delete(streams, key)
+				}
+			}
+			streamsMu.Unlock()
+		}
+	}
 }
 
 func handleStreamWS(w http.ResponseWriter, r *http.Request) {

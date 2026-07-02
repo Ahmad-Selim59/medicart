@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -286,4 +288,60 @@ func TestRenderSnapshot(t *testing.T) {
 		t.Fatalf("encode png: %v", err)
 	}
 	t.Logf("snapshot saved to %s; start=%q stop=%q", out, start.Text, stop.Text)
+}
+
+func TestCoalesceLatestFrame(t *testing.T) {
+	ch := make(chan []byte, 4)
+	ch <- []byte("old")
+	ch <- []byte("mid")
+	ch <- []byte("new")
+
+	got, closed := coalesceLatestFrame(ch, <-ch)
+	if closed {
+		t.Fatal("expected channel to remain open")
+	}
+	if string(got) != "new" {
+		t.Fatalf("got %q, want %q", got, "new")
+	}
+
+	ch2 := make(chan []byte, 2)
+	ch2 <- []byte("last")
+	close(ch2)
+	got, closed = coalesceLatestFrame(ch2, <-ch2)
+	if !closed {
+		t.Fatal("expected channel closed")
+	}
+	if string(got) != "last" {
+		t.Fatalf("got %q, want %q", got, "last")
+	}
+}
+
+func TestBuildFFmpegArgsForMJPEGPipe(t *testing.T) {
+	args := buildFFmpegArgsForMJPEGPipe(`video="Cam"`, avConfig{})
+	joined := strings.Join(args, " ")
+
+	for _, want := range []string{"-flush_packets", "1", "-vsync", "passthrough"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("args missing %q: %s", want, joined)
+		}
+	}
+
+	switch runtime.GOOS {
+	case "windows":
+		for _, want := range []string{
+			"-fflags", "+nobuffer",
+			"-flags", "low_delay",
+			"-video_size", captureVideoSize,
+			"-framerate", captureFramerate,
+			"-f", "dshow",
+		} {
+			if !strings.Contains(joined, want) {
+				t.Fatalf("windows args missing %q: %s", want, joined)
+			}
+		}
+	case "darwin":
+		if !strings.Contains(joined, "avfoundation") {
+			t.Fatalf("darwin args missing avfoundation: %s", joined)
+		}
+	}
 }

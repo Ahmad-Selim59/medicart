@@ -39,6 +39,11 @@ import (
 // returns a larger native frame (e.g. 640x480 or 1920x1080).
 const previewMaxW, previewMaxH = 320, 240
 
+// captureVideoSize and captureFramerate pin dshow/v4l2 to a modest resolution
+// so MJPEG frames stay small and ffmpeg does not buffer high-res captures.
+const captureVideoSize = "640x480"
+const captureFramerate = "30"
+
 // cameraFPS is kept for the existing function signature but unused now: the
 // pipeline runs at the camera's native rate (typically 30 fps) and we don't
 // dictate a framerate to the device — older ffmpeg on Windows + cameras that
@@ -104,6 +109,23 @@ func splitMJPEGFrames(ctx context.Context, r io.Reader, out chan<- []byte) {
 		}
 		if err != nil {
 			return
+		}
+	}
+}
+
+// coalesceLatestFrame drains ch until empty and returns the newest JPEG.
+// closed is true when ch was closed during draining (frame may still be sent).
+func coalesceLatestFrame(ch <-chan []byte, first []byte) (frame []byte, closed bool) {
+	frame = first
+	for {
+		select {
+		case newer, ok := <-ch:
+			if !ok {
+				return frame, true
+			}
+			frame = newer
+		default:
+			return frame, false
 		}
 	}
 }
@@ -306,17 +328,30 @@ func or(a, b string) string {
 // duplicating the very first frame thousands of times — which is what makes
 // the preview look frozen on one image. Wall-clock timestamps + passthrough
 // vsync make ffmpeg emit each captured frame exactly once.
+//
+// On Windows, dshow defaults to buffering several seconds of video unless we
+// pass low-latency input flags (same idea as the audio ffmpeg pipe).
 func buildFFmpegArgsForMJPEGPipe(device string, darwin avConfig) []string {
 	globals := []string{"-nostdin", "-hide_banner", "-loglevel", "error"}
 	// -vsync passthrough: emit each input frame once, never duplicate or drop.
+	// -flush_packets 1: push each MJPEG frame to stdout immediately.
 	// (Newer ffmpeg also exposes this as -fps_mode passthrough; -vsync still
 	// works in current builds and is the only spelling older ffmpeg knows.)
-	tail := []string{"-an", "-vsync", "passthrough", "-f", "mjpeg", "-q:v", "6", "-"}
+	tail := []string{"-an", "-vsync", "passthrough", "-flush_packets", "1", "-f", "mjpeg", "-q:v", "6", "-"}
 	var mid []string
 	switch runtime.GOOS {
 	case "windows":
 		device = normalizeWindowsDeviceName(device)
-		mid = []string{"-f", "dshow", "-i", device}
+		mid = []string{
+			"-fflags", "+nobuffer",
+			"-flags", "low_delay",
+			"-probesize", "32",
+			"-analyzeduration", "0",
+			"-video_size", captureVideoSize,
+			"-framerate", captureFramerate,
+			"-f", "dshow",
+			"-i", device,
+		}
 	case "darwin":
 		mid = []string{"-f", "avfoundation"}
 		if darwin.framerate != "" {
@@ -329,7 +364,13 @@ func buildFFmpegArgsForMJPEGPipe(device string, darwin avConfig) []string {
 		// device timebase so each frame gets a real, monotonic timestamp.
 		mid = append(mid, "-use_wallclock_as_timestamps", "1", "-i", device)
 	default:
-		mid = []string{"-f", "v4l2", "-i", device}
+		mid = []string{
+			"-fflags", "+nobuffer",
+			"-video_size", captureVideoSize,
+			"-framerate", captureFramerate,
+			"-f", "v4l2",
+			"-i", device,
+		}
 	}
 	return append(append(globals, mid...), tail...)
 }
@@ -1033,6 +1074,8 @@ func main() {
 						stopPreviewInternal("Camera preview ended")
 						return
 					}
+					var ended bool
+					jpegBytes, ended = coalesceLatestFrame(frames, jpegBytes)
 					img, err := jpeg.Decode(bytes.NewReader(jpegBytes))
 					if err != nil {
 						continue
@@ -1054,6 +1097,10 @@ func main() {
 						previewImage.Image = rendered
 						previewImage.Refresh()
 					})
+					if ended {
+						stopPreviewInternal("Camera preview ended")
+						return
+					}
 				}
 			}
 		}()
@@ -1157,6 +1204,20 @@ func main() {
 		}()
 
 		go func() {
+			wsMu.Lock()
+			c := wsConn
+			wsMu.Unlock()
+			if c == nil {
+				cameraLog("WS disconnected before stream")
+				stopStreaming()
+				return
+			}
+			// Refresh clinic registration once (connectWS already sent on dial).
+			if clinic := strings.TrimSpace(clinicNameEntry.Text); clinic != "" {
+				metaJSON, _ := json.Marshal(map[string]string{"clinic_name": clinic})
+				_ = c.WriteMessage(websocket.TextMessage, metaJSON)
+			}
+
 			for {
 				select {
 				case <-ctx.Done():
@@ -1167,20 +1228,24 @@ func main() {
 						stopStreaming()
 						return
 					}
-					currentClinic := strings.TrimSpace(clinicNameEntry.Text)
-					meta := map[string]string{"clinic_name": currentClinic}
-					metaJSON, _ := json.Marshal(meta)
+					var ended bool
+					jpegBytes, ended = coalesceLatestFrame(frames, jpegBytes)
+
 					wsMu.Lock()
-					c := wsConn
+					c = wsConn
 					wsMu.Unlock()
 					if c == nil {
 						cameraLog("WS disconnected during stream")
 						stopStreaming()
 						return
 					}
-					_ = c.WriteMessage(websocket.TextMessage, metaJSON)
 					if err := c.WriteMessage(websocket.BinaryMessage, jpegBytes); err != nil {
 						cameraLog(fmt.Sprintf("WS send error: %v", err))
+						stopStreaming()
+						return
+					}
+					if ended {
+						cameraLog("Stream: ffmpeg ended")
 						stopStreaming()
 						return
 					}
