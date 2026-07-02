@@ -527,6 +527,7 @@ var (
 	previewCancel context.CancelFunc
 	wsConn        *websocket.Conn
 	wsMu          sync.Mutex
+	feedWriteMu   sync.Mutex // serializes feed WS writes (frames, pings, metadata)
 	wsCancel      context.CancelFunc
 	streamCancel  context.CancelFunc
 
@@ -549,6 +550,30 @@ var (
 	sharedCamCancel context.CancelFunc
 	sharedCamFrames []chan []byte
 )
+
+func writeFeedMessage(messageType int, data []byte) error {
+	wsMu.Lock()
+	c := wsConn
+	wsMu.Unlock()
+	if c == nil {
+		return fmt.Errorf("feed websocket not connected")
+	}
+	feedWriteMu.Lock()
+	defer feedWriteMu.Unlock()
+	return c.WriteMessage(messageType, data)
+}
+
+func writeFeedControl(messageType int, data []byte, deadline time.Time) error {
+	wsMu.Lock()
+	c := wsConn
+	wsMu.Unlock()
+	if c == nil {
+		return fmt.Errorf("feed websocket not connected")
+	}
+	feedWriteMu.Lock()
+	defer feedWriteMu.Unlock()
+	return c.WriteControl(messageType, data, deadline)
+}
 
 func subscribeSharedCamera(ctx context.Context, device string, fps int, logFn func(string)) (<-chan []byte, func(), error) {
 	sharedCamMu.Lock()
@@ -1215,7 +1240,7 @@ func main() {
 			// Refresh clinic registration once (connectWS already sent on dial).
 			if clinic := strings.TrimSpace(clinicNameEntry.Text); clinic != "" {
 				metaJSON, _ := json.Marshal(map[string]string{"clinic_name": clinic})
-				_ = c.WriteMessage(websocket.TextMessage, metaJSON)
+				_ = writeFeedMessage(websocket.TextMessage, metaJSON)
 			}
 
 			for {
@@ -1239,7 +1264,7 @@ func main() {
 						stopStreaming(false)
 						return
 					}
-					if err := c.WriteMessage(websocket.BinaryMessage, jpegBytes); err != nil {
+					if err := writeFeedMessage(websocket.BinaryMessage, jpegBytes); err != nil {
 						cameraLog(fmt.Sprintf("WS send error: %v", err))
 						stopStreaming(false)
 						return
@@ -1873,7 +1898,7 @@ func main() {
 		if clinic != "" {
 			meta := map[string]string{"clinic_name": clinic}
 			mj, _ := json.Marshal(meta)
-			c.WriteMessage(websocket.TextMessage, mj)
+			_ = writeFeedMessage(websocket.TextMessage, mj)
 		}
 
 		go func() {
@@ -1904,7 +1929,7 @@ func main() {
 				for {
 					select {
 					case <-ticker.C:
-						_ = c.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
+						_ = writeFeedControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
 					case <-wsPingStop:
 						return
 					}
@@ -1954,16 +1979,17 @@ func main() {
 
 	disconnectWS := func() {
 		wsMu.Lock()
-		if wsConn != nil {
-			wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "bye"))
-			wsConn.Close()
-		}
+		c := wsConn
 		if wsCancel != nil {
 			wsCancel()
 		}
 		wsConn = nil
 		wsCancel = nil
 		wsMu.Unlock()
+		if c != nil {
+			_ = writeFeedMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "bye"))
+			c.Close()
+		}
 		wsStatus.SetText("WS: Disconnected")
 	}
 
@@ -2188,9 +2214,11 @@ func main() {
 	}
 
 	startBroadcast = func() {
-		if err := connectChatWS(); err != nil {
-			log(fmt.Sprintf("Chat auto-connect failed (non-fatal): %v", err))
-		}
+		go func() {
+			if err := connectChatWS(); err != nil {
+				log(fmt.Sprintf("Chat auto-connect failed (non-fatal): %v", err))
+			}
+		}()
 		go startMicStreaming()
 		startStreaming()
 	}
