@@ -2604,6 +2604,9 @@ func runCLIOnce(ctx context.Context, cmdPath string, args []string, parser LineP
 			result.receivedOutput = true
 
 			if dataMap, ok := data.(map[string]interface{}); ok {
+				if !shouldSendReading(dataMap) {
+					continue
+				}
 				dataMap["patient_name"] = patientName
 				dataMap["clinic_name"] = clinicName
 			}
@@ -2934,6 +2937,15 @@ func normalizeWindowsDeviceName(device string) string {
 }
 
 // --- Parsers (Copied from legacy/main.go) ---
+
+func shouldSendReading(data map[string]interface{}) bool {
+	switch t, _ := data["type"].(string); t {
+	case "cuff_update", "status", "error", "discovery":
+		return false
+	default:
+		return true
+	}
+}
 
 // Heart Rate / SpO2
 // Output: DATA:PR=75,SPO2=98
