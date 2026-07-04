@@ -1,6 +1,11 @@
 package main
 
-import "time"
+import (
+	"encoding/json"
+	"path/filepath"
+	"strings"
+	"time"
+)
 
 func readingPayload(raw map[string]interface{}) map[string]interface{} {
 	if nested, ok := raw["data"].(map[string]interface{}); ok {
@@ -87,4 +92,50 @@ func readingItemFromRecord(r Record) map[string]interface{} {
 
 func isDisplayableReading(item map[string]interface{}) bool {
 	return shouldPersistReading(item)
+}
+
+func writeMetricRecordFile(path string, record Record) error {
+	data, err := json.MarshalIndent([]Record{record}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return saveFile(path, data)
+}
+
+func findLatestMetricRecord(dir, metric string) (string, Record, bool) {
+	files, err := listFiles(dir)
+	if err != nil {
+		return "", Record{}, false
+	}
+
+	prefix := metric + "_"
+	var latestFile string
+	var latestTS int64
+
+	for _, name := range files {
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		ts := metricFilenameTS(name)
+		if ts >= latestTS {
+			latestTS = ts
+			latestFile = name
+		}
+	}
+
+	if latestFile == "" {
+		return "", Record{}, false
+	}
+
+	b, err := readFile(filepath.Join(dir, latestFile))
+	if err != nil {
+		return "", Record{}, false
+	}
+
+	var recs []Record
+	if err := json.Unmarshal(b, &recs); err != nil || len(recs) == 0 {
+		return "", Record{}, false
+	}
+
+	return latestFile, recs[len(recs)-1], true
 }

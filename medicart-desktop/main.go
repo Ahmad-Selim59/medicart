@@ -12,6 +12,7 @@ import (
 	_ "image/gif"
 	_ "image/png"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -2593,6 +2594,7 @@ func runCLIOnce(ctx context.Context, cmdPath string, args []string, parser LineP
 	}
 
 	scanner := bufio.NewScanner(stdout)
+	var pendingReading map[string]interface{}
 	for scanner.Scan() {
 		line := scanner.Text()
 		data, err := parser(line)
@@ -2607,14 +2609,17 @@ func runCLIOnce(ctx context.Context, cmdPath string, args []string, parser LineP
 				if !shouldSendReading(dataMap) {
 					continue
 				}
-				dataMap["patient_name"] = patientName
-				dataMap["clinic_name"] = clinicName
+				pendingReading = maps.Clone(dataMap)
 			}
+		}
+	}
 
-			log(fmt.Sprintf("Sending data: %v", data))
-			if err := sendData(targetURL, data); err != nil {
-				log(fmt.Sprintf("Error sending data: %v", err))
-			}
+	if pendingReading != nil {
+		pendingReading["patient_name"] = patientName
+		pendingReading["clinic_name"] = clinicName
+		log(fmt.Sprintf("Sending reading: %v", pendingReading))
+		if err := sendData(targetURL, pendingReading); err != nil {
+			log(fmt.Sprintf("Error sending data: %v", err))
 		}
 	}
 

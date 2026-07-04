@@ -257,6 +257,86 @@ func TestBuildPatientFiltersCuffUpdates(t *testing.T) {
 	}
 }
 
+func TestSaveRecordCoalescesSessionReadings(t *testing.T) {
+	os.RemoveAll("data")
+	defer os.RemoveAll("data")
+
+	base := time.Now()
+	for i := 0; i < 3; i++ {
+		record := Record{
+			Timestamp:   base.Add(time.Duration(i) * 2 * time.Second),
+			PatientName: "Ahmad",
+			ClinicName:  "TestClinic",
+			RawData: map[string]interface{}{
+				"pr":   70 + i,
+				"spo2": 98,
+			},
+		}
+		if err := saveRecord(record); err != nil {
+			t.Fatalf("saveRecord %d failed: %v", i, err)
+		}
+	}
+
+	dir := filepath.Join("data", "TestClinic", "Ahmad")
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("failed to read dir: %v", err)
+	}
+
+	var hrFiles []string
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "heart_rate_") {
+			hrFiles = append(hrFiles, f.Name())
+		}
+	}
+	if len(hrFiles) != 1 {
+		t.Fatalf("expected 1 heart_rate file for one session, got %d: %v", len(hrFiles), hrFiles)
+	}
+
+	patient := buildPatient("TestClinic", "Ahmad")
+	hr, ok := patient.Data["heartRate"].([]interface{})
+	if !ok || len(hr) != 1 {
+		t.Fatalf("expected 1 heartRate reading in API response, got %v", patient.Data["heartRate"])
+	}
+}
+
+func TestSaveRecordSeparateSessions(t *testing.T) {
+	os.RemoveAll("data")
+	defer os.RemoveAll("data")
+
+	base := time.Now()
+	for i := 0; i < 2; i++ {
+		record := Record{
+			Timestamp:   base.Add(time.Duration(i) * 2 * time.Minute),
+			PatientName: "Ahmad",
+			ClinicName:  "TestClinic",
+			RawData: map[string]interface{}{
+				"pr":   70 + i,
+				"spo2": 98,
+			},
+		}
+		if err := saveRecord(record); err != nil {
+			t.Fatalf("saveRecord %d failed: %v", i, err)
+		}
+	}
+
+	dir := filepath.Join("data", "TestClinic", "Ahmad")
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("failed to read dir: %v", err)
+	}
+
+	var hrFiles []string
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "heart_rate_") {
+			hrFiles = append(hrFiles, f.Name())
+		}
+	}
+	if len(hrFiles) != 2 {
+		t.Fatalf("expected 2 heart_rate files for two sessions, got %d", len(hrFiles))
+	}
+}
+
 func TestSaveRecord(t *testing.T) {
 	// Create a temporary data directory
 	os.RemoveAll("data")

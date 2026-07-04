@@ -20,6 +20,9 @@ import (
 
 const maxReadingsPerMetric = 3
 
+// Readings arriving within this window are treated as one measurement session.
+const readingSessionGap = 45 * time.Second
+
 type DataStorage struct {
 	Records []Record `json:"records"`
 }
@@ -236,16 +239,18 @@ func saveRecord(record Record) error {
 		baseFilename = "misc"
 	}
 
+	if latestFile, latestRecord, ok := findLatestMetricRecord(dir, baseFilename); ok {
+		gap := record.Timestamp.Sub(latestRecord.Timestamp)
+		if gap >= 0 && gap < readingSessionGap {
+			path := filepath.Join(dir, latestFile)
+			return writeMetricRecordFile(path, record)
+		}
+	}
+
 	filename := fmt.Sprintf("%s_%d.json", baseFilename, record.Timestamp.Unix())
 	path := filepath.Join(dir, filename)
 
-	recordsToSave := []Record{record}
-
-	data, err := json.MarshalIndent(recordsToSave, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := saveFile(path, data); err != nil {
+	if err := writeMetricRecordFile(path, record); err != nil {
 		return err
 	}
 	return pruneMetricReadings(dir, baseFilename, maxReadingsPerMetric)
