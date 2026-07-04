@@ -38,6 +38,19 @@ func payloadHasPositiveNumber(payload map[string]interface{}, key string) bool {
 	}
 }
 
+func payloadHasNumber(payload map[string]interface{}, key string) bool {
+	v, ok := payload[key]
+	if !ok {
+		return false
+	}
+	switch v.(type) {
+	case float64, int, int64, json.Number:
+		return true
+	default:
+		return false
+	}
+}
+
 func shouldPersistReading(raw map[string]interface{}) bool {
 	if _, ok := profilePayloadFromRecord(raw); ok {
 		return false
@@ -57,7 +70,7 @@ func shouldPersistReading(raw map[string]interface{}) bool {
 	if payloadHasPositiveNumber(payload, "sys") && payloadHasPositiveNumber(payload, "dia") {
 		return true
 	}
-	if payloadHasPositiveNumber(payload, "pr") || payloadHasPositiveNumber(payload, "spo2") {
+	if payloadHasNumber(payload, "pr") || payloadHasNumber(payload, "spo2") {
 		return true
 	}
 	if payloadHasPositiveNumber(payload, "glu") {

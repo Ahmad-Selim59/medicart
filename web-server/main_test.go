@@ -337,6 +337,47 @@ func TestSaveRecordSeparateSessions(t *testing.T) {
 	}
 }
 
+func TestShouldPersistReadingAcceptsZeroHeartRate(t *testing.T) {
+	raw := map[string]interface{}{
+		"type": "data",
+		"pr":   0,
+		"spo2": 0,
+	}
+	if !shouldPersistReading(raw) {
+		t.Fatal("expected zero heart rate reading to be persisted")
+	}
+}
+
+func TestBuildPatientIncludesZeroHeartRate(t *testing.T) {
+	os.RemoveAll("data")
+	defer os.RemoveAll("data")
+
+	base := time.Now()
+	readings := []map[string]interface{}{
+		{"pr": 0, "spo2": 0},
+		{"pr": 56, "spo2": 98},
+		{"pr": 56, "spo2": 98},
+	}
+
+	for i, raw := range readings {
+		record := Record{
+			Timestamp:   base.Add(time.Duration(i) * 2 * time.Minute),
+			PatientName: "Ahmad Selim",
+			ClinicName:  "saab",
+			RawData:     raw,
+		}
+		if err := saveRecord(record); err != nil {
+			t.Fatalf("saveRecord %d failed: %v", i, err)
+		}
+	}
+
+	patient := buildPatient("saab", "Ahmad Selim")
+	hr, ok := patient.Data["heartRate"].([]interface{})
+	if !ok || len(hr) != 3 {
+		t.Fatalf("expected 3 heartRate readings including zero, got %v", patient.Data["heartRate"])
+	}
+}
+
 func TestSaveRecord(t *testing.T) {
 	// Create a temporary data directory
 	os.RemoveAll("data")
