@@ -31,7 +31,6 @@ type Patient struct {
 	Height      float64                `json:"height"`
 	Status      string                 `json:"status"`
 	Action      string                 `json:"action"`
-	LastChecked string                 `json:"lastChecked"`
 	Data        map[string]interface{} `json:"data"`
 }
 
@@ -56,6 +55,50 @@ func loadPatientProfile(clinicName, patientName string) PatientProfile {
 		return PatientProfile{}
 	}
 	return profile
+}
+
+func profilePayloadFromRecord(raw map[string]interface{}) (map[string]interface{}, bool) {
+	if t, ok := raw["type"].(string); ok && t == "profile" {
+		return raw, true
+	}
+	if nested, ok := raw["data"].(map[string]interface{}); ok {
+		if t, ok := nested["type"].(string); ok && t == "profile" {
+			return nested, true
+		}
+	}
+	return nil, false
+}
+
+func profileFromPayload(payload map[string]interface{}, patientName, clinicName, updatedAt string) PatientProfile {
+	return PatientProfile{
+		PatientName: patientName,
+		ClinicName:  clinicName,
+		Gender:      profileString(payload, "gender"),
+		Age:         profileInt(payload, "age"),
+		Weight:      profileFloat(payload, "weight"),
+		Height:      profileFloat(payload, "height"),
+		UpdatedAt:   updatedAt,
+	}
+}
+
+func mergePatientProfile(primary, fallback PatientProfile) PatientProfile {
+	merged := fallback
+	if primary.Gender != "" {
+		merged.Gender = primary.Gender
+	}
+	if primary.Age > 0 {
+		merged.Age = primary.Age
+	}
+	if primary.Weight > 0 {
+		merged.Weight = primary.Weight
+	}
+	if primary.Height > 0 {
+		merged.Height = primary.Height
+	}
+	if primary.UpdatedAt != "" {
+		merged.UpdatedAt = primary.UpdatedAt
+	}
+	return merged
 }
 
 func readingTimestamp(item interface{}) int64 {
@@ -160,6 +203,8 @@ func buildPatient(clinicName string, patientName string) Patient {
 	files, err := listFiles(dir)
 
 	realData := make(map[string]interface{})
+	var latestMiscProfile PatientProfile
+	var latestMiscProfileTS int64
 
 	if err == nil {
 		for _, name := range files {
@@ -188,6 +233,19 @@ func buildPatient(clinicName string, patientName string) Patient {
 
 					var innerData []interface{}
 					for _, r := range recs {
+						if payload, ok := profilePayloadFromRecord(r.RawData); ok {
+							if ts := r.Timestamp.Unix(); ts >= latestMiscProfileTS {
+								latestMiscProfileTS = ts
+								latestMiscProfile = profileFromPayload(
+									payload,
+									patientName,
+									clinicName,
+									r.Timestamp.UTC().Format(time.RFC3339),
+								)
+							}
+							continue
+						}
+
 						item := make(map[string]interface{}, len(r.RawData)+1)
 						for k, v := range r.RawData {
 							item[k] = v
@@ -215,7 +273,7 @@ func buildPatient(clinicName string, patientName string) Patient {
 		}
 	}
 
-	profile := loadPatientProfile(clinicName, patientName)
+	profile := mergePatientProfile(loadPatientProfile(clinicName, patientName), latestMiscProfile)
 	gender := "Unknown"
 	age := 0
 	weight := 0.0
@@ -241,10 +299,9 @@ func buildPatient(clinicName string, patientName string) Patient {
 		Age:         age,
 		Weight:      weight,
 		Height:      height,
-		Status:      "stable",
-		Action:      "View",
-		LastChecked: profile.UpdatedAt,
-		Data:        realData,
+		Status:   "stable",
+		Action:   "View",
+		Data:     realData,
 	}
 }
 

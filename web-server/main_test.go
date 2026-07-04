@@ -68,6 +68,18 @@ func TestMetricFile(t *testing.T) {
 			expected: "ecg",
 		},
 		{
+			name: "Patient Nested in Data",
+			payload: map[string]interface{}{
+				"patient_name": "Test",
+				"data": map[string]interface{}{
+					"type":   "profile",
+					"gender": "Male",
+					"age":    24,
+				},
+			},
+			expected: "profile",
+		},
+		{
 			name: "Misc Data",
 			payload: map[string]interface{}{
 				"patient_name": "Test",
@@ -130,6 +142,49 @@ func TestSavePatientProfile(t *testing.T) {
 	patient := buildPatient("TestClinic", "Ahmad")
 	if patient.Gender != "Male" || patient.Age != 62 || patient.Weight != 85 || patient.Height != 180 {
 		t.Fatalf("unexpected patient profile: %+v", patient)
+	}
+}
+
+func TestBuildPatientProfileFromMisc(t *testing.T) {
+	os.RemoveAll("data")
+	defer os.RemoveAll("data")
+
+	record := Record{
+		Timestamp:   time.Now(),
+		PatientName: "Ahmad Selim",
+		ClinicName:  "saab",
+		RawData: map[string]interface{}{
+			"patient_name": "Ahmad Selim",
+			"clinic_name":  "saab",
+			"data": map[string]interface{}{
+				"type":   "profile",
+				"gender": "Male",
+				"age":    24,
+				"weight": 83.0,
+				"height": 178.0,
+			},
+		},
+	}
+
+	if err := saveRecord(record); err != nil {
+		t.Fatalf("saveRecord failed: %v", err)
+	}
+
+	patient := buildPatient("saab", "Ahmad Selim")
+	if patient.Gender != "Male" {
+		t.Fatalf("expected gender Male, got %q", patient.Gender)
+	}
+	if patient.Age != 24 {
+		t.Fatalf("expected age 24, got %d", patient.Age)
+	}
+	if patient.Weight != 83 {
+		t.Fatalf("expected weight 83, got %v", patient.Weight)
+	}
+	if patient.Height != 178 {
+		t.Fatalf("expected height 178, got %v", patient.Height)
+	}
+	if misc, ok := patient.Data["misc"]; ok {
+		t.Fatalf("expected profile records to be excluded from misc data, got %v", misc)
 	}
 }
 

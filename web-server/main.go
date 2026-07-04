@@ -159,29 +159,14 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if t, ok := data["type"].(string); ok && t == "profile" {
-		if strings.TrimSpace(patientName) == "" || patientName == "Unknown" {
-			http.Error(w, "patient_name required", http.StatusBadRequest)
-			return
-		}
-		if strings.TrimSpace(clinicName) == "" || clinicName == "Unknown" {
-			http.Error(w, "clinic_name required", http.StatusBadRequest)
-			return
-		}
-		record := Record{
-			Timestamp:   time.Now(),
-			PatientName: patientName,
-			ClinicName:  clinicName,
-			RawData:     data,
-		}
-		if err := savePatientProfile(record); err != nil {
-			log.Printf("Error saving patient profile: %v", err)
-			http.Error(w, "Failed to save profile", http.StatusInternalServerError)
-			return
-		}
-		log.Printf("Saved profile for patient: %s", patientName)
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Profile saved successfully")
+		saveProfileFromIngest(w, patientName, clinicName, data)
 		return
+	}
+	if nested, ok := data["data"].(map[string]interface{}); ok {
+		if t, ok := nested["type"].(string); ok && t == "profile" {
+			saveProfileFromIngest(w, patientName, clinicName, nested)
+			return
+		}
 	}
 
 	record := Record{
@@ -207,6 +192,31 @@ func ensureStorageFile() {
 	defer fileMutex.Unlock()
 
 	// no-op legacy
+}
+
+func saveProfileFromIngest(w http.ResponseWriter, patientName, clinicName string, profileData map[string]interface{}) {
+	if strings.TrimSpace(patientName) == "" || patientName == "Unknown" {
+		http.Error(w, "patient_name required", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(clinicName) == "" || clinicName == "Unknown" {
+		http.Error(w, "clinic_name required", http.StatusBadRequest)
+		return
+	}
+	record := Record{
+		Timestamp:   time.Now(),
+		PatientName: patientName,
+		ClinicName:  clinicName,
+		RawData:     profileData,
+	}
+	if err := savePatientProfile(record); err != nil {
+		log.Printf("Error saving patient profile: %v", err)
+		http.Error(w, "Failed to save profile", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("Saved profile for patient: %s", patientName)
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "Profile saved successfully")
 }
 
 func saveRecord(record Record) error {
@@ -594,6 +604,8 @@ func metricFile(data map[string]interface{}) string {
 		lowerKeys[strings.ToLower(k)] = true
 	}
 	switch {
+	case lowerKeys["type"] && payload["type"] == "profile":
+		return "profile"
 	case lowerKeys["type"] && payload["type"] == "ecg":
 		return "ecg"
 	case lowerKeys["pr"] || lowerKeys["spo2"]:
