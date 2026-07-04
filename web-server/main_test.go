@@ -188,6 +188,75 @@ func TestBuildPatientProfileFromMisc(t *testing.T) {
 	}
 }
 
+func TestShouldPersistReadingSkipsCuffUpdate(t *testing.T) {
+	raw := map[string]interface{}{
+		"type":          "cuff_update",
+		"cuff_pressure": 41,
+	}
+	if shouldPersistReading(raw) {
+		t.Fatal("expected cuff_update to be ignored")
+	}
+}
+
+func TestShouldPersistReadingAcceptsNIBPResult(t *testing.T) {
+	raw := map[string]interface{}{
+		"type": "result",
+		"sys":  120,
+		"dia":  80,
+	}
+	if !shouldPersistReading(raw) {
+		t.Fatal("expected NIBP result to be persisted")
+	}
+}
+
+func TestBuildPatientFiltersCuffUpdates(t *testing.T) {
+	os.RemoveAll("data")
+	defer os.RemoveAll("data")
+
+	base := time.Now()
+	for i := 0; i < 3; i++ {
+		record := Record{
+			Timestamp:   base.Add(time.Duration(i) * time.Second),
+			PatientName: "Ahmad Selim",
+			ClinicName:  "saab",
+			RawData: map[string]interface{}{
+				"type":          "cuff_update",
+				"cuff_pressure": 40 + i,
+			},
+		}
+		if err := saveRecord(record); err != nil {
+			t.Fatalf("saveRecord cuff_update %d failed: %v", i, err)
+		}
+	}
+
+	result := Record{
+		Timestamp:   base.Add(4 * time.Second),
+		PatientName: "Ahmad Selim",
+		ClinicName:  "saab",
+		RawData: map[string]interface{}{
+			"type": "result",
+			"sys":  122,
+			"dia":  81,
+		},
+	}
+	if err := saveRecord(result); err != nil {
+		t.Fatalf("saveRecord result failed: %v", err)
+	}
+
+	patient := buildPatient("saab", "Ahmad Selim")
+	bp, ok := patient.Data["bloodPressure"].([]interface{})
+	if !ok {
+		t.Fatalf("expected bloodPressure data")
+	}
+	if len(bp) != 1 {
+		t.Fatalf("expected 1 blood pressure reading, got %d", len(bp))
+	}
+	reading := bp[0].(map[string]interface{})
+	if profileInt(reading, "sys") != 122 || profileInt(reading, "dia") != 81 {
+		t.Fatalf("unexpected blood pressure reading: %+v", reading)
+	}
+}
+
 func TestSaveRecord(t *testing.T) {
 	// Create a temporary data directory
 	os.RemoveAll("data")

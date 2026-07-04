@@ -246,12 +246,9 @@ func buildPatient(clinicName string, patientName string) Patient {
 							continue
 						}
 
-						item := make(map[string]interface{}, len(r.RawData)+1)
-						for k, v := range r.RawData {
-							item[k] = v
-						}
-						if _, hasTS := item["timestamp"]; !hasTS {
-							item["timestamp"] = r.Timestamp.UTC().Format(time.RFC3339)
+						item := readingItemFromRecord(r)
+						if !isDisplayableReading(item) {
+							continue
 						}
 						innerData = append(innerData, item)
 					}

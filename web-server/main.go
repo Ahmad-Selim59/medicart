@@ -176,6 +176,12 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 		RawData:     data,
 	}
 
+	if !shouldPersistReading(data) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Ignored non-persistent reading")
+		return
+	}
+
 	if err := saveRecord(record); err != nil {
 		log.Printf("Error saving record: %v", err)
 		http.Error(w, "Failed to save data", http.StatusInternalServerError)
@@ -610,7 +616,7 @@ func metricFile(data map[string]interface{}) string {
 		return "ecg"
 	case lowerKeys["pr"] || lowerKeys["spo2"]:
 		return "heart_rate"
-	case lowerKeys["sys"] || lowerKeys["dia"] || lowerKeys["cuff_pressure"]:
+	case lowerKeys["sys"] || lowerKeys["dia"]:
 		return "bp"
 	case lowerKeys["glu"]:
 		return "glucose"
