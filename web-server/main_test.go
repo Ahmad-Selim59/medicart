@@ -46,6 +46,17 @@ func TestMetricFile(t *testing.T) {
 			expected: "bp",
 		},
 		{
+			name: "Blood Pressure with pulse rate",
+			payload: map[string]interface{}{
+				"type": "result",
+				"sys":  120,
+				"dia":  80,
+				"map":  93,
+				"pr":   70,
+			},
+			expected: "bp",
+		},
+		{
 			name: "Stethoscope Audio Stream",
 			payload: map[string]interface{}{
 				"patient_name": "Test",
@@ -237,6 +248,8 @@ func TestBuildPatientFiltersCuffUpdates(t *testing.T) {
 			"type": "result",
 			"sys":  122,
 			"dia":  81,
+			"map":  95,
+			"pr":   68,
 		},
 	}
 	if err := saveRecord(result); err != nil {
@@ -254,6 +267,26 @@ func TestBuildPatientFiltersCuffUpdates(t *testing.T) {
 	reading := bp[0].(map[string]interface{})
 	if profileInt(reading, "sys") != 122 || profileInt(reading, "dia") != 81 {
 		t.Fatalf("unexpected blood pressure reading: %+v", reading)
+	}
+
+	dir := filepath.Join("data", "saab", "Ahmad Selim")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read patient dir: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "heart_rate_") {
+			t.Fatalf("NIBP result with pr must not be saved as heart_rate, found %s", entry.Name())
+		}
+	}
+	var bpFiles []string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "bp_") {
+			bpFiles = append(bpFiles, entry.Name())
+		}
+	}
+	if len(bpFiles) != 1 {
+		t.Fatalf("expected 1 bp file, got %d: %v", len(bpFiles), bpFiles)
 	}
 }
 

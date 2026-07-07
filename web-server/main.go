@@ -619,10 +619,10 @@ func metricFile(data map[string]interface{}) string {
 		return "profile"
 	case lowerKeys["type"] && payload["type"] == "ecg":
 		return "ecg"
-	case lowerKeys["pr"] || lowerKeys["spo2"]:
-		return "heart_rate"
 	case lowerKeys["sys"] || lowerKeys["dia"]:
 		return "bp"
+	case lowerKeys["pr"] || lowerKeys["spo2"]:
+		return "heart_rate"
 	case lowerKeys["glu"]:
 		return "glucose"
 	case lowerKeys["temp"]:
