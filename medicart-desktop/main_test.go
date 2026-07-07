@@ -5,6 +5,8 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -82,7 +84,7 @@ func TestRunCLIOnceRetriesUntilOutput(t *testing.T) {
 	var logs []string
 	logFn := func(msg string) { logs = append(logs, msg) }
 
-	result := runCLIOnce(ctx, "sh", []string{tmp.Name(), "fail"}, parseHeartRateLine, "http://127.0.0.1:1", "Clinic", "Patient", logFn)
+	result := runCLIOnce(ctx, cancel, "sh", []string{tmp.Name(), "fail"}, parseHeartRateLine, readingSessionContinuous, "http://127.0.0.1:1", "Clinic", "Patient", logFn)
 	if result.succeeded() {
 		t.Fatalf("expected failed attempt, got %+v", result)
 	}
@@ -90,9 +92,81 @@ func TestRunCLIOnceRetriesUntilOutput(t *testing.T) {
 		t.Fatal("expected error message on failed attempt")
 	}
 
-	result = runCLIOnce(ctx, "sh", []string{tmp.Name(), "ok"}, parseHeartRateLine, "http://127.0.0.1:1", "Clinic", "Patient", logFn)
+	result = runCLIOnce(ctx, cancel, "sh", []string{tmp.Name(), "ok"}, parseHeartRateLine, readingSessionContinuous, "http://127.0.0.1:1", "Clinic", "Patient", logFn)
 	if !result.succeeded() || !result.receivedOutput {
 		t.Fatalf("expected successful attempt with output, got %+v", result)
+	}
+}
+
+func TestIsFinalReading(t *testing.T) {
+	cases := []struct {
+		name string
+		data map[string]interface{}
+		want bool
+	}{
+		{name: "nibp result", data: map[string]interface{}{"type": "result", "sys": 120}, want: true},
+		{name: "glucose", data: map[string]interface{}{"type": "data", "glu": 105}, want: true},
+		{name: "temperature", data: map[string]interface{}{"type": "data", "temp": 36.5}, want: true},
+		{name: "heart rate", data: map[string]interface{}{"type": "data", "pr": 75, "spo2": 98}, want: false},
+		{name: "cuff update", data: map[string]interface{}{"type": "cuff_update", "cuff_pressure": 120}, want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isFinalReading(tc.data); got != tc.want {
+				t.Fatalf("isFinalReading() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunCLIOnceAutoStopsOnNIBPResult(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+
+	script := `echo "DATA:CUFF_PRESSURE=120"
+echo "DATA:NIBP_RESULT:SYS=120,DIA=80,MAP=93,PR=70"
+sleep 60
+`
+	tmp, err := os.CreateTemp("", "medicart-cli-nibp-*.sh")
+	if err != nil {
+		t.Fatalf("create temp script: %v", err)
+	}
+	defer os.Remove(tmp.Name())
+
+	if _, err := tmp.WriteString(script); err != nil {
+		t.Fatalf("write temp script: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatalf("close temp script: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var logs []string
+	logFn := func(msg string) { logs = append(logs, msg) }
+
+	result := runCLIOnce(ctx, cancel, "sh", []string{tmp.Name()}, parseNIBPLine, readingSessionFinal, srv.URL, "Clinic", "Patient", logFn)
+	if !result.completed {
+		t.Fatalf("expected auto-complete after NIBP result, got %+v", result)
+	}
+	if !result.receivedOutput {
+		t.Fatal("expected output from NIBP session")
+	}
+
+	logText := strings.Join(logs, "\n")
+	if !strings.Contains(logText, "Final reading received.") {
+		t.Fatalf("expected final-reading log, got: %s", logText)
+	}
+	if !strings.Contains(logText, "Sending reading:") {
+		t.Fatalf("expected send log, got: %s", logText)
 	}
 }
 

@@ -59,6 +59,17 @@ const (
 	cliRetryDelay  = 2 * time.Second
 )
 
+// readingIdleTimeout is how long heart rate / SpO2 waits for new samples before
+// saving the last value and stopping automatically.
+const readingIdleTimeout = 3 * time.Second
+
+type readingSessionKind int
+
+const (
+	readingSessionContinuous readingSessionKind = iota // heart rate — stop after idle
+	readingSessionFinal                                // NIBP, glucose, temp — stop on final reading
+)
+
 // blankFrame is a 1x1 fully transparent image used in place of nil so that
 // canvas.Image always has content. A visible canvas.Image with nil content
 // thrashes the GL texture cache (see fyne issue #4345), evicting cached
@@ -830,7 +841,7 @@ func main() {
 		})
 	}
 
-	stopBtn = widget.NewButtonWithIcon("Emergency Stop", theme.MediaStopIcon(), func() {
+	stopBtn = widget.NewButtonWithIcon("Stop", theme.MediaStopIcon(), func() {
 		cmdMutex.Lock()
 		defer cmdMutex.Unlock()
 		if cancelFunc != nil {
@@ -838,7 +849,7 @@ func main() {
 			log("Stopping process...")
 		}
 	})
-	stopBtn.Importance = widget.DangerImportance
+	stopBtn.Importance = widget.MediumImportance
 	stopBtn.Disable()
 
 	btnHeartRate := widget.NewButtonWithIcon("Heart Rate / SpO2", theme.MediaPlayIcon(), func() {
@@ -2562,12 +2573,43 @@ func main() {
 
 type cliAttemptResult struct {
 	cancelled      bool
+	completed      bool // auto-stopped after final reading or idle timeout
 	receivedOutput bool
 	errMsg         string
 }
 
 func (r cliAttemptResult) succeeded() bool {
-	return r.receivedOutput || r.errMsg == ""
+	return r.receivedOutput || r.completed || r.errMsg == ""
+}
+
+func readingSessionKindForName(name string) readingSessionKind {
+	switch name {
+	case "HeartRate":
+		return readingSessionContinuous
+	default:
+		return readingSessionFinal
+	}
+}
+
+func isFinalReading(data map[string]interface{}) bool {
+	switch t, _ := data["type"].(string); t {
+	case "result":
+		return true
+	case "data":
+		_, hasGlu := data["glu"]
+		_, hasTemp := data["temp"]
+		return hasGlu || hasTemp
+	default:
+		return false
+	}
+}
+
+func sendReadingPayload(log func(string), targetURL, clinicName, patientName string, data map[string]interface{}) error {
+	payload := maps.Clone(data)
+	payload["patient_name"] = patientName
+	payload["clinic_name"] = clinicName
+	log(fmt.Sprintf("Sending reading: %v", payload))
+	return sendData(targetURL, payload)
 }
 
 func resolveCLIPath(name string) string {
@@ -2585,7 +2627,7 @@ func resolveCLIPath(name string) string {
 	return cmdPath
 }
 
-func runCLIOnce(ctx context.Context, cmdPath string, args []string, parser LineParser, targetURL, clinicName, patientName string, log func(string)) cliAttemptResult {
+func runCLIOnce(ctx context.Context, cancel context.CancelFunc, cmdPath string, args []string, parser LineParser, sessionKind readingSessionKind, targetURL, clinicName, patientName string, log func(string)) cliAttemptResult {
 	result := cliAttemptResult{}
 
 	if ctx.Err() != nil {
@@ -2622,37 +2664,136 @@ func runCLIOnce(ctx context.Context, cmdPath string, args []string, parser LineP
 	}
 
 	scanner := bufio.NewScanner(stdout)
-	var pendingReading map[string]interface{}
-	for scanner.Scan() {
-		line := scanner.Text()
-		data, err := parser(line)
-		if err != nil {
-			continue
+	lineCh := make(chan string)
+	scanDone := make(chan struct{})
+	go func() {
+		for scanner.Scan() {
+			lineCh <- scanner.Text()
 		}
+		close(lineCh)
+		close(scanDone)
+	}()
 
-		if data != nil {
+	var pendingReading map[string]interface{}
+	var idleTimer *time.Timer
+	var idleC <-chan time.Time
+	resetIdle := func() {
+		if sessionKind != readingSessionContinuous {
+			return
+		}
+		if idleTimer == nil {
+			idleTimer = time.NewTimer(readingIdleTimeout)
+			idleC = idleTimer.C
+			return
+		}
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(readingIdleTimeout)
+	}
+	if sessionKind == readingSessionContinuous {
+		resetIdle()
+	}
+	defer func() {
+		if idleTimer != nil {
+			idleTimer.Stop()
+		}
+	}()
+
+	finishAfterSend := func(reason string) cliAttemptResult {
+		if pendingReading == nil {
+			result.errMsg = "no reading to send"
+			cancel()
+			<-scanDone
+			_ = cmd.Wait()
+			return result
+		}
+		if reason != "" {
+			log(reason)
+		}
+		if err := sendReadingPayload(log, targetURL, clinicName, patientName, pendingReading); err != nil {
+			log(fmt.Sprintf("Error sending data: %v", err))
+			result.errMsg = err.Error()
+		} else {
+			result.completed = true
+		}
+		cancel()
+		<-scanDone
+		_ = cmd.Wait()
+		return result
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			goto flush
+		case <-idleC:
+			if pendingReading == nil {
+				log("No readings received.")
+				cancel()
+				<-scanDone
+				result.errMsg = "no data received from device"
+				_ = cmd.Wait()
+				return result
+			}
+			return finishAfterSend("No new readings — saving last value.")
+		case line, ok := <-lineCh:
+			if !ok {
+				goto flush
+			}
+			resetIdle()
+
+			data, err := parser(line)
+			if err != nil {
+				continue
+			}
+			if data == nil {
+				continue
+			}
+
 			result.receivedOutput = true
+			dataMap, ok := data.(map[string]interface{})
+			if !ok {
+				continue
+			}
 
-			if dataMap, ok := data.(map[string]interface{}); ok {
-				if !shouldSendReading(dataMap) {
-					continue
-				}
-				pendingReading = maps.Clone(dataMap)
+			if dataMap["type"] == "error" {
+				log(fmt.Sprintf("Device error: %v", dataMap))
+				cancel()
+				<-scanDone
+				result.errMsg = fmt.Sprintf("device error: %v", dataMap)
+				_ = cmd.Wait()
+				return result
+			}
+			if !shouldSendReading(dataMap) {
+				continue
+			}
+
+			pendingReading = maps.Clone(dataMap)
+			if sessionKind == readingSessionFinal && isFinalReading(dataMap) {
+				return finishAfterSend("Final reading received.")
 			}
 		}
 	}
 
-	if pendingReading != nil {
-		pendingReading["patient_name"] = patientName
-		pendingReading["clinic_name"] = clinicName
-		log(fmt.Sprintf("Sending reading: %v", pendingReading))
-		if err := sendData(targetURL, pendingReading); err != nil {
+flush:
+	if pendingReading != nil && !result.completed {
+		if err := sendReadingPayload(log, targetURL, clinicName, patientName, pendingReading); err != nil {
 			log(fmt.Sprintf("Error sending data: %v", err))
+		} else {
+			result.completed = true
 		}
 	}
 
+	<-scanDone
 	waitErr := cmd.Wait()
 	if ctx.Err() == context.Canceled {
+		if result.completed {
+			return result
+		}
 		result.cancelled = true
 		return result
 	}
@@ -2704,14 +2845,18 @@ func runCLIAndSend(name string, args []string, parser LineParser, targetURL stri
 			log(fmt.Sprintf("Starting %s (%s)...", name, cmdPath))
 		}
 
-		result := runCLIOnce(ctx, cmdPath, args, parser, targetURL, clinicName, patientName, log)
+		result := runCLIOnce(ctx, cancel, cmdPath, args, parser, readingSessionKindForName(name), targetURL, clinicName, patientName, log)
 		if result.cancelled {
 			log("Process stopped by user.")
 			return
 		}
-		if result.succeeded() {
+		if result.completed || result.succeeded() {
 			if result.receivedOutput {
-				log("Process finished successfully.")
+				if result.completed {
+					log("Reading complete.")
+				} else {
+					log("Process finished successfully.")
+				}
 			}
 			return
 		}
