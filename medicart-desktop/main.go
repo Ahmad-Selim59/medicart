@@ -2643,7 +2643,11 @@ func normalizeCLILine(line string) string {
 }
 
 func defaultAppBaseDir() string {
-	if exe, err := os.Executable(); err == nil {
+	exe, err := os.Executable()
+	if err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		}
 		dir := filepath.Dir(exe)
 		if !isGoBuildCacheDir(dir) {
 			return dir
@@ -2664,33 +2668,41 @@ func isGoBuildCacheDir(dir string) bool {
 		strings.Contains(dir, filepath.Join(os.TempDir(), "go-build"))
 }
 
+func bundledCLIPath(exeName string) string {
+	return filepath.Join(appBaseDir(), dependenciesDir, exeName)
+}
+
 func resolveDependencyCLI(exeName string) string {
-	if path, err := exec.LookPath(exeName); err == nil {
-		return path
+	if bundled := bundledCLIPath(exeName); fileExists(bundled) {
+		return mustAbs(bundled)
 	}
 
-	base := appBaseDir()
-	candidates := []string{
-		filepath.Join(base, dependenciesDir, exeName),
-		filepath.Join(".", exeName),
+	if path, err := exec.LookPath(exeName); err == nil && fileExists(path) {
+		return mustAbs(path)
 	}
-	for _, candidate := range candidates {
-		if _, err := os.Stat(candidate); err == nil {
-			abs, err := filepath.Abs(candidate)
-			if err == nil {
-				return abs
-			}
-			return candidate
-		}
+
+	if local := filepath.Join(".", exeName); fileExists(local) {
+		return mustAbs(local)
 	}
-	return filepath.Join(base, dependenciesDir, exeName)
+
+	return mustAbs(bundledCLIPath(exeName))
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func mustAbs(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	return abs
 }
 
 func configureDependencyCmd(cmd *exec.Cmd, cmdPath string) {
-	abs, err := filepath.Abs(cmdPath)
-	if err != nil {
-		return
-	}
+	abs := mustAbs(cmdPath)
 	cmd.Path = abs
 	if len(cmd.Args) > 0 {
 		cmd.Args[0] = abs
