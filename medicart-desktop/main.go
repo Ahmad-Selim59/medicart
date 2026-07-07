@@ -543,6 +543,9 @@ var (
 	chatWsMu     sync.Mutex
 	chatWsCancel context.CancelFunc
 
+	// Bounded timeout so ingest calls cannot hang the UI thread indefinitely.
+	ingestHTTPClient = &http.Client{Timeout: 15 * time.Second}
+
 	// Shared Camera Manager
 	sharedCamMu     sync.Mutex
 	sharedCamRef    int
@@ -2297,7 +2300,8 @@ func main() {
 	btnChatSend.Importance = widget.HighImportance
 	chatInput.OnSubmitted = func(string) { sendChatMessage() }
 
-	btnSaveSettings := widget.NewButtonWithIcon("Save Settings", theme.DocumentSaveIcon(), func() {
+	var btnSaveSettings *widget.Button
+	btnSaveSettings = widget.NewButtonWithIcon("Save Settings", theme.DocumentSaveIcon(), func() {
 		newCfg := AppConfig{
 			ServerBase:    strings.TrimSpace(serverBaseEntry.Text),
 			ClinicName:    strings.TrimSpace(clinicNameEntry.Text),
@@ -2309,12 +2313,20 @@ func main() {
 			StethMAC:      strings.TrimSpace(stethMacEntry.Text),
 			LightMode:     lightModeCheck.Checked,
 		}
-		if err := saveAppConfig(newCfg); err != nil {
-			log(fmt.Sprintf("Error saving settings: %v", err))
-		} else {
-			log(fmt.Sprintf("Settings saved (server: %s)", newCfg.ServerBase))
-			dialog.ShowInformation("Saved Successfully", "Your settings have been saved successfully.", myWindow)
-		}
+		btnSaveSettings.Disable()
+		log("Saving settings...")
+		go func(cfg AppConfig) {
+			err := saveAppConfig(cfg)
+			fyne.Do(func() {
+				btnSaveSettings.Enable()
+				if err != nil {
+					log(fmt.Sprintf("Error saving settings: %v", err))
+					return
+				}
+				log(fmt.Sprintf("Settings saved (server: %s)", cfg.ServerBase))
+				dialog.ShowInformation("Saved Successfully", "Your settings have been saved successfully.", myWindow)
+			})
+		}(newCfg)
 	})
 	btnSaveSettings.Importance = widget.HighImportance
 
@@ -2343,6 +2355,7 @@ func main() {
 		genderSelect.SetSelected(cfg.PatientGender)
 	}
 
+	var btnSavePatient *widget.Button
 	savePatientProfile := func() {
 		base := strings.TrimSpace(serverBaseEntry.Text)
 		if base == "" {
@@ -2379,11 +2392,6 @@ func main() {
 			StethMAC:      strings.TrimSpace(stethMacEntry.Text),
 			LightMode:     lightModeCheck.Checked,
 		}
-		if err := saveAppConfig(newCfg); err != nil {
-			log(fmt.Sprintf("Error saving patient info locally: %v", err))
-			return
-		}
-
 		payload := map[string]interface{}{
 			"type":         "profile",
 			"patient_name": patientName,
@@ -2393,15 +2401,33 @@ func main() {
 			"weight":       weight,
 			"height":       height,
 		}
-		if err := sendData(ingestURL(base), payload); err != nil {
-			log(fmt.Sprintf("Patient profile upload failed: %v", err))
-			return
-		}
-		log("Patient profile saved")
-		dialog.ShowInformation("Saved Successfully", "Patient profile has been saved successfully.", myWindow)
+
+		btnSavePatient.Disable()
+		log("Saving patient profile...")
+		go func(cfg AppConfig, uploadURL string, body map[string]interface{}) {
+			if err := saveAppConfig(cfg); err != nil {
+				fyne.Do(func() {
+					btnSavePatient.Enable()
+					log(fmt.Sprintf("Error saving patient info locally: %v", err))
+				})
+				return
+			}
+			if err := sendData(uploadURL, body); err != nil {
+				fyne.Do(func() {
+					btnSavePatient.Enable()
+					log(fmt.Sprintf("Patient profile upload failed: %v", err))
+				})
+				return
+			}
+			fyne.Do(func() {
+				btnSavePatient.Enable()
+				log("Patient profile saved")
+				dialog.ShowInformation("Saved Successfully", "Patient profile has been saved successfully.", myWindow)
+			})
+		}(newCfg, ingestURL(base), payload)
 	}
 
-	btnSavePatient := widget.NewButtonWithIcon("Save Patient Info", theme.DocumentSaveIcon(), savePatientProfile)
+	btnSavePatient = widget.NewButtonWithIcon("Save Patient Info", theme.DocumentSaveIcon(), savePatientProfile)
 	btnSavePatient.Importance = widget.HighImportance
 
 	patientOverview := container.NewGridWithColumns(2,
@@ -2705,7 +2731,7 @@ func sendData(url string, data interface{}) error {
 		return err
 	}
 
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	resp, err := ingestHTTPClient.Post(url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return err
 	}
