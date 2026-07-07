@@ -2313,6 +2313,7 @@ func main() {
 			log(fmt.Sprintf("Error saving settings: %v", err))
 		} else {
 			log(fmt.Sprintf("Settings saved (server: %s)", newCfg.ServerBase))
+			dialog.ShowInformation("Saved Successfully", "Your settings have been saved successfully.", myWindow)
 		}
 	})
 	btnSaveSettings.Importance = widget.HighImportance
@@ -2397,6 +2398,7 @@ func main() {
 			return
 		}
 		log("Patient profile saved")
+		dialog.ShowInformation("Saved Successfully", "Patient profile has been saved successfully.", myWindow)
 	}
 
 	btnSavePatient := widget.NewButtonWithIcon("Save Patient Info", theme.DocumentSaveIcon(), savePatientProfile)
