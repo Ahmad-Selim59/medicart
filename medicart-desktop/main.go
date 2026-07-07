@@ -63,6 +63,9 @@ const (
 // saving the last value and stopping automatically.
 const readingIdleTimeout = 3 * time.Second
 
+// cliShutdownTimeout bounds how long we wait for lepu_cli to exit after cancel.
+const cliShutdownTimeout = 2 * time.Second
+
 type readingSessionKind int
 
 const (
@@ -728,9 +731,10 @@ func main() {
 
 	// Status Area
 	statusLabel := widget.NewRichTextFromMarkdown("Status: Idle")
-	logArea := widget.NewMultiLineEntry()
-	logArea.Disable()
-	logArea.SetMinRowsVisible(10)
+	logRich := widget.NewRichText()
+	logRich.Wrapping = fyne.TextWrapWord
+	logScroll := container.NewScroll(logRich)
+	logScroll.SetMinSize(fyne.NewSize(0, 180))
 
 	// Camera-specific log shown inside the Comms tab so camera errors
 	// don't pollute the readings Live Console.
@@ -767,7 +771,13 @@ func main() {
 	log := func(msg string) {
 		fyne.Do(func() {
 			timestamp := time.Now().Format("15:04:05")
-			logArea.SetText(fmt.Sprintf("[%s] %s\n%s", timestamp, msg, logArea.Text))
+			line := fmt.Sprintf("[%s] %s\n", timestamp, msg)
+			style := widget.RichTextStyle{ColorName: theme.ColorNameForeground}
+			logRich.Segments = append(
+				[]widget.RichTextSegment{&widget.TextSegment{Text: line, Style: style}},
+				logRich.Segments...,
+			)
+			logRich.Refresh()
 
 			statusText := "Status: " + msg
 			isError := strings.HasPrefix(msg, "Error") || strings.Contains(strings.ToLower(msg), "error")
@@ -849,7 +859,7 @@ func main() {
 			log("Stopping process...")
 		}
 	})
-	stopBtn.Importance = widget.MediumImportance
+	stopBtn.Importance = widget.DangerImportance
 	stopBtn.Disable()
 
 	btnHeartRate := widget.NewButtonWithIcon("Heart Rate / SpO2", theme.MediaPlayIcon(), func() {
@@ -2481,7 +2491,7 @@ func main() {
 		widget.NewSeparator(),
 		widget.NewCard("Live Console", "System Active", container.NewVBox(
 			statusLabel,
-			container.NewStack(logArea),
+			container.NewStack(logScroll),
 			stopBtn,
 		)),
 	)
@@ -2612,6 +2622,28 @@ func sendReadingPayload(log func(string), targetURL, clinicName, patientName str
 	return sendData(targetURL, payload)
 }
 
+func waitCLIShutdown(scanDone <-chan struct{}, cmd *exec.Cmd) error {
+	select {
+	case <-scanDone:
+	case <-time.After(cliShutdownTimeout):
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		select {
+		case <-scanDone:
+		case <-time.After(cliShutdownTimeout):
+		}
+	}
+	return cmd.Wait()
+}
+
+func normalizeCLILine(line string) string {
+	normalized := strings.TrimSpace(line)
+	normalized = strings.TrimPrefix(normalized, "\ufeff")
+	normalized = strings.ReplaceAll(normalized, " ", "")
+	return strings.ToUpper(normalized)
+}
+
 func resolveCLIPath(name string) string {
 	cmdPath := "lepu_cli.exe"
 	if name == "StethoscopeList" || name == "StethoscopeStream" {
@@ -2707,8 +2739,7 @@ func runCLIOnce(ctx context.Context, cancel context.CancelFunc, cmdPath string, 
 		if pendingReading == nil {
 			result.errMsg = "no reading to send"
 			cancel()
-			<-scanDone
-			_ = cmd.Wait()
+			go waitCLIShutdown(scanDone, cmd)
 			return result
 		}
 		if reason != "" {
@@ -2721,8 +2752,7 @@ func runCLIOnce(ctx context.Context, cancel context.CancelFunc, cmdPath string, 
 			result.completed = true
 		}
 		cancel()
-		<-scanDone
-		_ = cmd.Wait()
+		go waitCLIShutdown(scanDone, cmd)
 		return result
 	}
 
@@ -2734,9 +2764,8 @@ func runCLIOnce(ctx context.Context, cancel context.CancelFunc, cmdPath string, 
 			if pendingReading == nil {
 				log("No readings received.")
 				cancel()
-				<-scanDone
+				go waitCLIShutdown(scanDone, cmd)
 				result.errMsg = "no data received from device"
-				_ = cmd.Wait()
 				return result
 			}
 			return finishAfterSend("No new readings — saving last value.")
@@ -2763,9 +2792,8 @@ func runCLIOnce(ctx context.Context, cancel context.CancelFunc, cmdPath string, 
 			if dataMap["type"] == "error" {
 				log(fmt.Sprintf("Device error: %v", dataMap))
 				cancel()
-				<-scanDone
+				go waitCLIShutdown(scanDone, cmd)
 				result.errMsg = fmt.Sprintf("device error: %v", dataMap)
-				_ = cmd.Wait()
 				return result
 			}
 			if !shouldSendReading(dataMap) {
@@ -2788,8 +2816,7 @@ flush:
 		}
 	}
 
-	<-scanDone
-	waitErr := cmd.Wait()
+	waitErr := waitCLIShutdown(scanDone, cmd)
 	if ctx.Err() == context.Canceled {
 		if result.completed {
 			return result
@@ -3223,9 +3250,9 @@ func parseNIBPLine(line string) (interface{}, error) {
 
 // Glucose
 func parseGlucoseLine(line string) (interface{}, error) {
-	line = strings.TrimSpace(line)
-	if strings.HasPrefix(line, "DATA:GLU=") {
-		valStr := strings.TrimPrefix(line, "DATA:GLU=")
+	normalized := normalizeCLILine(line)
+	if strings.HasPrefix(normalized, "DATA:GLU=") {
+		valStr := strings.TrimPrefix(normalized, "DATA:GLU=")
 		val, _ := strconv.Atoi(valStr)
 		return map[string]interface{}{
 			"type": "data",
@@ -3237,9 +3264,12 @@ func parseGlucoseLine(line string) (interface{}, error) {
 
 // Temperature
 func parseTemperatureLine(line string) (interface{}, error) {
-	line = strings.TrimSpace(line)
-	if strings.HasPrefix(line, "DATA:TEMP=") {
-		valStr := strings.TrimPrefix(line, "DATA:TEMP=")
+	normalized := normalizeCLILine(line)
+	if strings.HasPrefix(normalized, "DATA:TEMP=") {
+		valStr := strings.TrimPrefix(normalized, "DATA:TEMP=")
+		if idx := strings.Index(valStr, ","); idx >= 0 {
+			valStr = valStr[:idx]
+		}
 		val, err := strconv.ParseFloat(valStr, 64)
 		if err != nil {
 			return nil, err

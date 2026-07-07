@@ -120,6 +120,37 @@ func TestIsFinalReading(t *testing.T) {
 	}
 }
 
+func TestParseTemperatureLine(t *testing.T) {
+	cases := []struct {
+		line string
+		want float64
+	}{
+		{line: "DATA:TEMP=36.5", want: 36.5},
+		{line: "data: temp=37.1", want: 37.1},
+		{line: "DATA:TEMP=36.2,UNIT=C", want: 36.2},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.line, func(t *testing.T) {
+			got, err := parseTemperatureLine(tc.line)
+			if err != nil {
+				t.Fatalf("parseTemperatureLine() error = %v", err)
+			}
+			data, ok := got.(map[string]interface{})
+			if !ok {
+				t.Fatalf("expected map result, got %T", got)
+			}
+			if !isFinalReading(data) {
+				t.Fatal("expected temperature reading to be final")
+			}
+			temp, ok := data["temp"].(float64)
+			if !ok || temp != tc.want {
+				t.Fatalf("temp = %v, want %v", data["temp"], tc.want)
+			}
+		})
+	}
+}
+
 func TestRunCLIOnceAutoStopsOnNIBPResult(t *testing.T) {
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("sh not available")
