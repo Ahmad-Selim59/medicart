@@ -66,6 +66,8 @@ const readingIdleTimeout = 3 * time.Second
 // cliShutdownTimeout bounds how long we wait for lepu_cli to exit after cancel.
 const cliShutdownTimeout = 2 * time.Second
 
+const dependenciesDir = "dependencies"
+
 type readingSessionKind int
 
 const (
@@ -943,14 +945,12 @@ func main() {
 		if mac == "" {
 			// If no MAC is entered, try to auto-detect if there's exactly one device
 
-			cmdPath := "MinttiCLI.exe"
-			if _, err := exec.LookPath(cmdPath); err != nil {
-				cmdPath = "./MinttiCLI.exe"
-			}
+			cmdPath := resolveDependencyCLI("MinttiCLI.exe")
 
 			// Run a quick scan to see if we can find exactly one device
 			go func() {
 				cmd := exec.Command(cmdPath, "-list")
+				configureDependencyCmd(cmd, cmdPath)
 				output, err := cmd.CombinedOutput()
 				if err != nil {
 					log(fmt.Sprintf("Auto-scan failed: %v", err))
@@ -995,12 +995,10 @@ func main() {
 		go func() {
 			cameraLog(fmt.Sprintf("Camera: %s ...", action))
 
-			cmdPath := "camera_cli.exe"
-			if _, err := exec.LookPath(cmdPath); err != nil {
-				cmdPath = "./camera_cli.exe"
-			}
+			cmdPath := resolveDependencyCLI("camera_cli.exe")
 
 			cmd := exec.Command(cmdPath, args...)
+			configureDependencyCmd(cmd, cmdPath)
 			outputBytes, err := cmd.CombinedOutput()
 			output := strings.TrimSpace(string(outputBytes))
 
@@ -2644,19 +2642,70 @@ func normalizeCLILine(line string) string {
 	return strings.ToUpper(normalized)
 }
 
+func defaultAppBaseDir() string {
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		if !isGoBuildCacheDir(dir) {
+			return dir
+		}
+	}
+	wd, err := os.Getwd()
+	if err != nil || wd == "" {
+		return "."
+	}
+	return wd
+}
+
+var appBaseDir = defaultAppBaseDir
+
+func isGoBuildCacheDir(dir string) bool {
+	base := filepath.Base(dir)
+	return strings.HasPrefix(base, "go-build") ||
+		strings.Contains(dir, filepath.Join(os.TempDir(), "go-build"))
+}
+
+func resolveDependencyCLI(exeName string) string {
+	if path, err := exec.LookPath(exeName); err == nil {
+		return path
+	}
+
+	base := appBaseDir()
+	candidates := []string{
+		filepath.Join(base, dependenciesDir, exeName),
+		filepath.Join(".", exeName),
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			abs, err := filepath.Abs(candidate)
+			if err == nil {
+				return abs
+			}
+			return candidate
+		}
+	}
+	return filepath.Join(base, dependenciesDir, exeName)
+}
+
+func configureDependencyCmd(cmd *exec.Cmd, cmdPath string) {
+	abs, err := filepath.Abs(cmdPath)
+	if err != nil {
+		return
+	}
+	cmd.Path = abs
+	if len(cmd.Args) > 0 {
+		cmd.Args[0] = abs
+	}
+	if dir := filepath.Dir(abs); dir != "" && dir != "." {
+		cmd.Dir = dir
+	}
+}
+
 func resolveCLIPath(name string) string {
 	cmdPath := "lepu_cli.exe"
 	if name == "StethoscopeList" || name == "StethoscopeStream" {
 		cmdPath = "MinttiCLI.exe"
 	}
-
-	if _, err := exec.LookPath(cmdPath); err != nil {
-		if name == "StethoscopeList" || name == "StethoscopeStream" {
-			return "./MinttiCLI.exe"
-		}
-		return "./lepu_cli.exe"
-	}
-	return cmdPath
+	return resolveDependencyCLI(cmdPath)
 }
 
 func runCLIOnce(ctx context.Context, cancel context.CancelFunc, cmdPath string, args []string, parser LineParser, sessionKind readingSessionKind, targetURL, clinicName, patientName string, log func(string)) cliAttemptResult {
@@ -2668,6 +2717,7 @@ func runCLIOnce(ctx context.Context, cancel context.CancelFunc, cmdPath string, 
 	}
 
 	cmd := exec.CommandContext(ctx, cmdPath, args...)
+	configureDependencyCmd(cmd, cmdPath)
 
 	cmdMutex.Lock()
 	currentCmd = cmd

@@ -19,7 +19,20 @@ This application acts as a bridge between local medical devices (via `lepu_cli.e
     *   **Windows**: MSYS2 with Mingw-w64 or TDM-GCC.
     *   **macOS**: Xcode Command Line Tools (`xcode-select --install`).
     *   **Linux**: GCC (`sudo apt install gcc`).
-3.  **lepu_cli.exe**: The driver executable for the medical devices. This file must be present in the system PATH or in the same directory as the application.
+3.  **Device CLIs** (Windows): Place executables and their full publish output in `dependencies/` next to the desktop app:
+
+    ```
+    medicart-desktop-windows-386/
+    ├── medicart-desktop-windows-386.exe
+    └── dependencies/
+        ├── lepu_cli.exe
+        ├── lepu_cli.dll
+        ├── camera_cli.exe
+        ├── MinttiCLI.exe          (optional — stethoscope only)
+        └── runtimes/              (required by lepu_cli — keep inside dependencies/)
+    ```
+
+    Paths are resolved from the folder containing the desktop executable. Each CLI runs with `dependencies/` as its working directory so DLLs and `runtimes/` load correctly. CLIs can also be placed on the system PATH.
 
 ## Installation
 
