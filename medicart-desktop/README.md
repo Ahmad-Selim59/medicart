@@ -19,7 +19,7 @@ This application acts as a bridge between local medical devices (via `lepu_cli.e
     *   **Windows**: MSYS2 with Mingw-w64 or TDM-GCC.
     *   **macOS**: Xcode Command Line Tools (`xcode-select --install`).
     *   **Linux**: GCC (`sudo apt install gcc`).
-3.  **lepu_cli.exe**: The driver executable for the medical devices. This file must be present in the system PATH or in the same directory as the application.
+3.  **Device CLIs**: Place `lepu_cli.exe`, `MinttiCLI.exe`, and `camera_cli.exe` in the `dependencies/` folder next to the application (or ensure they are on the system PATH).
 
 ## Installation
 
