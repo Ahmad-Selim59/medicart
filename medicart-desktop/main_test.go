@@ -22,31 +22,6 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-func TestResolveDependencyCLIUsesAppBaseDir(t *testing.T) {
-	tmp := t.TempDir()
-	deps := filepath.Join(tmp, dependenciesDir)
-	if err := os.MkdirAll(deps, 0o755); err != nil {
-		t.Fatalf("mkdir dependencies: %v", err)
-	}
-	exePath := filepath.Join(deps, "lepu_cli.exe")
-	if err := os.WriteFile(exePath, []byte("fake"), 0o755); err != nil {
-		t.Fatalf("write fake exe: %v", err)
-	}
-
-	orig := appBaseDir
-	appBaseDir = func() string { return tmp }
-	t.Cleanup(func() { appBaseDir = orig })
-
-	got := resolveDependencyCLI("lepu_cli.exe")
-	want, err := filepath.Abs(exePath)
-	if err != nil {
-		t.Fatalf("abs exe path: %v", err)
-	}
-	if got != want {
-		t.Fatalf("resolveDependencyCLI() = %q, want %q", got, want)
-	}
-}
-
 func TestCLIAttemptSucceeded(t *testing.T) {
 	cases := []struct {
 		name   string
