@@ -950,7 +950,7 @@ func main() {
 			// Run a quick scan to see if we can find exactly one device
 			go func() {
 				cmd := exec.Command(cmdPath, "-list")
-				setCLIDir(cmd, cmdPath)
+				configureDependencyCmd(cmd, cmdPath)
 				output, err := cmd.CombinedOutput()
 				if err != nil {
 					log(fmt.Sprintf("Auto-scan failed: %v", err))
@@ -998,7 +998,7 @@ func main() {
 			cmdPath := resolveDependencyCLI("camera_cli.exe")
 
 			cmd := exec.Command(cmdPath, args...)
-			setCLIDir(cmd, cmdPath)
+			configureDependencyCmd(cmd, cmdPath)
 			outputBytes, err := cmd.CombinedOutput()
 			output := strings.TrimSpace(string(outputBytes))
 
@@ -2642,20 +2642,60 @@ func normalizeCLILine(line string) string {
 	return strings.ToUpper(normalized)
 }
 
-func resolveDependencyCLI(exeName string) string {
-	if _, err := exec.LookPath(exeName); err == nil {
-		return exeName
+func defaultAppBaseDir() string {
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		if !isGoBuildCacheDir(dir) {
+			return dir
+		}
 	}
-	inDeps := filepath.Join(dependenciesDir, exeName)
-	if _, err := os.Stat(inDeps); err == nil {
-		return inDeps
+	wd, err := os.Getwd()
+	if err != nil || wd == "" {
+		return "."
 	}
-	return filepath.Join(".", exeName)
+	return wd
 }
 
-func setCLIDir(cmd *exec.Cmd, cmdPath string) {
-	if dir := filepath.Dir(cmdPath); dir != "." && dir != "" {
-		cmd.Dir = dir
+var appBaseDir = defaultAppBaseDir
+
+func isGoBuildCacheDir(dir string) bool {
+	base := filepath.Base(dir)
+	return strings.HasPrefix(base, "go-build") ||
+		strings.Contains(dir, filepath.Join(os.TempDir(), "go-build"))
+}
+
+func resolveDependencyCLI(exeName string) string {
+	if path, err := exec.LookPath(exeName); err == nil {
+		return path
+	}
+
+	base := appBaseDir()
+	candidates := []string{
+		filepath.Join(base, dependenciesDir, exeName),
+		filepath.Join(dependenciesDir, exeName),
+		filepath.Join(".", exeName),
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			abs, err := filepath.Abs(candidate)
+			if err == nil {
+				return abs
+			}
+			return candidate
+		}
+	}
+	return filepath.Join(base, dependenciesDir, exeName)
+}
+
+func configureDependencyCmd(cmd *exec.Cmd, cmdPath string) {
+	if abs, err := filepath.Abs(cmdPath); err == nil {
+		cmd.Path = abs
+		if len(cmd.Args) > 0 {
+			cmd.Args[0] = abs
+		}
+		if dir := filepath.Dir(abs); dir != "" && dir != "." {
+			cmd.Dir = dir
+		}
 	}
 }
 
@@ -2676,7 +2716,7 @@ func runCLIOnce(ctx context.Context, cancel context.CancelFunc, cmdPath string, 
 	}
 
 	cmd := exec.CommandContext(ctx, cmdPath, args...)
-	setCLIDir(cmd, cmdPath)
+	configureDependencyCmd(cmd, cmdPath)
 
 	cmdMutex.Lock()
 	currentCmd = cmd
