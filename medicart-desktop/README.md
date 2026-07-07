@@ -25,12 +25,13 @@ This application acts as a bridge between local medical devices (via `lepu_cli.e
     medicart-desktop-windows-386/
     ├── medicart-desktop-windows-386.exe
     ├── dependencies/
-    │   ├── lepu_cli.exe
+    │   ├── lepu_cli.exe      (full publish output — DLLs, deps.json, etc.)
     │   ├── camera_cli.exe
-    │       └── MinttiCLI.exe   (optional — stethoscope only)
+    │   └── MinttiCLI.exe     (optional — stethoscope only)
+    └── runtimes/             (if required by lepu_cli — keep next to the desktop exe)
     ```
 
-    Paths are resolved from the folder containing the desktop executable, not the current working directory. CLIs can also be placed on the system PATH.
+    Paths are resolved from the folder containing the desktop executable, not the current working directory. CLIs run with that folder as their working directory so sibling folders like `runtimes/` remain reachable. CLIs can also be placed on the system PATH.
 
 ## Installation
 

@@ -2587,7 +2587,7 @@ type cliAttemptResult struct {
 }
 
 func (r cliAttemptResult) succeeded() bool {
-	return r.receivedOutput || r.completed || r.errMsg == ""
+	return r.receivedOutput || r.completed
 }
 
 func readingSessionKindForName(name string) readingSessionKind {
@@ -2688,13 +2688,13 @@ func resolveDependencyCLI(exeName string) string {
 }
 
 func configureDependencyCmd(cmd *exec.Cmd, cmdPath string) {
+	base := appBaseDir()
+	cmd.Dir = base
+
 	if abs, err := filepath.Abs(cmdPath); err == nil {
 		cmd.Path = abs
 		if len(cmd.Args) > 0 {
 			cmd.Args[0] = abs
-		}
-		if dir := filepath.Dir(abs); dir != "" && dir != "." {
-			cmd.Dir = dir
 		}
 	}
 }
@@ -2910,16 +2910,15 @@ func runCLIAndSend(name string, args []string, parser LineParser, targetURL stri
 
 	for attempt := 1; attempt <= cliMaxAttempts; attempt++ {
 		if attempt > 1 {
-			log(fmt.Sprintf("Retrying %s (attempt %d/%d)...", name, attempt, cliMaxAttempts))
 			select {
 			case <-ctx.Done():
 				log("Process stopped by user.")
 				return
 			case <-time.After(cliRetryDelay):
 			}
-		} else {
-			log(fmt.Sprintf("Starting %s (%s)...", name, cmdPath))
 		}
+
+		log(fmt.Sprintf("Starting %s (attempt %d/%d, %s)...", name, attempt, cliMaxAttempts, cmdPath))
 
 		result := runCLIOnce(ctx, cancel, cmdPath, args, parser, readingSessionKindForName(name), targetURL, clinicName, patientName, log)
 		if result.cancelled {
