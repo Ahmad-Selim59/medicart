@@ -928,19 +928,14 @@ func main() {
 		}, myWindow)
 	})
 
-	// Stethoscope Buttons
-	var btnStethoscopeList *widget.Button
+	// Stethoscope
 	var stethMacEntry *widget.Entry
-
-	btnStethoscopeList = widget.NewButtonWithIcon("List Stethoscopes", theme.ListIcon(), func() {
-		startProcess("StethoscopeList", []string{"-list"}, parseStethoscopeLine)
-	})
 
 	stethMacEntry = widget.NewEntry()
 	stethMacEntry.SetPlaceHolder("AA:BB:CC:DD:EE:FF")
 	stethMacEntry.SetText(cfg.StethMAC)
 
-	btnStethoscopeConnect := widget.NewButtonWithIcon("Connect", theme.MediaPlayIcon(), func() {
+	btnStethoscope := widget.NewButtonWithIcon("Stethoscope", theme.MediaPlayIcon(), func() {
 		mac := strings.TrimSpace(stethMacEntry.Text)
 		if mac == "" {
 			// If no MAC is entered, try to auto-detect if there's exactly one device
@@ -2480,11 +2475,10 @@ func main() {
 			btnECGUpload,
 		)),
 		widget.NewSeparator(),
-		widget.NewCard("Connect Stethoscope", "Stream high-fidelity auscultation", container.NewVBox(
-			btnStethoscopeList,
-			widget.NewLabel("MAC Address:"),
+		widget.NewCard("Stethoscope", "Search, connect, and stream auscultation", container.NewVBox(
+			widget.NewLabel("MAC Address (optional):"),
 			stethMacEntry,
-			btnStethoscopeConnect,
+			btnStethoscope,
 		)),
 		widget.NewSeparator(),
 		widget.NewCard("Live Console", "System Active", container.NewVBox(
