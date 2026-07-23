@@ -872,9 +872,54 @@ func main() {
 		startProcess("NIBP", []string{"-nibp"}, parseNIBPLine)
 	})
 
-	btnGlucose := widget.NewButtonWithIcon("Glucose", theme.MediaPlayIcon(), func() {
-		startProcess("Glucose", []string{"-glu"}, parseGlucoseLine)
-	})
+	glucoseEntry := widget.NewEntry()
+	glucoseEntry.SetPlaceHolder("e.g. 105")
+
+	submitGlucose := func() {
+		base := strings.TrimSpace(serverBaseEntry.Text)
+		if base == "" {
+			log("Error: Enter a Server Base URL in Settings")
+			return
+		}
+		patientName := strings.TrimSpace(patientNameEntry.Text)
+		clinicName := strings.TrimSpace(clinicNameEntry.Text)
+		if patientName == "" {
+			log("Error: Enter a Patient Name in Patients tab")
+			return
+		}
+		if clinicName == "" {
+			log("Error: Enter a Clinic Name in Settings")
+			return
+		}
+
+		valStr := strings.TrimSpace(glucoseEntry.Text)
+		if valStr == "" {
+			log("Error: Enter a glucose value")
+			return
+		}
+		val, err := strconv.ParseFloat(valStr, 64)
+		if err != nil || val <= 0 {
+			log("Error: Glucose must be a positive number (mg/dL)")
+			return
+		}
+
+		payload := map[string]interface{}{
+			"patient_name": patientName,
+			"clinic_name":  clinicName,
+			"type":         "data",
+			"glu":          val,
+		}
+		if err := sendData(ingestURL(base), payload); err != nil {
+			log(fmt.Sprintf("Glucose upload failed: %v", err))
+			return
+		}
+		log(fmt.Sprintf("Glucose saved: %.0f mg/dL", val))
+		glucoseEntry.SetText("")
+	}
+
+	btnSaveGlucose := widget.NewButtonWithIcon("Save Glucose", theme.DocumentSaveIcon(), submitGlucose)
+	btnSaveGlucose.Importance = widget.HighImportance
+	glucoseEntry.OnSubmitted = func(string) { submitGlucose() }
 
 	btnTemp := widget.NewButtonWithIcon("Temperature", theme.MediaPlayIcon(), func() {
 		startProcess("Temperature", []string{"-temperature"}, parseTemperatureLine)
@@ -2467,9 +2512,14 @@ func main() {
 		container.NewGridWithColumns(2,
 			btnHeartRate,
 			btnNIBP,
-			btnGlucose,
 			btnTemp,
 		),
+		widget.NewSeparator(),
+		widget.NewCard("Blood Glucose", "Manual entry in mg/dL", container.NewVBox(
+			widget.NewLabel("Glucose (mg/dL):"),
+			glucoseEntry,
+			btnSaveGlucose,
+		)),
 		widget.NewSeparator(),
 		widget.NewCard("ECG", "Upload an ECG strip or snapshot image", container.NewVBox(
 			btnECGUpload,
@@ -3298,20 +3348,6 @@ func parseNIBPLine(line string) (interface{}, error) {
 		return map[string]interface{}{
 			"type": "status",
 			"msg":  "NIBP_END",
-		}, nil
-	}
-	return nil, nil
-}
-
-// Glucose
-func parseGlucoseLine(line string) (interface{}, error) {
-	normalized := normalizeCLILine(line)
-	if strings.HasPrefix(normalized, "DATA:GLU=") {
-		valStr := strings.TrimPrefix(normalized, "DATA:GLU=")
-		val, _ := strconv.Atoi(valStr)
-		return map[string]interface{}{
-			"type": "data",
-			"glu":  val,
 		}, nil
 	}
 	return nil, nil
