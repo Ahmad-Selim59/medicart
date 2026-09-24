@@ -317,6 +317,50 @@ func getAllPatients(allowedClinics []string) []Patient {
 	return patients
 }
 
+func buildClinicDistribution(patients []Patient) []map[string]interface{} {
+	counts := make(map[string]int)
+	for _, patient := range patients {
+		clinicName := patient.ClinicID
+		if clinicName == "" {
+			continue
+		}
+		counts[clinicName]++
+	}
+
+	distribution := make([]map[string]interface{}, 0, len(counts))
+	for name, count := range counts {
+		distribution = append(distribution, map[string]interface{}{
+			"name":     name,
+			"patients": count,
+		})
+	}
+	sort.Slice(distribution, func(i, j int) bool {
+		return distribution[i]["name"].(string) < distribution[j]["name"].(string)
+	})
+	return distribution
+}
+
+func buildPatientStatusBreakdown(patients []Patient) []map[string]interface{} {
+	counts := map[string]int{
+		"stable":   0,
+		"warning":  0,
+		"critical": 0,
+	}
+	for _, patient := range patients {
+		status := strings.ToLower(strings.TrimSpace(patient.Status))
+		if _, ok := counts[status]; !ok {
+			status = "stable"
+		}
+		counts[status]++
+	}
+
+	return []map[string]interface{}{
+		{"name": "Stable", "value": counts["stable"], "fill": "var(--chart-2)"},
+		{"name": "Warning", "value": counts["warning"], "fill": "var(--chart-4)"},
+		{"name": "Critical", "value": counts["critical"], "fill": "var(--chart-5)"},
+	}
+}
+
 func handleClinics(w http.ResponseWriter, r *http.Request) {
 	if preflight(w, r) {
 		return
@@ -362,6 +406,8 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 			"activeDevices": len(patients), // Assume 1 device per patient
 			"alertsCount":   0,
 		},
+		"clinicDistribution": buildClinicDistribution(patients),
+		"patientStatus":      buildPatientStatusBreakdown(patients),
 	}
 
 	writeJSON(w, dashboard)

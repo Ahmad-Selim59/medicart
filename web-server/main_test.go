@@ -569,3 +569,38 @@ func TestPruneMetricReadingsKeepsFewerThanLimit(t *testing.T) {
 		t.Fatalf("expected 2 heartRate readings in API response, got %v", patient.Data["heartRate"])
 	}
 }
+
+func TestDashboardDistributionPayload(t *testing.T) {
+	os.RemoveAll("data")
+	defer os.RemoveAll("data")
+
+	if err := os.MkdirAll(filepath.Join("data", "Alpha Clinic", "Patient One"), 0755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join("data", "Beta Clinic", "Patient Two"), 0755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+
+	clinics := getAllClinics(nil)
+	patients := getAllPatients(nil)
+
+	if len(clinics) != 2 {
+		t.Fatalf("expected 2 clinics, got %d", len(clinics))
+	}
+	if len(patients) != 2 {
+		t.Fatalf("expected 2 patients, got %d", len(patients))
+	}
+
+	distribution := buildClinicDistribution(patients)
+	if len(distribution) != 2 {
+		t.Fatalf("expected 2 distribution entries, got %d", len(distribution))
+	}
+
+	status := buildPatientStatusBreakdown(patients)
+	if len(status) != 3 {
+		t.Fatalf("expected 3 status slices, got %d", len(status))
+	}
+	if status[0]["value"].(int) != 2 {
+		t.Fatalf("expected 2 stable patients, got %v", status[0]["value"])
+	}
+}
