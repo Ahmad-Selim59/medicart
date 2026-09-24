@@ -13,6 +13,11 @@ echo "Pulling latest changes..."
 cd "$APP_DIR"
 git pull origin main
 
+### Rebuild server binary (git pull alone does not update the running binary)
+echo "Building web server..."
+cd "$WEB_DIR"
+go build -o medicart-server-ubuntu .
+
 ### Fix permissions (safe)
 sudo chown -R ubuntu:ubuntu "$APP_DIR"
 

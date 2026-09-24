@@ -74,5 +74,11 @@ GOOS=linux GOARCH=amd64 go build -o medicart-server-ubuntu .
 Copy `medicart-server-ubuntu` to the Ubuntu server (e.g. `/home/ubuntu/medicart/web-server/`) and restart the service:
 
 ```bash
+cd web-server
+go build -o medicart-server-ubuntu .
 sudo systemctl restart medicart
 ```
+
+Or from the repo root on the server, run `./deploy.sh` (pulls, rebuilds, and restarts).
+
+**Important:** `git pull` alone is not enough — the systemd service runs the compiled `medicart-server-ubuntu` binary. You must rebuild after pulling code changes.
