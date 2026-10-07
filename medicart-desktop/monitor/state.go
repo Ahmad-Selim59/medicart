@@ -41,6 +41,7 @@ type ConnectionMeta struct {
 	LastPacketAt    time.Time
 	SourceIP        string
 	PacketsReceived int64
+	PacketsFiltered int64
 	MessagesParsed  int64
 	ParseErrors     int64
 }
@@ -144,6 +145,13 @@ func (s *MonitorState) RecordMessagesParsed(n int) {
 	}
 	s.mu.Lock()
 	s.connection.MessagesParsed += int64(n)
+	s.mu.Unlock()
+}
+
+// RecordFilteredPacket counts a datagram dropped by the allow-IP filter.
+func (s *MonitorState) RecordFilteredPacket() {
+	s.mu.Lock()
+	s.connection.PacketsFiltered++
 	s.mu.Unlock()
 }
 

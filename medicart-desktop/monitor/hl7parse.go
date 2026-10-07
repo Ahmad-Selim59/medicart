@@ -272,28 +272,52 @@ func fieldComponent(field string, seps hl7Separators, idx int) string {
 	return strings.TrimSpace(parts[idx])
 }
 
+func isPlaceholderHL7(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return true
+	}
+	stripped := strings.Map(func(r rune) rune {
+		if r == '^' || r == '&' || r == '~' || r == ' ' {
+			return -1
+		}
+		return r
+	}, s)
+	return stripped == ""
+}
+
 func parsePID(seg hl7Segment, p *PatientSnapshot) {
 	// PID-3 patient ID list — first repetition, first component
 	if len(seg.fields) > 3 {
 		idField := seg.fields[3]
 		idParts := strings.Split(idField, string(seg.seps.repetition))
 		if len(idParts) > 0 {
-			p.PatientID = fieldComponent(idParts[0], seg.seps, 0)
+			candidate := fieldComponent(idParts[0], seg.seps, 0)
+			if !isPlaceholderHL7(candidate) {
+				p.PatientID = candidate
+			}
 		}
 		if p.PatientID == "" && len(seg.fields) > 3 {
 			// PID-3.4 facility
 			fac := fieldComponent(idField, seg.seps, 3)
-			if fac != "" && p.ClinicName == "" {
+			if !isPlaceholderHL7(fac) && p.ClinicName == "" {
 				p.ClinicName = fac
 			}
 		}
 	}
-	// PID-5 name: family^given
+	// PID-5 name: family^given (ZUG may send XCN — use first two components)
 	if len(seg.fields) > 5 {
 		family := fieldComponent(seg.fields[5], seg.seps, 0)
 		given := fieldComponent(seg.fields[5], seg.seps, 1)
-		if given != "" || family != "" {
+		if !isPlaceholderHL7(family) || !isPlaceholderHL7(given) {
 			p.PatientName = strings.TrimSpace(strings.TrimSpace(given) + " " + strings.TrimSpace(family))
+		}
+	}
+	// PID-2 alternate patient ID
+	if len(seg.fields) > 2 && strings.TrimSpace(p.PatientID) == "" {
+		candidate := strings.TrimSpace(seg.fields[2])
+		if !isPlaceholderHL7(candidate) {
+			p.PatientID = candidate
 		}
 	}
 	if len(seg.fields) > 7 {

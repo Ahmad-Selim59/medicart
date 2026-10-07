@@ -909,7 +909,6 @@ func main() {
 		monitorCancelMu.Unlock()
 		lc := monitorListenConfig(appCfg)
 		go monitor.Listen(ctx, lc, monitorState, func(msg string) { log(msg) })
-		log(fmt.Sprintf("TR8 monitor listening on %s:%d (UDP)", lc.BindHost, lc.UDPPort))
 	}
 
 	monitorState.SetPatientChangeHandler(func(p monitor.PatientSnapshot) {
@@ -1064,7 +1063,10 @@ func main() {
 		btnNIBP.SetIcon(icon)
 		btnTemp.SetIcon(icon)
 	}
-	monitorEnabledCheck.OnChanged = func(bool) { updateVitalButtonIcons() }
+	monitorEnabledCheck.OnChanged = func(checked bool) {
+		updateVitalButtonIcons()
+		startMonitorListener(monitorCfgFromUI())
+	}
 	updateVitalButtonIcons()
 
 	uploadECG := func(path string) {
@@ -2810,20 +2812,20 @@ func main() {
 	go func() {
 		tick := time.NewTicker(time.Second)
 		defer tick.Stop()
-		var lastUISyncKey string
 		for range tick.C {
 			if !monitorEnabledCheck.Checked {
+				fyne.Do(func() { monitorStatusLabel.SetText("Monitor: off (enable in Settings)") })
 				continue
 			}
 			snap := monitorState.Snapshot()
 			hr, spo2, nibp, temp := monitor.FormatVitalDisplay(snap.Vitals)
 			status := monitor.ConnectionStatusText(snap.Connection, time.Now(), snap.Vitals)
-			syncKey := strings.TrimSpace(snap.Patient.PatientID) + "|" + strings.TrimSpace(snap.Patient.PatientName)
-			shouldSyncPatient := syncKey != "" && syncKey != "|" && syncKey != lastUISyncKey
-			if shouldSyncPatient {
-				lastUISyncKey = syncKey
-			}
 			patientCopy := snap.Patient
+			shouldSyncPatient := strings.TrimSpace(patientCopy.PatientID) != "" ||
+				strings.TrimSpace(patientCopy.PatientName) != "" ||
+				strings.TrimSpace(patientCopy.BedID) != "" ||
+				patientCopy.Age > 0 ||
+				strings.TrimSpace(patientCopy.Gender) != ""
 			fyne.Do(func() {
 				monitorStatusLabel.SetText(status)
 				liveHRLabel.SetText(hr)
@@ -2837,7 +2839,7 @@ func main() {
 		}
 	}()
 
-	startMonitorListener(cfg)
+	startMonitorListener(monitorCfgFromUI())
 
 	myWindow.ShowAndRun()
 }

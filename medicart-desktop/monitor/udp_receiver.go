@@ -25,24 +25,27 @@ func Listen(ctx context.Context, cfg ListenConfig, state *MonitorState, onError 
 	if port <= 0 {
 		port = 5000
 	}
-	addr := fmt.Sprintf("%s:%d", host, port)
-
-	pc, err := net.ListenPacket("udp", addr)
+	pc, boundAddr, err := openUDPListen(host, port)
 	if err != nil {
 		if onError != nil {
-			onError(fmt.Sprintf("Monitor UDP listen failed on %s: %v", addr, err))
+			onError(fmt.Sprintf("Monitor UDP listen failed on %s: %v", boundAddr, err))
 		}
 		return
 	}
 	defer pc.Close()
 
-	state.SetListening(addr)
+	state.SetListening(boundAddr)
+	allowIP := strings.TrimSpace(cfg.AllowIP)
 	if onError != nil {
-		onError(fmt.Sprintf("Monitor UDP listening on %s", addr))
+		onError(fmt.Sprintf("Monitor UDP listening on %s (udp4)", boundAddr))
+		if allowIP != "" {
+			onError(fmt.Sprintf("Monitor: filtering UDP to source IP %s only", allowIP))
+		}
 	}
 
 	buf := make([]byte, 65507)
 	var packetsSeen int64
+	var filteredLogged bool
 	for {
 		select {
 		case <-ctx.Done():
@@ -65,21 +68,17 @@ func Listen(ctx context.Context, cfg ListenConfig, state *MonitorState, onError 
 				continue
 			}
 		}
-		if cfg.AllowIP != "" {
-			hostIP := remote.String()
-			if h, _, splitErr := net.SplitHostPort(hostIP); splitErr == nil {
-				hostIP = h
+		sourceIP := remoteIPString(remote)
+		if !ipAllowed(sourceIP, allowIP) {
+			state.RecordFilteredPacket()
+			if onError != nil && !filteredLogged {
+				filteredLogged = true
+				onError(fmt.Sprintf("Monitor: ignoring packets from %s (Allow IP is %q)", sourceIP, allowIP))
 			}
-			if hostIP != strings.TrimSpace(cfg.AllowIP) {
-				continue
-			}
+			continue
 		}
 
 		now := time.Now()
-		sourceIP := remote.String()
-		if h, _, splitErr := net.SplitHostPort(sourceIP); splitErr == nil {
-			sourceIP = h
-		}
 		state.RecordPacket(sourceIP, now)
 		packetsSeen++
 

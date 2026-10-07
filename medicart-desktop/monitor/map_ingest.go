@@ -177,8 +177,11 @@ func ConnectionStatusText(c ConnectionMeta, now time.Time, vitals VitalsSnapshot
 	if addr == "" {
 		addr = "0.0.0.0:5000"
 	}
+	if c.PacketsFiltered > 0 && c.PacketsReceived == 0 {
+		return fmt.Sprintf("Monitor: listening on %s — packets arrive but are blocked by Allow IP filter (%d dropped)", addr, c.PacketsFiltered)
+	}
 	if c.LastPacketAt.IsZero() {
-		return fmt.Sprintf("Monitor: listening on %s — no UDP packets yet (check TR8 target IP, port %s, and firewall)", addr, addr)
+		return fmt.Sprintf("Monitor: listening on %s — no UDP packets yet (only one program can use this port; close PowerShell test listeners)", addr)
 	}
 	ago := now.Sub(c.LastPacketAt)
 	hasVitals := vitals.ECGHeartRate.Valid || vitals.SpO2.Valid || vitals.SpO2Pulse.Valid ||
