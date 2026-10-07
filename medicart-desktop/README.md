@@ -11,6 +11,15 @@ This application acts as a bridge between local medical devices (via `lepu_cli.e
 - **Data Ingestion**: Parses raw device data and sends structured JSON to a specified HTTP endpoint.
 - **Patient Association**: Allows tagging readings with a specific Patient Name.
 - **Real-time Status**: Visual feedback and error highlighting (red for errors).
+- **ZUG TR8 monitor (HL7 UDP)**: Listens on UDP port 5000 for vitals; live values on the Readings tab; tap a vital button to save one snapshot.
+
+### TR8 HL7 setup (Windows)
+
+1. On the monitor, set the HL7 **destination** to this PC’s LAN IP and **UDP port 5000** (defaults in Settings → TR8 Monitor).
+2. In Medicart **Settings**, set **Clinic Name** and **Server Base URL**. The TR8 usually does **not** send a clinic name; vitals uploads use this clinic when HL7 has none.
+3. Leave **Allow source IP** empty unless you intentionally filter one monitor IP.
+4. Allow inbound **UDP 5000** in Windows Firewall for the desktop app.
+5. On Readings, status should show **connected** and packet count once data arrives. If it stays on **no UDP packets yet**, the stream is not reaching the PC (wrong IP/port, firewall, or cable/Wi‑Fi).
 
 ## Prerequisites
 

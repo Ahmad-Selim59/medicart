@@ -37,9 +37,12 @@ type IntReading struct {
 
 // ConnectionMeta tracks UDP activity.
 type ConnectionMeta struct {
-	LastPacketAt time.Time
-	SourceIP     string
-	ParseErrors  int64
+	ListenAddr      string
+	LastPacketAt    time.Time
+	SourceIP        string
+	PacketsReceived int64
+	MessagesParsed  int64
+	ParseErrors     int64
 }
 
 // PatientSnapshot is demographics from HL7 PID/PV1 (+ weight/height OBX).
@@ -118,11 +121,29 @@ func (s *MonitorState) Snapshot() PublicSnapshot {
 	}
 }
 
+// SetListening records the bound UDP address after a successful listen.
+func (s *MonitorState) SetListening(addr string) {
+	s.mu.Lock()
+	s.connection.ListenAddr = addr
+	s.mu.Unlock()
+}
+
 // RecordPacket updates connection metadata from a received UDP datagram.
 func (s *MonitorState) RecordPacket(sourceIP string, at time.Time) {
 	s.mu.Lock()
 	s.connection.LastPacketAt = at
 	s.connection.SourceIP = sourceIP
+	s.connection.PacketsReceived++
+	s.mu.Unlock()
+}
+
+// RecordMessagesParsed adds to the count of HL7 messages handled from UDP.
+func (s *MonitorState) RecordMessagesParsed(n int) {
+	if n <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.connection.MessagesParsed += int64(n)
 	s.mu.Unlock()
 }
 

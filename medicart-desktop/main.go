@@ -921,7 +921,9 @@ func main() {
 			log("Error: Cannot upload monitor profile — set Server Base URL")
 			return
 		}
-		body := monitor.BuildProfilePayload(p)
+		settingsClinic := strings.TrimSpace(clinicNameEntry.Text)
+		settingsPatient := strings.TrimSpace(patientNameEntry.Text)
+		body := monitor.BuildProfilePayload(p, settingsClinic, settingsPatient)
 		url := ingestURL(base)
 		go func() {
 			if err := sendData(url, body); err != nil {
@@ -986,7 +988,7 @@ func main() {
 				log("Error: Please enter a Server Base URL in Settings")
 				return
 			}
-			go commitFromMonitor(log, monitorState, kind, ingestURL(base))
+			go commitFromMonitor(myWindow, log, monitorState, kind, ingestURL(base), clinicNameEntry.Text, patientNameEntry.Text)
 			return
 		}
 		startProcess(name, args, parser)
@@ -2815,7 +2817,7 @@ func main() {
 			}
 			snap := monitorState.Snapshot()
 			hr, spo2, nibp, temp := monitor.FormatVitalDisplay(snap.Vitals)
-			status := monitor.ConnectionStatusText(snap.Connection, time.Now())
+			status := monitor.ConnectionStatusText(snap.Connection, time.Now(), snap.Vitals)
 			syncKey := strings.TrimSpace(snap.Patient.PatientID) + "|" + strings.TrimSpace(snap.Patient.PatientName)
 			shouldSyncPatient := syncKey != "" && syncKey != "|" && syncKey != lastUISyncKey
 			if shouldSyncPatient {
@@ -2874,24 +2876,35 @@ func isFinalReading(data map[string]interface{}) bool {
 }
 
 func commitFromMonitor(
+	win fyne.Window,
 	log func(string),
 	state *monitor.MonitorState,
 	kind monitor.VitalKind,
 	targetURL string,
+	settingsClinic, settingsPatient string,
 ) {
-	patient := state.PatientForCommit()
-	if ok, msg := monitor.CanCommitVitals(patient); !ok {
+	patient := monitor.ResolvePatientIdentity(state.PatientForCommit(), settingsClinic, settingsPatient)
+	if ok, msg := monitor.CanCommitVitals(state.PatientForCommit(), settingsClinic, settingsPatient); !ok {
 		log("Error: " + msg)
+		fyne.Do(func() {
+			dialog.ShowInformation("Cannot save vital", msg, win)
+		})
 		return
 	}
 	vitals := state.VitalsForCommit()
 	result := monitor.BuildVitalCommit(kind, vitals, time.Now())
 	if result.Err != nil {
 		log(result.Err.Error())
+		fyne.Do(func() {
+			dialog.ShowInformation("Cannot save vital", result.Err.Error(), win)
+		})
 		return
 	}
 	if err := sendReadingPayload(log, targetURL, patient.ClinicName, patient.PatientName, result.Data); err != nil {
 		log(fmt.Sprintf("Error: upload failed: %v", err))
+		fyne.Do(func() {
+			dialog.ShowError(err, win)
+		})
 		return
 	}
 	log(fmt.Sprintf("%s saved from monitor", kind))

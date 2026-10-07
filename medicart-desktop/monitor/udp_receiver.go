@@ -36,7 +36,13 @@ func Listen(ctx context.Context, cfg ListenConfig, state *MonitorState, onError 
 	}
 	defer pc.Close()
 
+	state.SetListening(addr)
+	if onError != nil {
+		onError(fmt.Sprintf("Monitor UDP listening on %s", addr))
+	}
+
 	buf := make([]byte, 65507)
+	var packetsSeen int64
 	for {
 		select {
 		case <-ctx.Done():
@@ -75,6 +81,7 @@ func Listen(ctx context.Context, cfg ListenConfig, state *MonitorState, onError 
 			sourceIP = h
 		}
 		state.RecordPacket(sourceIP, now)
+		packetsSeen++
 
 		msgs, parseErr := ParseHL7Payload(buf[:n])
 		if parseErr != nil {
@@ -83,6 +90,13 @@ func Listen(ctx context.Context, cfg ListenConfig, state *MonitorState, onError 
 				onError(fmt.Sprintf("Monitor HL7 parse error: %v", parseErr))
 			}
 			continue
+		}
+		state.RecordMessagesParsed(len(msgs))
+		if len(msgs) == 0 && onError != nil && packetsSeen <= 3 {
+			preview := strings.TrimSpace(string(buf[:min(n, 80)]))
+			preview = strings.ReplaceAll(preview, "\r", `\r`)
+			preview = strings.ReplaceAll(preview, "\n", `\n`)
+			onError(fmt.Sprintf("Monitor: UDP packet (%d bytes) had no HL7 MSH segment; preview: %q", n, preview))
 		}
 		for _, msg := range msgs {
 			if msg == nil || msg.Skip {

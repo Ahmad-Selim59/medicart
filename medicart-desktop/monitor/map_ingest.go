@@ -6,22 +6,43 @@ import (
 	"time"
 )
 
-// CanCommitVitals reports whether patient/clinic identity is sufficient for vitals ingest.
-func CanCommitVitals(p PatientSnapshot) (bool, string) {
+// ResolvePatientIdentity merges HL7 demographics with app Settings fallbacks.
+// The TR8 often omits a dedicated clinic/facility field; Settings → Clinic Name is used when HL7 has none.
+func ResolvePatientIdentity(p PatientSnapshot, settingsClinic, settingsPatient string) PatientSnapshot {
+	out := p
+	if strings.TrimSpace(out.ClinicName) == "" {
+		out.ClinicName = strings.TrimSpace(settingsClinic)
+	}
+	if strings.TrimSpace(out.PatientName) == "" {
+		out.PatientName = strings.TrimSpace(settingsPatient)
+	}
+	if strings.TrimSpace(out.PatientName) == "" && strings.TrimSpace(out.PatientID) != "" {
+		out.PatientName = strings.TrimSpace(out.PatientID)
+	}
+	if strings.TrimSpace(out.PatientName) == "" && strings.TrimSpace(out.BedID) != "" {
+		out.PatientName = "Bed " + strings.TrimSpace(out.BedID)
+	}
+	return out
+}
+
+// CanCommitVitals reports whether identity is sufficient for vitals ingest (after Settings fallbacks).
+func CanCommitVitals(p PatientSnapshot, settingsClinic, settingsPatient string) (bool, string) {
+	p = ResolvePatientIdentity(p, settingsClinic, settingsPatient)
 	clinic := strings.TrimSpace(p.ClinicName)
 	if clinic == "" {
-		return false, "Monitor patient identity incomplete: clinic/facility required"
+		return false, "Set Clinic Name in Settings (the monitor does not send a clinic). Patient name can come from HL7 or Settings."
 	}
 	id := strings.TrimSpace(p.PatientID)
 	name := strings.TrimSpace(p.PatientName)
 	if id == "" && name == "" {
-		return false, "Monitor patient identity incomplete: patient ID or name required"
+		return false, "Patient identity missing: admit/sync a patient on the monitor, or enter Patient Name in Settings."
 	}
 	return true, ""
 }
 
 // BuildProfilePayload returns the profile ingest body (includes type at top level for sendData).
-func BuildProfilePayload(p PatientSnapshot) map[string]interface{} {
+func BuildProfilePayload(p PatientSnapshot, settingsClinic, settingsPatient string) map[string]interface{} {
+	p = ResolvePatientIdentity(p, settingsClinic, settingsPatient)
 	body := map[string]interface{}{
 		"type":         "profile",
 		"patient_name": strings.TrimSpace(p.PatientName),
@@ -151,17 +172,27 @@ func FormatVitalDisplay(v VitalsSnapshot) (hr, spo2, nibp, temp string) {
 }
 
 // ConnectionStatusText formats monitor link status for the UI.
-func ConnectionStatusText(c ConnectionMeta, now time.Time) string {
+func ConnectionStatusText(c ConnectionMeta, now time.Time, vitals VitalsSnapshot) string {
+	addr := strings.TrimSpace(c.ListenAddr)
+	if addr == "" {
+		addr = "0.0.0.0:5000"
+	}
 	if c.LastPacketAt.IsZero() {
-		return "Monitor: waiting for data…"
+		return fmt.Sprintf("Monitor: listening on %s — no UDP packets yet (check TR8 target IP, port %s, and firewall)", addr, addr)
 	}
 	ago := now.Sub(c.LastPacketAt)
+	hasVitals := vitals.ECGHeartRate.Valid || vitals.SpO2.Valid || vitals.SpO2Pulse.Valid ||
+		vitals.NIBPSys.Valid || vitals.Temp.Valid
+	vitalsHint := ""
+	if !hasVitals {
+		vitalsHint = " — receiving HL7 but no valid vitals yet (probes on?)"
+	}
 	if ago < 3*time.Second {
 		ip := c.SourceIP
 		if ip != "" {
-			return fmt.Sprintf("Monitor: connected (%s)", ip)
+			return fmt.Sprintf("Monitor: connected (%s, %d pkts)%s", ip, c.PacketsReceived, vitalsHint)
 		}
-		return "Monitor: connected"
+		return fmt.Sprintf("Monitor: connected (%d pkts)%s", c.PacketsReceived, vitalsHint)
 	}
-	return fmt.Sprintf("Monitor: no data for %ds (last: %s)", int(ago.Seconds()), c.LastPacketAt.Format("15:04:05"))
+	return fmt.Sprintf("Monitor: no data for %ds (last: %s, %d pkts)%s", int(ago.Seconds()), c.LastPacketAt.Format("15:04:05"), c.PacketsReceived, vitalsHint)
 }

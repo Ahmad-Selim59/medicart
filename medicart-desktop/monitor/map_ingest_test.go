@@ -57,15 +57,19 @@ func TestBuildVitalCommit_Stale(t *testing.T) {
 }
 
 func TestCanCommitVitals(t *testing.T) {
-	ok, _ := CanCommitVitals(PatientSnapshot{ClinicName: "Ward", PatientID: "1"})
+	ok, _ := CanCommitVitals(PatientSnapshot{ClinicName: "Ward", PatientID: "1"}, "", "")
 	if !ok {
 		t.Fatal("expected ok with id and clinic")
 	}
-	ok, msg := CanCommitVitals(PatientSnapshot{PatientName: "John"})
+	ok, msg := CanCommitVitals(PatientSnapshot{PatientName: "John"}, "", "")
 	if ok {
 		t.Fatal("expected fail without clinic")
 	}
 	if msg == "" {
 		t.Fatal("expected message")
+	}
+	ok, _ = CanCommitVitals(PatientSnapshot{PatientName: "John"}, "ClinicA", "")
+	if !ok {
+		t.Fatal("expected ok with settings clinic fallback")
 	}
 }

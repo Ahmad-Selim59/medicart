@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"bytes"
 	"regexp"
 	"strconv"
 	"strings"
@@ -19,11 +20,18 @@ type ParsedMessage struct {
 
 // ParseHL7Payload splits raw UDP bytes into messages and parses each.
 func ParseHL7Payload(raw []byte) ([]*ParsedMessage, error) {
+	raw = bytes.TrimPrefix(raw, []byte{0xEF, 0xBB, 0xBF})
+	raw = bytes.TrimPrefix(raw, []byte{0xFE, 0xFF})
+	raw = bytes.TrimPrefix(raw, []byte{0xFF, 0xFE})
 	text := string(raw)
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return nil, nil
 	}
+	text = strings.TrimPrefix(text, "\x0b")
+	text = strings.TrimSuffix(text, "\x1c\r")
+	text = strings.TrimSuffix(text, "\x1c")
+	text = strings.TrimSuffix(text, "\x0d")
 	// Strip common log prefixes from demo captures.
 	if idx := strings.Index(text, "MSH|"); idx > 0 {
 		text = text[idx:]
@@ -121,8 +129,16 @@ func parseOneMessage(body string) (*ParsedMessage, error) {
 				msgType = strings.TrimSpace(seg.fields[7])
 				msg.MessageType = msgType
 			}
-			if len(seg.fields) > 1 && seg.fields[1] != "" {
-				// MSH-2 is encoding chars; field index 1 in our split (MSH|^~\&|...)
+			// MSH-4 sending facility (index 2) when PV1 has no facility — TR8 often leaves PV1 empty.
+			if len(seg.fields) > 2 {
+				facility := strings.TrimSpace(fieldComponent(seg.fields[2], seg.seps, 0))
+				if facility == "" {
+					facility = strings.TrimSpace(seg.fields[2])
+				}
+				if facility != "" && strings.TrimSpace(patient.ClinicName) == "" {
+					patient.ClinicName = facility
+					hasPatient = true
+				}
 			}
 		case "PID":
 			parsePID(seg, patient)
@@ -185,7 +201,7 @@ func vitalsIf(ok bool, v *VitalsSnapshot) *VitalsSnapshot {
 }
 
 func shouldProcessVitals(msgType string) bool {
-	parts := strings.Split(msgType, "^")
+	parts := strings.Split(strings.ToUpper(msgType), "^")
 	if len(parts) < 2 {
 		return false
 	}
@@ -297,6 +313,7 @@ func parsePID(seg hl7Segment, p *PatientSnapshot) {
 func parsePV1(seg hl7Segment, p *PatientSnapshot) {
 	if len(seg.fields) > 3 {
 		loc := seg.fields[3]
+		poc := fieldComponent(loc, seg.seps, 0)
 		bed := fieldComponent(loc, seg.seps, 2)
 		if bed != "" {
 			p.BedID = bed
@@ -304,58 +321,69 @@ func parsePV1(seg hl7Segment, p *PatientSnapshot) {
 		fac := fieldComponent(loc, seg.seps, 3)
 		if fac != "" {
 			p.ClinicName = fac
+		} else if poc != "" && strings.TrimSpace(p.ClinicName) == "" {
+			p.ClinicName = poc
 		}
 	}
+}
+
+func obxMDCKey(identifierField string, seps hl7Separators) string {
+	name := strings.ToUpper(fieldComponent(identifierField, seps, 1))
+	code := fieldComponent(identifierField, seps, 0)
+	if strings.HasPrefix(name, "MDC_") {
+		return name
+	}
+	return strings.ToUpper(code)
 }
 
 func parseOBX(seg hl7Segment, v *VitalsSnapshot, p *PatientSnapshot) bool {
 	if len(seg.fields) < 6 {
 		return false
 	}
-	id := fieldComponent(seg.fields[3], seg.seps, 1)
-	if id == "" {
-		id = fieldComponent(seg.fields[3], seg.seps, 0)
-	}
+	id := obxMDCKey(seg.fields[3], seg.seps)
 	rawVal := strings.TrimSpace(seg.fields[5])
+	if rawVal == "" && len(seg.fields) > 6 {
+		rawVal = strings.TrimSpace(seg.fields[6])
+	}
 	obsTime := parseHL7Time(seg, 14)
 
 	switch id {
-	case "MDC_ECG_HEART_RATE":
+	case "MDC_ECG_HEART_RATE", "147842":
 		if n, ok := validInt(rawVal); ok {
 			v.ECGHeartRate = IntReading{Value: n, Valid: true, ObservedAt: obsTime}
 			return true
 		}
-	case "MDC_PULS_OXIM_PULS_RATE":
+	case "MDC_PULS_OXIM_PULS_RATE", "149530":
 		if n, ok := validInt(rawVal); ok {
 			v.SpO2Pulse = IntReading{Value: n, Valid: true, ObservedAt: obsTime}
 			return true
 		}
-	case "MDC_PULS_OXIM_SAT_O2":
+	case "MDC_PULS_OXIM_SAT_O2", "150456":
 		if n, ok := validInt(rawVal); ok {
 			v.SpO2 = IntReading{Value: n, Valid: true, ObservedAt: obsTime}
 			return true
 		}
-	case "MDC_PRESS_CUFF_SYS":
+	case "MDC_PRESS_CUFF_SYS", "150301":
 		if n, ok := validInt(rawVal); ok {
 			v.NIBPSys = IntReading{Value: n, Valid: true, ObservedAt: obsTime}
 			return true
 		}
-	case "MDC_PRESS_CUFF_DIA":
+	case "MDC_PRESS_CUFF_DIA", "150302":
 		if n, ok := validInt(rawVal); ok {
 			v.NIBPDia = IntReading{Value: n, Valid: true, ObservedAt: obsTime}
 			return true
 		}
-	case "MDC_PRESS_CUFF_MEAN":
+	case "MDC_PRESS_CUFF_MEAN", "150303":
 		if n, ok := validInt(rawVal); ok {
 			v.NIBPMap = IntReading{Value: n, Valid: true, ObservedAt: obsTime}
 			return true
 		}
-	case "MDC_PULS_RATE_NON_INV":
+	case "MDC_PULS_RATE_NON_INV", "149546":
 		if n, ok := validInt(rawVal); ok {
 			v.NIBPPulse = IntReading{Value: n, Valid: true, ObservedAt: obsTime}
 			return true
 		}
-	case "MDC_TEMP":
+	case "MDC_TEMP", "150344":
 		if f, ok := validFloat(rawVal); ok {
 			v.Temp = FloatReading{Value: f, Valid: true, ObservedAt: obsTime}
 			return true
