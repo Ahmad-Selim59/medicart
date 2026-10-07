@@ -31,6 +31,7 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/Ahmad-Selim59/medicart/monitor"
 	"github.com/gorilla/websocket"
 	xdraw "golang.org/x/image/draw"
 )
@@ -418,15 +419,37 @@ type LineParser func(line string) (interface{}, error)
 
 // AppConfig holds all persisted settings.
 type AppConfig struct {
-	ServerBase    string `json:"server_base"`
-	ClinicName    string `json:"clinic_name"`
-	PatientName   string `json:"patient_name"`
-	PatientAge    string `json:"patient_age"`
-	PatientWeight string `json:"patient_weight"`
-	PatientHeight string `json:"patient_height"`
-	PatientGender string `json:"patient_gender"`
-	StethMAC      string `json:"steth_mac"`
-	LightMode     bool   `json:"light_mode"`
+	ServerBase       string `json:"server_base"`
+	ClinicName       string `json:"clinic_name"`
+	PatientName      string `json:"patient_name"`
+	PatientAge       string `json:"patient_age"`
+	PatientWeight    string `json:"patient_weight"`
+	PatientHeight    string `json:"patient_height"`
+	PatientGender    string `json:"patient_gender"`
+	StethMAC         string `json:"steth_mac"`
+	LightMode        bool   `json:"light_mode"`
+	MonitorEnabled   bool   `json:"monitor_enabled"`
+	MonitorBindHost  string `json:"monitor_bind_host"`
+	MonitorUDPPort   int    `json:"monitor_udp_port"`
+	MonitorAllowIP   string `json:"monitor_allow_ip"`
+}
+
+func defaultAppConfig() AppConfig {
+	return AppConfig{
+		ServerBase:      "http://localhost:8081",
+		MonitorEnabled:  true,
+		MonitorBindHost: "0.0.0.0",
+		MonitorUDPPort:  5000,
+	}
+}
+
+func applyMonitorDefaults(cfg *AppConfig) {
+	if cfg.MonitorBindHost == "" {
+		cfg.MonitorBindHost = "0.0.0.0"
+	}
+	if cfg.MonitorUDPPort <= 0 {
+		cfg.MonitorUDPPort = 5000
+	}
 }
 
 func configFilePath() string {
@@ -438,16 +461,34 @@ func configFilePath() string {
 }
 
 func loadAppConfig() AppConfig {
-	cfg := AppConfig{ServerBase: "http://localhost:8081"}
+	cfg := defaultAppConfig()
 	data, err := os.ReadFile(configFilePath())
 	if err != nil {
 		return cfg
 	}
-	_ = json.Unmarshal(data, &cfg)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return cfg
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg
+	}
+	if _, ok := raw["monitor_enabled"]; !ok {
+		cfg.MonitorEnabled = true
+	}
 	if cfg.ServerBase == "" {
 		cfg.ServerBase = "http://localhost:8081"
 	}
+	applyMonitorDefaults(&cfg)
 	return cfg
+}
+
+func monitorListenConfig(cfg AppConfig) monitor.ListenConfig {
+	return monitor.ListenConfig{
+		BindHost: cfg.MonitorBindHost,
+		UDPPort:  cfg.MonitorUDPPort,
+		AllowIP:  strings.TrimSpace(cfg.MonitorAllowIP),
+	}
 }
 
 func saveAppConfig(cfg AppConfig) error {
@@ -700,6 +741,39 @@ func main() {
 	// Load persisted settings from ~/.medicart/config.json
 	cfg := loadAppConfig()
 
+	monitorState := monitor.NewMonitorState()
+	var monitorCancel context.CancelFunc
+	var monitorCancelMu sync.Mutex
+	var startMonitorListener func(AppConfig)
+
+	monitorEnabledCheck := widget.NewCheck("Enable TR8 HL7 monitor (UDP)", nil)
+	monitorEnabledCheck.Checked = cfg.MonitorEnabled
+	monitorBindEntry := widget.NewEntry()
+	monitorBindEntry.SetPlaceHolder("0.0.0.0")
+	monitorBindEntry.SetText(cfg.MonitorBindHost)
+	monitorPortEntry := widget.NewEntry()
+	monitorPortEntry.SetPlaceHolder("5000")
+	monitorPortEntry.SetText(strconv.Itoa(cfg.MonitorUDPPort))
+	monitorAllowIPEntry := widget.NewEntry()
+	monitorAllowIPEntry.SetPlaceHolder("optional — single source IP")
+	monitorAllowIPEntry.SetText(cfg.MonitorAllowIP)
+
+	monitorStatusLabel := widget.NewLabel("Monitor: off")
+	liveHRLabel := widget.NewLabel("—")
+	liveSpO2Label := widget.NewLabel("—")
+	liveNIBPLabel := widget.NewLabel("—")
+	liveTempLabel := widget.NewLabel("—")
+
+	monitorCfgFromUI := func() AppConfig {
+		port, _ := strconv.Atoi(strings.TrimSpace(monitorPortEntry.Text))
+		return AppConfig{
+			MonitorEnabled:  monitorEnabledCheck.Checked,
+			MonitorBindHost: strings.TrimSpace(monitorBindEntry.Text),
+			MonitorUDPPort:  port,
+			MonitorAllowIP:  strings.TrimSpace(monitorAllowIPEntry.Text),
+		}
+	}
+
 	// Theme Toggle — applies immediately, persisted on Save
 	lightModeCheck := widget.NewCheck("Light Mode", func(checked bool) {
 		if checked {
@@ -817,6 +891,47 @@ func main() {
 		})
 	}
 
+	startMonitorListener = func(appCfg AppConfig) {
+		monitorCancelMu.Lock()
+		if monitorCancel != nil {
+			monitorCancel()
+			monitorCancel = nil
+		}
+		monitorCancelMu.Unlock()
+		if !appCfg.MonitorEnabled {
+			fyne.Do(func() { monitorStatusLabel.SetText("Monitor: off") })
+			return
+		}
+		applyMonitorDefaults(&appCfg)
+		ctx, cancel := context.WithCancel(context.Background())
+		monitorCancelMu.Lock()
+		monitorCancel = cancel
+		monitorCancelMu.Unlock()
+		lc := monitorListenConfig(appCfg)
+		go monitor.Listen(ctx, lc, monitorState, func(msg string) { log(msg) })
+		log(fmt.Sprintf("TR8 monitor listening on %s:%d (UDP)", lc.BindHost, lc.UDPPort))
+	}
+
+	monitorState.SetPatientChangeHandler(func(p monitor.PatientSnapshot) {
+		fyne.Do(func() {
+			syncPatientUIFromMonitor(p, patientNameEntry, clinicNameEntry, ageEntry, weightEntry, heightEntry, genderSelect)
+		})
+		base := strings.TrimSpace(serverBaseEntry.Text)
+		if base == "" {
+			log("Error: Cannot upload monitor profile — set Server Base URL")
+			return
+		}
+		body := monitor.BuildProfilePayload(p)
+		url := ingestURL(base)
+		go func() {
+			if err := sendData(url, body); err != nil {
+				log(fmt.Sprintf("Monitor profile upload failed: %v", err))
+				return
+			}
+			log("Patient profile synced from monitor")
+		}()
+	})
+
 	// Action Buttons
 	var stopBtn *widget.Button
 
@@ -864,12 +979,25 @@ func main() {
 	stopBtn.Importance = widget.DangerImportance
 	stopBtn.Disable()
 
-	btnHeartRate := widget.NewButtonWithIcon("Heart Rate / SpO2", theme.MediaPlayIcon(), func() {
-		startProcess("HeartRate", []string{"-heartrate"}, parseHeartRateLine)
+	vitalButtonTapped := func(name string, args []string, parser LineParser, kind monitor.VitalKind) {
+		if monitorEnabledCheck.Checked {
+			base := strings.TrimSpace(serverBaseEntry.Text)
+			if base == "" {
+				log("Error: Please enter a Server Base URL in Settings")
+				return
+			}
+			go commitFromMonitor(log, monitorState, kind, ingestURL(base))
+			return
+		}
+		startProcess(name, args, parser)
+	}
+
+	btnHeartRate := widget.NewButtonWithIcon("Heart Rate / SpO2", theme.DocumentSaveIcon(), func() {
+		vitalButtonTapped("HeartRate", []string{"-heartrate"}, parseHeartRateLine, monitor.VitalHeartRate)
 	})
 
-	btnNIBP := widget.NewButtonWithIcon("NIBP", theme.MediaPlayIcon(), func() {
-		startProcess("NIBP", []string{"-nibp"}, parseNIBPLine)
+	btnNIBP := widget.NewButtonWithIcon("NIBP", theme.DocumentSaveIcon(), func() {
+		vitalButtonTapped("NIBP", []string{"-nibp"}, parseNIBPLine, monitor.VitalNIBP)
 	})
 
 	glucoseEntry := widget.NewEntry()
@@ -921,9 +1049,21 @@ func main() {
 	btnSaveGlucose.Importance = widget.HighImportance
 	glucoseEntry.OnSubmitted = func(string) { submitGlucose() }
 
-	btnTemp := widget.NewButtonWithIcon("Temperature", theme.MediaPlayIcon(), func() {
-		startProcess("Temperature", []string{"-temperature"}, parseTemperatureLine)
+	btnTemp := widget.NewButtonWithIcon("Temperature", theme.DocumentSaveIcon(), func() {
+		vitalButtonTapped("Temperature", []string{"-temperature"}, parseTemperatureLine, monitor.VitalTemp)
 	})
+
+	updateVitalButtonIcons := func() {
+		icon := theme.MediaPlayIcon()
+		if monitorEnabledCheck.Checked {
+			icon = theme.DocumentSaveIcon()
+		}
+		btnHeartRate.SetIcon(icon)
+		btnNIBP.SetIcon(icon)
+		btnTemp.SetIcon(icon)
+	}
+	monitorEnabledCheck.OnChanged = func(bool) { updateVitalButtonIcons() }
+	updateVitalButtonIcons()
 
 	uploadECG := func(path string) {
 		base := strings.TrimSpace(serverBaseEntry.Text)
@@ -2361,17 +2501,23 @@ func main() {
 
 	var btnSaveSettings *widget.Button
 	btnSaveSettings = widget.NewButtonWithIcon("Save Settings", theme.DocumentSaveIcon(), func() {
+		mon := monitorCfgFromUI()
 		newCfg := AppConfig{
-			ServerBase:    strings.TrimSpace(serverBaseEntry.Text),
-			ClinicName:    strings.TrimSpace(clinicNameEntry.Text),
-			PatientName:   strings.TrimSpace(patientNameEntry.Text),
-			PatientAge:    strings.TrimSpace(ageEntry.Text),
-			PatientWeight: strings.TrimSpace(weightEntry.Text),
-			PatientHeight: strings.TrimSpace(heightEntry.Text),
-			PatientGender: genderSelect.Selected,
-			StethMAC:      strings.TrimSpace(stethMacEntry.Text),
-			LightMode:     lightModeCheck.Checked,
+			ServerBase:      strings.TrimSpace(serverBaseEntry.Text),
+			ClinicName:      strings.TrimSpace(clinicNameEntry.Text),
+			PatientName:     strings.TrimSpace(patientNameEntry.Text),
+			PatientAge:      strings.TrimSpace(ageEntry.Text),
+			PatientWeight:   strings.TrimSpace(weightEntry.Text),
+			PatientHeight:   strings.TrimSpace(heightEntry.Text),
+			PatientGender:   genderSelect.Selected,
+			StethMAC:        strings.TrimSpace(stethMacEntry.Text),
+			LightMode:       lightModeCheck.Checked,
+			MonitorEnabled:  mon.MonitorEnabled,
+			MonitorBindHost: mon.MonitorBindHost,
+			MonitorUDPPort:  mon.MonitorUDPPort,
+			MonitorAllowIP:  mon.MonitorAllowIP,
 		}
+		applyMonitorDefaults(&newCfg)
 		btnSaveSettings.Disable()
 		log("Saving settings...")
 		go func(cfg AppConfig) {
@@ -2383,6 +2529,8 @@ func main() {
 					return
 				}
 				log(fmt.Sprintf("Settings saved (server: %s)", cfg.ServerBase))
+				startMonitorListener(cfg)
+				updateVitalButtonIcons()
 				dialog.ShowInformation("Saved Successfully", "Your settings have been saved successfully.", myWindow)
 			})
 		}(newCfg)
@@ -2440,17 +2588,23 @@ func main() {
 		weight, _ := strconv.ParseFloat(strings.TrimSpace(weightEntry.Text), 64)
 		height, _ := strconv.ParseFloat(strings.TrimSpace(heightEntry.Text), 64)
 
+		mon := monitorCfgFromUI()
 		newCfg := AppConfig{
-			ServerBase:    base,
-			ClinicName:    clinicName,
-			PatientName:   patientName,
-			PatientAge:    strings.TrimSpace(ageEntry.Text),
-			PatientWeight: strings.TrimSpace(weightEntry.Text),
-			PatientHeight: strings.TrimSpace(heightEntry.Text),
-			PatientGender: genderSelect.Selected,
-			StethMAC:      strings.TrimSpace(stethMacEntry.Text),
-			LightMode:     lightModeCheck.Checked,
+			ServerBase:      base,
+			ClinicName:      clinicName,
+			PatientName:     patientName,
+			PatientAge:      strings.TrimSpace(ageEntry.Text),
+			PatientWeight:   strings.TrimSpace(weightEntry.Text),
+			PatientHeight:   strings.TrimSpace(heightEntry.Text),
+			PatientGender:   genderSelect.Selected,
+			StethMAC:        strings.TrimSpace(stethMacEntry.Text),
+			LightMode:       lightModeCheck.Checked,
+			MonitorEnabled:  mon.MonitorEnabled,
+			MonitorBindHost: mon.MonitorBindHost,
+			MonitorUDPPort:  mon.MonitorUDPPort,
+			MonitorAllowIP:  mon.MonitorAllowIP,
 		}
+		applyMonitorDefaults(&newCfg)
 		payload := map[string]interface{}{
 			"type":         "profile",
 			"patient_name": patientName,
@@ -2496,8 +2650,12 @@ func main() {
 		container.NewVBox(widget.NewLabelWithStyle("HEIGHT (CM)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), heightEntry),
 	)
 
+	patientIdentitySubtitle := "Select Patient"
+	if cfg.MonitorEnabled {
+		patientIdentitySubtitle = "Synced from monitor when HL7 patient data is available"
+	}
 	patientsContent := container.NewVBox(
-		widget.NewCard("Identity Context", "Select Patient", container.NewVBox(
+		widget.NewCard("Identity Context", patientIdentitySubtitle, container.NewVBox(
 			patientNameLabel, patientNameEntry,
 			btnSavePatient,
 		)),
@@ -2508,7 +2666,16 @@ func main() {
 	// Mimicking the Vitals & Stethoscope section + Live Console
 	readingsContent := container.NewVBox(
 		widget.NewLabelWithStyle("Patient Readings", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		widget.NewLabel("Select a vital sign to begin live monitoring."),
+		widget.NewLabel("When TR8 monitor is enabled, live values update from HL7; tap a vital to save one snapshot to the server."),
+		widget.NewCard("TR8 Monitor", "Live cache from UDP HL7 stream", container.NewVBox(
+			monitorStatusLabel,
+			container.NewGridWithColumns(2,
+				container.NewVBox(widget.NewLabel("Heart rate"), liveHRLabel),
+				container.NewVBox(widget.NewLabel("SpO2"), liveSpO2Label),
+				container.NewVBox(widget.NewLabel("NIBP"), liveNIBPLabel),
+				container.NewVBox(widget.NewLabel("Temperature"), liveTempLabel),
+			),
+		)),
 		container.NewGridWithColumns(2,
 			btnHeartRate,
 			btnNIBP,
@@ -2606,6 +2773,15 @@ func main() {
 			container.NewGridWithColumns(2, wsConnectBtn, wsDisconnectBtn),
 		)),
 		widget.NewCard("Display", "", lightModeCheck),
+		widget.NewCard("TR8 Monitor (HL7 UDP)", "ZUG patient monitor vitals stream", container.NewVBox(
+			monitorEnabledCheck,
+			widget.NewLabel("Bind host:"),
+			monitorBindEntry,
+			widget.NewLabel("UDP port:"),
+			monitorPortEntry,
+			widget.NewLabel("Allow source IP (optional):"),
+			monitorAllowIPEntry,
+		)),
 	)
 
 	// Main Tab Container
@@ -2619,6 +2795,47 @@ func main() {
 
 	myWindow.SetContent(tabs)
 	myWindow.Resize(fyne.NewSize(480, 800))
+
+	myWindow.SetCloseIntercept(func() {
+		monitorCancelMu.Lock()
+		if monitorCancel != nil {
+			monitorCancel()
+		}
+		monitorCancelMu.Unlock()
+		myWindow.Close()
+	})
+
+	go func() {
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		var lastUISyncKey string
+		for range tick.C {
+			if !monitorEnabledCheck.Checked {
+				continue
+			}
+			snap := monitorState.Snapshot()
+			hr, spo2, nibp, temp := monitor.FormatVitalDisplay(snap.Vitals)
+			status := monitor.ConnectionStatusText(snap.Connection, time.Now())
+			syncKey := strings.TrimSpace(snap.Patient.PatientID) + "|" + strings.TrimSpace(snap.Patient.PatientName)
+			shouldSyncPatient := syncKey != "" && syncKey != "|" && syncKey != lastUISyncKey
+			if shouldSyncPatient {
+				lastUISyncKey = syncKey
+			}
+			patientCopy := snap.Patient
+			fyne.Do(func() {
+				monitorStatusLabel.SetText(status)
+				liveHRLabel.SetText(hr)
+				liveSpO2Label.SetText(spo2)
+				liveNIBPLabel.SetText(nibp)
+				liveTempLabel.SetText(temp)
+				if shouldSyncPatient {
+					syncPatientUIFromMonitor(patientCopy, patientNameEntry, clinicNameEntry, ageEntry, weightEntry, heightEntry, genderSelect)
+				}
+			})
+		}
+	}()
+
+	startMonitorListener(cfg)
 
 	myWindow.ShowAndRun()
 }
@@ -2653,6 +2870,55 @@ func isFinalReading(data map[string]interface{}) bool {
 		return hasGlu || hasTemp
 	default:
 		return false
+	}
+}
+
+func commitFromMonitor(
+	log func(string),
+	state *monitor.MonitorState,
+	kind monitor.VitalKind,
+	targetURL string,
+) {
+	patient := state.PatientForCommit()
+	if ok, msg := monitor.CanCommitVitals(patient); !ok {
+		log("Error: " + msg)
+		return
+	}
+	vitals := state.VitalsForCommit()
+	result := monitor.BuildVitalCommit(kind, vitals, time.Now())
+	if result.Err != nil {
+		log(result.Err.Error())
+		return
+	}
+	if err := sendReadingPayload(log, targetURL, patient.ClinicName, patient.PatientName, result.Data); err != nil {
+		log(fmt.Sprintf("Error: upload failed: %v", err))
+		return
+	}
+	log(fmt.Sprintf("%s saved from monitor", kind))
+}
+
+func syncPatientUIFromMonitor(
+	p monitor.PatientSnapshot,
+	patientNameEntry, clinicNameEntry, ageEntry, weightEntry, heightEntry *widget.Entry,
+	genderSelect *widget.Select,
+) {
+	if name := strings.TrimSpace(p.PatientName); name != "" {
+		patientNameEntry.SetText(name)
+	}
+	if clinic := strings.TrimSpace(p.ClinicName); clinic != "" {
+		clinicNameEntry.SetText(clinic)
+	}
+	if p.Age > 0 {
+		ageEntry.SetText(strconv.Itoa(p.Age))
+	}
+	if p.Weight > 0 {
+		weightEntry.SetText(strconv.FormatFloat(p.Weight, 'f', -1, 64))
+	}
+	if p.Height > 0 {
+		heightEntry.SetText(strconv.FormatFloat(p.Height, 'f', -1, 64))
+	}
+	if g := strings.TrimSpace(p.Gender); g != "" {
+		genderSelect.SetSelected(g)
 	}
 }
 

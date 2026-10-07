@@ -59,9 +59,9 @@ func TestCLIAttemptSucceeded(t *testing.T) {
 			want:   true,
 		},
 		{
-			name:   "clean exit with no error message",
+			name:   "clean exit with no output",
 			result: cliAttemptResult{},
-			want:   true,
+			want:   false,
 		},
 		{
 			name:   "failed with no output",
@@ -85,7 +85,8 @@ func TestCLIAttemptSucceeded(t *testing.T) {
 }
 
 func TestRunCLIOnceRetriesUntilOutput(t *testing.T) {
-	if _, err := exec.LookPath("sh"); err != nil {
+	shPath, err := exec.LookPath("sh")
+	if err != nil {
 		t.Skip("sh not available")
 	}
 
@@ -109,7 +110,7 @@ func TestRunCLIOnceRetriesUntilOutput(t *testing.T) {
 	var logs []string
 	logFn := func(msg string) { logs = append(logs, msg) }
 
-	result := runCLIOnce(ctx, cancel, "sh", []string{tmp.Name(), "fail"}, parseHeartRateLine, readingSessionContinuous, "http://127.0.0.1:1", "Clinic", "Patient", logFn)
+	result := runCLIOnce(ctx, cancel, shPath, []string{tmp.Name(), "fail"}, parseHeartRateLine, readingSessionContinuous, "http://127.0.0.1:1", "Clinic", "Patient", logFn)
 	if result.succeeded() {
 		t.Fatalf("expected failed attempt, got %+v", result)
 	}
@@ -117,7 +118,7 @@ func TestRunCLIOnceRetriesUntilOutput(t *testing.T) {
 		t.Fatal("expected error message on failed attempt")
 	}
 
-	result = runCLIOnce(ctx, cancel, "sh", []string{tmp.Name(), "ok"}, parseHeartRateLine, readingSessionContinuous, "http://127.0.0.1:1", "Clinic", "Patient", logFn)
+	result = runCLIOnce(ctx, cancel, shPath, []string{tmp.Name(), "ok"}, parseHeartRateLine, readingSessionContinuous, "http://127.0.0.1:1", "Clinic", "Patient", logFn)
 	if !result.succeeded() || !result.receivedOutput {
 		t.Fatalf("expected successful attempt with output, got %+v", result)
 	}
@@ -177,7 +178,8 @@ func TestParseTemperatureLine(t *testing.T) {
 }
 
 func TestRunCLIOnceAutoStopsOnNIBPResult(t *testing.T) {
-	if _, err := exec.LookPath("sh"); err != nil {
+	shPath, err := exec.LookPath("sh")
+	if err != nil {
 		t.Skip("sh not available")
 	}
 
@@ -209,7 +211,7 @@ sleep 60
 	var logs []string
 	logFn := func(msg string) { logs = append(logs, msg) }
 
-	result := runCLIOnce(ctx, cancel, "sh", []string{tmp.Name()}, parseNIBPLine, readingSessionFinal, srv.URL, "Clinic", "Patient", logFn)
+	result := runCLIOnce(ctx, cancel, shPath, []string{tmp.Name()}, parseNIBPLine, readingSessionFinal, srv.URL, "Clinic", "Patient", logFn)
 	if !result.completed {
 		t.Fatalf("expected auto-complete after NIBP result, got %+v", result)
 	}

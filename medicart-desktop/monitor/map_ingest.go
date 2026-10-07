@@ -1,0 +1,167 @@
+package monitor
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+// CanCommitVitals reports whether patient/clinic identity is sufficient for vitals ingest.
+func CanCommitVitals(p PatientSnapshot) (bool, string) {
+	clinic := strings.TrimSpace(p.ClinicName)
+	if clinic == "" {
+		return false, "Monitor patient identity incomplete: clinic/facility required"
+	}
+	id := strings.TrimSpace(p.PatientID)
+	name := strings.TrimSpace(p.PatientName)
+	if id == "" && name == "" {
+		return false, "Monitor patient identity incomplete: patient ID or name required"
+	}
+	return true, ""
+}
+
+// BuildProfilePayload returns the profile ingest body (includes type at top level for sendData).
+func BuildProfilePayload(p PatientSnapshot) map[string]interface{} {
+	body := map[string]interface{}{
+		"type":         "profile",
+		"patient_name": strings.TrimSpace(p.PatientName),
+		"clinic_name":  strings.TrimSpace(p.ClinicName),
+		"gender":       strings.TrimSpace(p.Gender),
+		"age":          p.Age,
+		"weight":       p.Weight,
+		"height":       p.Height,
+	}
+	if id := strings.TrimSpace(p.PatientID); id != "" {
+		body["patient_id"] = id
+	}
+	if bed := strings.TrimSpace(p.BedID); bed != "" {
+		body["bed_id"] = bed
+	}
+	if ag := strings.TrimSpace(p.AgeGroup); ag != "" {
+		body["age_group"] = ag
+	}
+	if dob := strings.TrimSpace(p.DOB); dob != "" {
+		body["dob"] = dob
+	}
+	if body["gender"] == "" {
+		body["gender"] = "Other"
+	}
+	return body
+}
+
+// CommitResult is the outcome of building a vital commit payload.
+type CommitResult struct {
+	Data map[string]interface{}
+	Err  error
+}
+
+// BuildVitalCommit builds ingest data for a vital button press.
+func BuildVitalCommit(kind VitalKind, v VitalsSnapshot, now time.Time) CommitResult {
+	switch kind {
+	case VitalHeartRate:
+		return buildHeartRate(v, now)
+	case VitalNIBP:
+		return buildNIBP(v, now)
+	case VitalTemp:
+		return buildTemp(v, now)
+	default:
+		return CommitResult{Err: fmt.Errorf("unknown vital kind %q", kind)}
+	}
+}
+
+func freshInt(r IntReading, now time.Time) bool {
+	return r.Valid && !r.ObservedAt.IsZero() && now.Sub(r.ObservedAt) <= MaxStaleness
+}
+
+func freshFloat(r FloatReading, now time.Time) bool {
+	return r.Valid && !r.ObservedAt.IsZero() && now.Sub(r.ObservedAt) <= MaxStaleness
+}
+
+func buildHeartRate(v VitalsSnapshot, now time.Time) CommitResult {
+	var pr int
+	var prOK bool
+	if freshInt(v.ECGHeartRate, now) {
+		pr, prOK = v.ECGHeartRate.Value, true
+	} else if freshInt(v.SpO2Pulse, now) {
+		pr, prOK = v.SpO2Pulse.Value, true
+	}
+	if !prOK || !freshInt(v.SpO2, now) {
+		return CommitResult{Err: fmt.Errorf("no fresh reading from monitor")}
+	}
+	return CommitResult{Data: map[string]interface{}{
+		"type": "data",
+		"pr":   pr,
+		"spo2": v.SpO2.Value,
+	}}
+}
+
+func buildNIBP(v VitalsSnapshot, now time.Time) CommitResult {
+	if !freshInt(v.NIBPSys, now) || !freshInt(v.NIBPDia, now) || !freshInt(v.NIBPMap, now) {
+		return CommitResult{Err: fmt.Errorf("no fresh reading from monitor")}
+	}
+	pr := 0
+	if freshInt(v.NIBPPulse, now) {
+		pr = v.NIBPPulse.Value
+	}
+	return CommitResult{Data: map[string]interface{}{
+		"type": "result",
+		"sys":  v.NIBPSys.Value,
+		"dia":  v.NIBPDia.Value,
+		"map":  v.NIBPMap.Value,
+		"pr":   pr,
+		"irr":  false,
+	}}
+}
+
+func buildTemp(v VitalsSnapshot, now time.Time) CommitResult {
+	if !freshFloat(v.Temp, now) {
+		return CommitResult{Err: fmt.Errorf("no fresh reading from monitor")}
+	}
+	return CommitResult{Data: map[string]interface{}{
+		"type": "data",
+		"temp": v.Temp.Value,
+	}}
+}
+
+// FormatVitalDisplay returns human-readable live values for the UI.
+func FormatVitalDisplay(v VitalsSnapshot) (hr, spo2, nibp, temp string) {
+	if v.ECGHeartRate.Valid {
+		hr = fmt.Sprintf("%d bpm", v.ECGHeartRate.Value)
+	} else if v.SpO2Pulse.Valid {
+		hr = fmt.Sprintf("%d bpm (SpO2)", v.SpO2Pulse.Value)
+	} else {
+		hr = "—"
+	}
+	if v.SpO2.Valid {
+		spo2 = fmt.Sprintf("%d%%", v.SpO2.Value)
+	} else {
+		spo2 = "—"
+	}
+	if v.NIBPSys.Valid && v.NIBPDia.Valid && v.NIBPMap.Valid {
+		nibp = fmt.Sprintf("%d/%d (%d)", v.NIBPSys.Value, v.NIBPDia.Value, v.NIBPMap.Value)
+	} else {
+		nibp = "—"
+	}
+	if v.Temp.Valid {
+		temp = fmt.Sprintf("%.1f °C", v.Temp.Value)
+	} else {
+		temp = "—"
+	}
+	return hr, spo2, nibp, temp
+}
+
+// ConnectionStatusText formats monitor link status for the UI.
+func ConnectionStatusText(c ConnectionMeta, now time.Time) string {
+	if c.LastPacketAt.IsZero() {
+		return "Monitor: waiting for data…"
+	}
+	ago := now.Sub(c.LastPacketAt)
+	if ago < 3*time.Second {
+		ip := c.SourceIP
+		if ip != "" {
+			return fmt.Sprintf("Monitor: connected (%s)", ip)
+		}
+		return "Monitor: connected"
+	}
+	return fmt.Sprintf("Monitor: no data for %ds (last: %s)", int(ago.Seconds()), c.LastPacketAt.Format("15:04:05"))
+}
