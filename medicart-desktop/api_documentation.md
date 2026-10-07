@@ -99,21 +99,7 @@ Stored in `temperature.json`.
 }
 ```
 
-### 5. Stethoscope
-Stored in `stethoscope.json`.
-**Stream Data:**
-```json
-{
-  "type": "stream",
-  "stream_type": "audio" | "heartrate",
-  "data": [123, 456, ...], // Array of int16 (if audio)
-  "value": 75              // Pulse rate (if heartrate)
-}
-```
-
----
-
-### 4. Camera Control
+### 5. Camera Control
 Sends a movement or control command to the desktop application's camera.
 
 - **URL:** `${API_BASE}/api/camera/control`

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -41,34 +40,6 @@ import (
 // returns a larger native frame (e.g. 640x480 or 1920x1080).
 const previewMaxW, previewMaxH = 320, 240
 
-// showStethoscopeInReadings toggles the Stethoscope card on the Readings tab.
-const showStethoscopeInReadings = false
-
-const localGunTempMaxAge = 30 * time.Minute
-
-// gunTempState holds the last infrared/CLI thermometer reading for the Readings UI.
-type gunTempState struct {
-	mu    sync.Mutex
-	value float64
-	at    time.Time
-}
-
-func (g *gunTempState) set(v float64) {
-	g.mu.Lock()
-	g.value = v
-	g.at = time.Now()
-	g.mu.Unlock()
-}
-
-func (g *gunTempState) label() string {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.at.IsZero() || time.Since(g.at) > localGunTempMaxAge {
-		return "—"
-	}
-	return fmt.Sprintf("%.1f °C (gun)", g.value)
-}
-
 // captureVideoSize and captureFramerate pin dshow/v4l2 to a modest resolution
 // so MJPEG frames stay small and ffmpeg does not buffer high-res captures.
 const captureVideoSize = "640x480"
@@ -81,28 +52,7 @@ const captureFramerate = "30"
 const cameraFPS = 30
 const maxChatImageBytes = 2 * 1024 * 1024
 
-// CLI reads can fail if the operator starts monitoring before the device is
-// ready (e.g. NIBP cuff not yet started). Retry a few times before giving up.
-const (
-	cliMaxAttempts = 4
-	cliRetryDelay  = 2 * time.Second
-)
-
-// readingIdleTimeout is how long heart rate / SpO2 waits for new samples before
-// saving the last value and stopping automatically.
-const readingIdleTimeout = 3 * time.Second
-
-// cliShutdownTimeout bounds how long we wait for lepu_cli to exit after cancel.
-const cliShutdownTimeout = 2 * time.Second
-
 const dependenciesDir = "dependencies"
-
-type readingSessionKind int
-
-const (
-	readingSessionContinuous readingSessionKind = iota // heart rate — stop after idle
-	readingSessionFinal                                // NIBP, glucose, temp — stop on final reading
-)
 
 // blankFrame is a 1x1 fully transparent image used in place of nil so that
 // canvas.Image always has content. A visible canvas.Image with nil content
@@ -442,9 +392,6 @@ func fitToPreview(src image.Image) *image.RGBA {
 	return dst
 }
 
-// LineParser function signature
-type LineParser func(line string) (interface{}, error)
-
 // AppConfig holds all persisted settings.
 type AppConfig struct {
 	ServerBase       string `json:"server_base"`
@@ -454,7 +401,6 @@ type AppConfig struct {
 	PatientWeight    string `json:"patient_weight"`
 	PatientHeight    string `json:"patient_height"`
 	PatientGender    string `json:"patient_gender"`
-	StethMAC         string `json:"steth_mac"`
 	LightMode        bool   `json:"light_mode"`
 	MonitorEnabled   bool   `json:"monitor_enabled"`
 	MonitorBindHost  string `json:"monitor_bind_host"`
@@ -606,9 +552,6 @@ func prepareChatImageFile(path string) ([]byte, string, error) {
 }
 
 var (
-	currentCmd    *exec.Cmd
-	cmdMutex      sync.Mutex
-	cancelFunc    context.CancelFunc
 	previewMu     sync.Mutex
 	previewCancel context.CancelFunc
 	wsConn        *websocket.Conn
@@ -791,7 +734,6 @@ func main() {
 	liveSpO2Label := widget.NewLabel("—")
 	liveNIBPLabel := widget.NewLabel("—")
 	liveTempLabel := widget.NewLabel("—")
-	var gunTemp gunTempState
 
 	monitorCfgFromUI := func() AppConfig {
 		port, _ := strconv.Atoi(strings.TrimSpace(monitorPortEntry.Text))
@@ -983,80 +925,28 @@ func main() {
 		}()
 	})
 
-	// Action Buttons
-	var stopBtn *widget.Button
-
-	startProcess := func(name string, args []string, parser LineParser) {
-		cmdMutex.Lock()
-		if currentCmd != nil {
-			cmdMutex.Unlock()
-			log("Error: A process is already running. Stop it first.")
+	commitVitalFromMonitor := func(kind monitor.VitalKind) {
+		if !monitorEnabledCheck.Checked {
+			log("Error: Enable TR8 monitor in Settings to capture vitals from HL7")
+			fyne.Do(func() {
+				dialog.ShowInformation("Monitor required", "Enable TR8 HL7 monitor in Settings. Vitals (including temperature) come from the monitor stream.", myWindow)
+			})
 			return
 		}
-		cmdMutex.Unlock()
-
-		targetURL := ingestURL(strings.TrimSpace(serverBaseEntry.Text))
-		if strings.TrimSpace(serverBaseEntry.Text) == "" {
+		base := strings.TrimSpace(serverBaseEntry.Text)
+		if base == "" {
 			log("Error: Please enter a Server Base URL in Settings")
 			return
 		}
-
-		clinicName := clinicNameEntry.Text
-		if clinicName == "" {
-			log("Error: Please enter a Clinic Name")
-			return
-		}
-
-		patientName := patientNameEntry.Text
-		if patientName == "" {
-			log("Error: Please enter a Patient Name")
-			return
-		}
-
-		stopBtn.Enable()
-		onCLIReading := func(data map[string]interface{}) {
-			if v, ok := data["temp"].(float64); ok && v > 0 && v < 50 {
-				gunTemp.set(v)
-				fyne.Do(func() {
-					liveTempLabel.SetText(gunTemp.label())
-				})
-			}
-		}
-		go runCLIAndSend(name, args, parser, targetURL, clinicName, patientName, log, onCLIReading, func() {
-			fyne.Do(func() { stopBtn.Disable() })
-		})
-	}
-
-	stopBtn = widget.NewButtonWithIcon("Stop", theme.MediaStopIcon(), func() {
-		cmdMutex.Lock()
-		defer cmdMutex.Unlock()
-		if cancelFunc != nil {
-			cancelFunc()
-			log("Stopping process...")
-		}
-	})
-	stopBtn.Importance = widget.DangerImportance
-	stopBtn.Disable()
-
-	vitalButtonTapped := func(name string, args []string, parser LineParser, kind monitor.VitalKind) {
-		if monitorEnabledCheck.Checked {
-			base := strings.TrimSpace(serverBaseEntry.Text)
-			if base == "" {
-				log("Error: Please enter a Server Base URL in Settings")
-				return
-			}
-			go commitFromMonitor(myWindow, log, monitorState, kind, ingestURL(base), clinicNameEntry.Text, patientNameEntry.Text)
-			return
-		}
-		startProcess(name, args, parser)
+		go commitFromMonitor(myWindow, log, monitorState, kind, ingestURL(base), clinicNameEntry.Text, patientNameEntry.Text)
 	}
 
 	btnHeartRate := widget.NewButtonWithIcon("Heart Rate / SpO2", theme.DocumentSaveIcon(), func() {
-		vitalButtonTapped("HeartRate", []string{"-heartrate"}, parseHeartRateLine, monitor.VitalHeartRate)
+		commitVitalFromMonitor(monitor.VitalHeartRate)
 	})
 
 	btnNIBP := widget.NewButtonWithIcon("NIBP", theme.DocumentSaveIcon(), func() {
-		vitalButtonTapped("NIBP", []string{"-nibp"}, parseNIBPLine, monitor.VitalNIBP)
+		commitVitalFromMonitor(monitor.VitalNIBP)
 	})
 
 	glucoseEntry := widget.NewEntry()
@@ -1108,22 +998,14 @@ func main() {
 	btnSaveGlucose.Importance = widget.HighImportance
 	glucoseEntry.OnSubmitted = func(string) { submitGlucose() }
 
-	btnTemp := widget.NewButtonWithIcon("Temperature", theme.MediaPlayIcon(), func() {
-		startProcess("Temperature", []string{"-temperature"}, parseTemperatureLine)
+	btnTemp := widget.NewButtonWithIcon("Temperature", theme.DocumentSaveIcon(), func() {
+		commitVitalFromMonitor(monitor.VitalTemp)
 	})
 
 	updateVitalButtonIcons := func() {
-		monitorSave := theme.DocumentSaveIcon()
-		cliPlay := theme.MediaPlayIcon()
-		if monitorEnabledCheck.Checked {
-			btnHeartRate.SetIcon(monitorSave)
-			btnNIBP.SetIcon(monitorSave)
-		} else {
-			btnHeartRate.SetIcon(cliPlay)
-			btnNIBP.SetIcon(cliPlay)
-		}
-		// Body temp uses lepu_cli gun even when TR8 monitor is enabled (monitor temp is often unset).
-		btnTemp.SetIcon(cliPlay)
+		btnHeartRate.SetIcon(theme.DocumentSaveIcon())
+		btnNIBP.SetIcon(theme.DocumentSaveIcon())
+		btnTemp.SetIcon(theme.DocumentSaveIcon())
 	}
 	updateVitalButtonIcons()
 
@@ -1212,64 +1094,6 @@ func main() {
 		updateECGButtons()
 		startMonitorListener(monitorCfgFromUI())
 	}
-
-	// Stethoscope
-	var stethMacEntry *widget.Entry
-
-	stethMacEntry = widget.NewEntry()
-	stethMacEntry.SetPlaceHolder("AA:BB:CC:DD:EE:FF")
-	stethMacEntry.SetText(cfg.StethMAC)
-
-	btnStethoscope := widget.NewButtonWithIcon("Stethoscope", theme.MediaPlayIcon(), func() {
-		mac := strings.TrimSpace(stethMacEntry.Text)
-		if mac == "" {
-			// If no MAC is entered, try to auto-detect if there's exactly one device
-
-			cmdPath := resolveDependencyCLI("MinttiCLI.exe")
-
-			// Run a quick scan to see if we can find exactly one device
-			go func() {
-				cmd := exec.Command(cmdPath, "-list")
-				configureDependencyCmd(cmd, cmdPath)
-				output, err := cmd.CombinedOutput()
-				if err != nil {
-					log(fmt.Sprintf("Auto-scan failed: %v", err))
-					return
-				}
-
-				lines := strings.Split(string(output), "\n")
-				var foundMacs []string
-				for _, line := range lines {
-					line = strings.TrimSpace(line)
-					if strings.Contains(line, "DATA:ITEM") {
-						// Simple extraction of mac="..."
-						if start := strings.Index(line, "mac=\""); start != -1 {
-							rest := line[start+len("mac=\""):]
-							if end := strings.Index(rest, "\""); end != -1 {
-								foundMacs = append(foundMacs, rest[:end])
-							}
-						}
-					}
-				}
-
-				if len(foundMacs) == 1 {
-					autoMac := foundMacs[0]
-					fyne.Do(func() {
-						stethMacEntry.SetText(autoMac)
-						log(fmt.Sprintf("Auto-detected single stethoscope: %s", autoMac))
-						// Start the process now that we have the MAC
-						startProcess("StethoscopeStream", []string{"-connect", "-mac", autoMac}, parseStethoscopeLine)
-					})
-				} else if len(foundMacs) > 1 {
-					log(fmt.Sprintf("Found %d devices. Please enter a MAC address manually.", len(foundMacs)))
-				} else {
-					log("No stethoscopes found. Ensure device is on and in range.")
-				}
-			}()
-			return
-		}
-		startProcess("StethoscopeStream", []string{"-connect", "-mac", mac}, parseStethoscopeLine)
-	})
 
 	runCameraCommand := func(action string, args []string) {
 		go func() {
@@ -2610,7 +2434,6 @@ func main() {
 			PatientWeight:   strings.TrimSpace(weightEntry.Text),
 			PatientHeight:   strings.TrimSpace(heightEntry.Text),
 			PatientGender:   genderSelect.Selected,
-			StethMAC:        strings.TrimSpace(stethMacEntry.Text),
 			LightMode:       lightModeCheck.Checked,
 			MonitorEnabled:  mon.MonitorEnabled,
 			MonitorBindHost: mon.MonitorBindHost,
@@ -2697,7 +2520,6 @@ func main() {
 			PatientWeight:   strings.TrimSpace(weightEntry.Text),
 			PatientHeight:   strings.TrimSpace(heightEntry.Text),
 			PatientGender:   genderSelect.Selected,
-			StethMAC:        strings.TrimSpace(stethMacEntry.Text),
 			LightMode:       lightModeCheck.Checked,
 			MonitorEnabled:  mon.MonitorEnabled,
 			MonitorBindHost: mon.MonitorBindHost,
@@ -2788,25 +2610,12 @@ func main() {
 		)),
 		widget.NewSeparator(),
 		widget.NewCard("ECG", "Live W01 preview (Lead II / best ECG lead); save PNG or upload when monitor is off", ecgCardBody),
-	}
-	if showStethoscopeInReadings {
-		readingsParts = append(readingsParts,
-			widget.NewSeparator(),
-			widget.NewCard("Stethoscope", "Search, connect, and stream auscultation", container.NewVBox(
-				widget.NewLabel("MAC Address (optional):"),
-				stethMacEntry,
-				btnStethoscope,
-			)),
-		)
-	}
-	readingsParts = append(readingsParts,
 		widget.NewSeparator(),
 		widget.NewCard("Live Console", "System Active", container.NewVBox(
 			statusLabel,
 			container.NewStack(logScroll),
-			stopBtn,
 		)),
-	)
+	}
 	readingsContent := container.NewVBox(readingsParts...)
 
 	// 3. Comms Tab — split into Video, Control, and Chat sub-tabs
@@ -2932,11 +2741,7 @@ func main() {
 				}
 			}
 			snap := monitorState.Snapshot()
-			hr, spo2, nibp, monTemp := monitor.FormatVitalDisplay(snap.Vitals)
-			temp := monTemp
-			if temp == "—" {
-				temp = gunTemp.label()
-			}
+			hr, spo2, nibp, temp := monitor.FormatVitalDisplay(snap.Vitals)
 			status := monitor.ConnectionStatusText(snap.Connection, time.Now(), snap.Vitals)
 			patientCopy := snap.Patient
 			shouldSyncPatient := strings.TrimSpace(patientCopy.PatientID) != "" ||
@@ -2968,39 +2773,6 @@ func main() {
 	startMonitorListener(monitorCfgFromUI())
 
 	myWindow.ShowAndRun()
-}
-
-type cliAttemptResult struct {
-	cancelled      bool
-	completed      bool // auto-stopped after final reading or idle timeout
-	receivedOutput bool
-	errMsg         string
-}
-
-func (r cliAttemptResult) succeeded() bool {
-	return r.receivedOutput || r.completed
-}
-
-func readingSessionKindForName(name string) readingSessionKind {
-	switch name {
-	case "HeartRate":
-		return readingSessionContinuous
-	default:
-		return readingSessionFinal
-	}
-}
-
-func isFinalReading(data map[string]interface{}) bool {
-	switch t, _ := data["type"].(string); t {
-	case "result":
-		return true
-	case "data":
-		_, hasGlu := data["glu"]
-		_, hasTemp := data["temp"]
-		return hasGlu || hasTemp
-	default:
-		return false
-	}
 }
 
 func commitFromMonitor(
@@ -3119,28 +2891,6 @@ func formatPayloadForLog(payload map[string]interface{}) string {
 	return fmt.Sprintf("%v", view)
 }
 
-func waitCLIShutdown(scanDone <-chan struct{}, cmd *exec.Cmd) error {
-	select {
-	case <-scanDone:
-	case <-time.After(cliShutdownTimeout):
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		select {
-		case <-scanDone:
-		case <-time.After(cliShutdownTimeout):
-		}
-	}
-	return cmd.Wait()
-}
-
-func normalizeCLILine(line string) string {
-	normalized := strings.TrimSpace(line)
-	normalized = strings.TrimPrefix(normalized, "\ufeff")
-	normalized = strings.ReplaceAll(normalized, " ", "")
-	return strings.ToUpper(normalized)
-}
-
 func defaultAppBaseDir() string {
 	exe, err := os.Executable()
 	if err == nil {
@@ -3209,255 +2959,6 @@ func configureDependencyCmd(cmd *exec.Cmd, cmdPath string) {
 	if dir := filepath.Dir(abs); dir != "" && dir != "." {
 		cmd.Dir = dir
 	}
-}
-
-func resolveCLIPath(name string) string {
-	cmdPath := "lepu_cli.exe"
-	if name == "StethoscopeList" || name == "StethoscopeStream" {
-		cmdPath = "MinttiCLI.exe"
-	}
-	return resolveDependencyCLI(cmdPath)
-}
-
-func runCLIOnce(ctx context.Context, cancel context.CancelFunc, cmdPath string, args []string, parser LineParser, sessionKind readingSessionKind, targetURL, clinicName, patientName string, log func(string), onReading func(map[string]interface{})) cliAttemptResult {
-	result := cliAttemptResult{}
-
-	if ctx.Err() != nil {
-		result.cancelled = true
-		return result
-	}
-
-	cmd := exec.CommandContext(ctx, cmdPath, args...)
-	configureDependencyCmd(cmd, cmdPath)
-
-	cmdMutex.Lock()
-	currentCmd = cmd
-	cmdMutex.Unlock()
-
-	defer func() {
-		cmdMutex.Lock()
-		if currentCmd == cmd {
-			currentCmd = nil
-		}
-		cmdMutex.Unlock()
-	}()
-
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		result.errMsg = fmt.Sprintf("error creating stdout pipe: %v", err)
-		return result
-	}
-
-	if err := cmd.Start(); err != nil {
-		result.errMsg = fmt.Sprintf("error starting process: %v", err)
-		return result
-	}
-
-	scanner := bufio.NewScanner(stdout)
-	lineCh := make(chan string)
-	scanDone := make(chan struct{})
-	go func() {
-		for scanner.Scan() {
-			lineCh <- scanner.Text()
-		}
-		close(lineCh)
-		close(scanDone)
-	}()
-
-	var pendingReading map[string]interface{}
-	var idleTimer *time.Timer
-	var idleC <-chan time.Time
-	resetIdle := func() {
-		if sessionKind != readingSessionContinuous {
-			return
-		}
-		if idleTimer == nil {
-			idleTimer = time.NewTimer(readingIdleTimeout)
-			idleC = idleTimer.C
-			return
-		}
-		if !idleTimer.Stop() {
-			select {
-			case <-idleTimer.C:
-			default:
-			}
-		}
-		idleTimer.Reset(readingIdleTimeout)
-	}
-	if sessionKind == readingSessionContinuous {
-		resetIdle()
-	}
-	defer func() {
-		if idleTimer != nil {
-			idleTimer.Stop()
-		}
-	}()
-
-	finishAfterSend := func(reason string) cliAttemptResult {
-		if pendingReading == nil {
-			result.errMsg = "no reading to send"
-			cancel()
-			go waitCLIShutdown(scanDone, cmd)
-			return result
-		}
-		if reason != "" {
-			log(reason)
-		}
-		if err := sendReadingPayload(log, targetURL, clinicName, patientName, pendingReading); err != nil {
-			log(fmt.Sprintf("Error sending data: %v", err))
-			result.errMsg = err.Error()
-		} else {
-			result.completed = true
-		}
-		cancel()
-		go waitCLIShutdown(scanDone, cmd)
-		return result
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			goto flush
-		case <-idleC:
-			if pendingReading == nil {
-				log("No readings received.")
-				cancel()
-				go waitCLIShutdown(scanDone, cmd)
-				result.errMsg = "no data received from device"
-				return result
-			}
-			return finishAfterSend("No new readings — saving last value.")
-		case line, ok := <-lineCh:
-			if !ok {
-				goto flush
-			}
-			resetIdle()
-
-			data, err := parser(line)
-			if err != nil {
-				continue
-			}
-			if data == nil {
-				continue
-			}
-
-			result.receivedOutput = true
-			dataMap, ok := data.(map[string]interface{})
-			if !ok {
-				continue
-			}
-
-			if dataMap["type"] == "error" {
-				log(fmt.Sprintf("Device error: %v", dataMap))
-				cancel()
-				go waitCLIShutdown(scanDone, cmd)
-				result.errMsg = fmt.Sprintf("device error: %v", dataMap)
-				return result
-			}
-			if !shouldSendReading(dataMap) {
-				continue
-			}
-
-			pendingReading = maps.Clone(dataMap)
-			if onReading != nil {
-				onReading(dataMap)
-			}
-			if sessionKind == readingSessionFinal && isFinalReading(dataMap) {
-				return finishAfterSend("Final reading received.")
-			}
-		}
-	}
-
-flush:
-	if pendingReading != nil && !result.completed {
-		if err := sendReadingPayload(log, targetURL, clinicName, patientName, pendingReading); err != nil {
-			log(fmt.Sprintf("Error sending data: %v", err))
-		} else {
-			result.completed = true
-		}
-	}
-
-	waitErr := waitCLIShutdown(scanDone, cmd)
-	if ctx.Err() == context.Canceled {
-		if result.completed {
-			return result
-		}
-		result.cancelled = true
-		return result
-	}
-
-	if waitErr != nil {
-		result.errMsg = waitErr.Error()
-		if stderr := strings.TrimSpace(stderrBuf.String()); stderr != "" {
-			result.errMsg = fmt.Sprintf("%s: %s", result.errMsg, stderr)
-		}
-	} else if !result.receivedOutput {
-		result.errMsg = "no data received from device"
-		if stderr := strings.TrimSpace(stderrBuf.String()); stderr != "" {
-			result.errMsg = fmt.Sprintf("%s: %s", result.errMsg, stderr)
-		}
-	}
-
-	return result
-}
-
-func runCLIAndSend(name string, args []string, parser LineParser, targetURL string, clinicName string, patientName string, log func(string), onReading func(map[string]interface{}), onFinish func()) {
-	defer onFinish()
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	cmdMutex.Lock()
-	cancelFunc = cancel
-	cmdMutex.Unlock()
-
-	defer func() {
-		cmdMutex.Lock()
-		currentCmd = nil
-		cancelFunc = nil
-		cmdMutex.Unlock()
-	}()
-
-	cmdPath := resolveCLIPath(name)
-	var lastErr string
-
-	for attempt := 1; attempt <= cliMaxAttempts; attempt++ {
-		if attempt > 1 {
-			select {
-			case <-ctx.Done():
-				log("Process stopped by user.")
-				return
-			case <-time.After(cliRetryDelay):
-			}
-		}
-
-		log(fmt.Sprintf("Starting %s (attempt %d/%d, %s)...", name, attempt, cliMaxAttempts, cmdPath))
-
-		result := runCLIOnce(ctx, cancel, cmdPath, args, parser, readingSessionKindForName(name), targetURL, clinicName, patientName, log, onReading)
-		if result.cancelled {
-			log("Process stopped by user.")
-			return
-		}
-		if result.completed || result.succeeded() {
-			if result.receivedOutput {
-				if result.completed {
-					log("Reading complete.")
-				} else {
-					log("Process finished successfully.")
-				}
-			}
-			return
-		}
-
-		lastErr = result.errMsg
-		if attempt < cliMaxAttempts {
-			log(fmt.Sprintf("Attempt %d failed: %s", attempt, lastErr))
-		}
-	}
-
-	log(fmt.Sprintf("Error: %s failed after %d attempts: %s", name, cliMaxAttempts, lastErr))
 }
 
 func sendData(url string, data interface{}) error {
@@ -3702,253 +3203,4 @@ func normalizeWindowsDeviceName(device string) string {
 	name := strings.Trim(d, `"`)
 	// For exec.Command we do NOT need quotes; they are only for shell protection.
 	return "video=" + name
-}
-
-// --- Parsers (Copied from legacy/main.go) ---
-
-func shouldSendReading(data map[string]interface{}) bool {
-	switch t, _ := data["type"].(string); t {
-	case "cuff_update", "status", "error", "discovery":
-		return false
-	default:
-		return true
-	}
-}
-
-// Heart Rate / SpO2
-// Output: DATA:PR=75,SPO2=98
-// Or Status: STATUS:PROBE_OFF
-func parseHeartRateLine(line string) (interface{}, error) {
-	line = strings.TrimSpace(line)
-	if strings.HasPrefix(line, "DATA:") {
-		parts := strings.TrimPrefix(line, "DATA:")
-		kv := parseKV(parts)
-
-		pr, _ := strconv.Atoi(kv["PR"])
-		spo2, _ := strconv.Atoi(kv["SPO2"])
-
-		return map[string]interface{}{
-			"type": "data",
-			"pr":   pr,
-			"spo2": spo2,
-		}, nil
-	} else if strings.HasPrefix(line, "STATUS:") {
-		status := strings.TrimPrefix(line, "STATUS:")
-		return map[string]interface{}{
-			"type": "status",
-			"msg":  status,
-		}, nil
-	}
-	return nil, nil
-}
-
-// NIBP
-func parseNIBPLine(line string) (interface{}, error) {
-	normalized := strings.ReplaceAll(line, " ", "")
-	normalized = strings.ReplaceAll(normalized, "\r", "")
-	normalized = strings.ToUpper(normalized)
-
-	if strings.HasPrefix(normalized, "DATA:CUFF_PRESSURE=") {
-		valStr := strings.TrimPrefix(normalized, "DATA:CUFF_PRESSURE=")
-		val, _ := strconv.Atoi(valStr)
-		return map[string]interface{}{
-			"type":          "cuff_update",
-			"cuff_pressure": val,
-		}, nil
-	} else if strings.HasPrefix(normalized, "DATA:NIBP_RESULT:") {
-		partsStr := strings.TrimPrefix(normalized, "DATA:NIBP_RESULT:")
-		parts := strings.Split(partsStr, ",")
-		resultMap := make(map[string]string)
-
-		for _, p := range parts {
-			if strings.Contains(p, "=") {
-				kv := strings.SplitN(p, "=", 2)
-				if len(kv) == 2 {
-					resultMap[kv[0]] = kv[1]
-				}
-			} else {
-				if strings.HasPrefix(p, "MAP") {
-					resultMap["MAP"] = strings.TrimPrefix(p, "MAP")
-				} else if strings.HasPrefix(p, "PR") {
-					resultMap["PR"] = strings.TrimPrefix(p, "PR")
-				} else if strings.HasPrefix(p, "SYS") {
-					resultMap["SYS"] = strings.TrimPrefix(p, "SYS")
-				} else if strings.HasPrefix(p, "DIA") {
-					resultMap["DIA"] = strings.TrimPrefix(p, "DIA")
-				}
-			}
-		}
-
-		sys, _ := strconv.Atoi(resultMap["SYS"])
-		dia, _ := strconv.Atoi(resultMap["DIA"])
-		mean, _ := strconv.Atoi(resultMap["MAP"])
-		pr, _ := strconv.Atoi(resultMap["PR"])
-
-		irrVal := resultMap["IRR"]
-		irr := irrVal == "TRUE"
-
-		return map[string]interface{}{
-			"type": "result",
-			"sys":  sys,
-			"dia":  dia,
-			"map":  mean,
-			"pr":   pr,
-			"irr":  irr,
-		}, nil
-	} else if strings.HasPrefix(normalized, "STATUS:NIBP_ERROR=") {
-		codeStr := strings.TrimPrefix(normalized, "STATUS:NIBP_ERROR=")
-		code, _ := strconv.Atoi(codeStr)
-		return map[string]interface{}{
-			"type": "error",
-			"code": code,
-		}, nil
-	} else if strings.HasPrefix(normalized, "STATUS:NIBP_END") {
-		return map[string]interface{}{
-			"type": "status",
-			"msg":  "NIBP_END",
-		}, nil
-	}
-	return nil, nil
-}
-
-// Temperature (lepu_cli / infrared gun). Accepts DATA:TEMP=… and comma-separated DATA: lines.
-func parseTemperatureLine(line string) (interface{}, error) {
-	normalized := normalizeCLILine(line)
-	if strings.HasPrefix(normalized, "DATA:") {
-		payload := strings.TrimPrefix(normalized, "DATA:")
-		if strings.HasPrefix(payload, "TEMP=") {
-			valStr := strings.TrimPrefix(payload, "TEMP=")
-			if idx := strings.Index(valStr, ","); idx >= 0 {
-				valStr = valStr[:idx]
-			}
-			if val, ok := parseTemperatureValue(valStr); ok {
-				return temperatureReading(val), nil
-			}
-		}
-		kv := parseKV(payload)
-		for key, valStr := range kv {
-			switch strings.ToUpper(strings.TrimSpace(key)) {
-			case "TEMP", "BODYTEMP", "BT", "T":
-				if val, ok := parseTemperatureValue(valStr); ok {
-					return temperatureReading(val), nil
-				}
-			}
-		}
-	}
-	return nil, nil
-}
-
-func parseTemperatureValue(raw string) (float64, bool) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return 0, false
-	}
-	val, err := strconv.ParseFloat(raw, 64)
-	if err != nil || val <= 0 || val >= 50 {
-		return 0, false
-	}
-	return val, true
-}
-
-func temperatureReading(celsius float64) map[string]interface{} {
-	return map[string]interface{}{
-		"type": "data",
-		"temp": celsius,
-	}
-}
-
-// Stethoscope
-func parseStethoscopeLine(line string) (interface{}, error) {
-	line = strings.TrimSpace(line)
-	if !strings.HasPrefix(line, "DATA:") {
-		return nil, nil
-	}
-
-	parts := strings.TrimPrefix(line, "DATA:")
-	if strings.HasPrefix(parts, "OK") {
-		return map[string]interface{}{
-			"type": "status",
-			"msg":  parts,
-		}, nil
-	}
-	if strings.HasPrefix(parts, "ERROR") {
-		return map[string]interface{}{
-			"type": "error",
-			"msg":  parts,
-		}, nil
-	}
-	if strings.HasPrefix(parts, "STATUS") {
-		return map[string]interface{}{
-			"type": "status",
-			"msg":  parts,
-		}, nil
-	}
-	if strings.HasPrefix(parts, "LIST") || strings.HasPrefix(parts, "ITEM") {
-		return map[string]interface{}{
-			"type": "discovery",
-			"msg":  parts,
-		}, nil
-	}
-	if strings.HasPrefix(parts, "STREAM") {
-		// DATA:STREAM type=audio data=[...]
-		// DATA:STREAM type=heartrate value=N
-		streamParts := parseKVSpace(parts)
-		res := map[string]interface{}{
-			"type": "stream",
-		}
-		for k, v := range streamParts {
-			if k == "type" {
-				res["stream_type"] = v
-			} else if k == "data" {
-				var audioData []int16
-				if err := json.Unmarshal([]byte(v), &audioData); err == nil {
-					res["data"] = audioData
-				} else {
-					res["data"] = v
-				}
-			} else if k == "value" {
-				if val, err := strconv.Atoi(v); err == nil {
-					res["value"] = val
-				} else {
-					res["value"] = v
-				}
-			} else {
-				res[k] = v
-			}
-		}
-		return res, nil
-	}
-
-	return map[string]interface{}{
-		"type": "raw",
-		"msg":  parts,
-	}, nil
-}
-
-func parseKVSpace(input string) map[string]string {
-	result := make(map[string]string)
-	// Simple space-based KV parser for "type=audio data=[...]"
-	// This is naive but should work for the expected format
-	pairs := strings.Split(input, " ")
-	for _, p := range pairs {
-		if strings.Contains(p, "=") {
-			parts := strings.SplitN(p, "=", 2)
-			if len(parts) == 2 {
-				result[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-			}
-		}
-	}
-	return result
-}
-
-func parseKV(input string) map[string]string {
-	result := make(map[string]string)
-	pairs := strings.Split(input, ",")
-	for _, p := range pairs {
-		parts := strings.SplitN(p, "=", 2)
-		if len(parts) == 2 {
-			result[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-		}
-	}
-	return result
 }

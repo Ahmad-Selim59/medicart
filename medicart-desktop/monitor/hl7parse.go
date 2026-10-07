@@ -412,9 +412,9 @@ func parseOBX(seg hl7Segment, v *VitalsSnapshot, p *PatientSnapshot) bool {
 			v.NIBPPulse = IntReading{Value: n, Valid: true, ObservedAt: obsTime}
 			return true
 		}
-	case "MDC_TEMP", "150344":
-		if f, ok := validFloat(rawVal); ok {
-			v.Temp = FloatReading{Value: f, Valid: true, ObservedAt: obsTime}
+	case "MDC_TEMP", "150344", "188440", "188472":
+		if f, ok := validBodyTempCelsius(rawVal); ok {
+			applyBodyTemp(v, f, obsTime)
 			return true
 		}
 	case "MDC_ATTR_PT_WEIGHT", "MDC_WEIGHT", "MDC_BODY_WEIGHT":
@@ -504,4 +504,30 @@ func validFloat(raw string) (float64, bool) {
 		return 0, false
 	}
 	return f, true
+}
+
+func validBodyTempCelsius(raw string) (float64, bool) {
+	f, ok := validFloat(raw)
+	if !ok {
+		return 0, false
+	}
+	// Plausible clinical range (°C); TR8 sends MDC_DIM_DEGC for 150344.
+	if f < 25 || f > 45 {
+		return 0, false
+	}
+	return f, true
+}
+
+func applyBodyTemp(v *VitalsSnapshot, celsius float64, obsTime time.Time) {
+	if v == nil {
+		return
+	}
+	if !v.Temp.Valid {
+		v.Temp = FloatReading{Value: celsius, Valid: true, ObservedAt: obsTime}
+		return
+	}
+	if !obsTime.IsZero() && !v.Temp.ObservedAt.IsZero() && obsTime.Before(v.Temp.ObservedAt) {
+		return
+	}
+	v.Temp = FloatReading{Value: celsius, Valid: true, ObservedAt: obsTime}
 }

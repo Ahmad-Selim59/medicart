@@ -1,19 +1,14 @@
 package main
 
 import (
-	"context"
 	"image"
 	"image/color"
 	"image/png"
-	"net/http"
-	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -28,7 +23,7 @@ func TestResolveDependencyCLIUsesAppBaseDir(t *testing.T) {
 	if err := os.MkdirAll(deps, 0o755); err != nil {
 		t.Fatalf("mkdir dependencies: %v", err)
 	}
-	exePath := filepath.Join(deps, "lepu_cli.exe")
+	exePath := filepath.Join(deps, "camera_cli.exe")
 	if err := os.WriteFile(exePath, []byte("fake"), 0o755); err != nil {
 		t.Fatalf("write fake exe: %v", err)
 	}
@@ -37,7 +32,7 @@ func TestResolveDependencyCLIUsesAppBaseDir(t *testing.T) {
 	appBaseDir = func() string { return tmp }
 	t.Cleanup(func() { appBaseDir = orig })
 
-	got := resolveDependencyCLI("lepu_cli.exe")
+	got := resolveDependencyCLI("camera_cli.exe")
 	want, err := filepath.Abs(exePath)
 	if err != nil {
 		t.Fatalf("abs exe path: %v", err)
@@ -47,189 +42,7 @@ func TestResolveDependencyCLIUsesAppBaseDir(t *testing.T) {
 	}
 }
 
-func TestCLIAttemptSucceeded(t *testing.T) {
-	cases := []struct {
-		name   string
-		result cliAttemptResult
-		want   bool
-	}{
-		{
-			name:   "received output",
-			result: cliAttemptResult{receivedOutput: true, errMsg: "exit status 1"},
-			want:   true,
-		},
-		{
-			name:   "clean exit with no output",
-			result: cliAttemptResult{},
-			want:   false,
-		},
-		{
-			name:   "failed with no output",
-			result: cliAttemptResult{errMsg: "exit status 1"},
-			want:   false,
-		},
-		{
-			name:   "no data received",
-			result: cliAttemptResult{errMsg: "no data received from device"},
-			want:   false,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.result.succeeded(); got != tc.want {
-				t.Fatalf("succeeded() = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestRunCLIOnceRetriesUntilOutput(t *testing.T) {
-	shPath, err := exec.LookPath("sh")
-	if err != nil {
-		t.Skip("sh not available")
-	}
-
-	script := `if [ "$1" = "fail" ]; then exit 1; fi; echo "DATA:PR=75,SPO2=98"`
-	tmp, err := os.CreateTemp("", "medicart-cli-retry-*.sh")
-	if err != nil {
-		t.Fatalf("create temp script: %v", err)
-	}
-	defer os.Remove(tmp.Name())
-
-	if _, err := tmp.WriteString(script); err != nil {
-		t.Fatalf("write temp script: %v", err)
-	}
-	if err := tmp.Close(); err != nil {
-		t.Fatalf("close temp script: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	var logs []string
-	logFn := func(msg string) { logs = append(logs, msg) }
-
-	result := runCLIOnce(ctx, cancel, shPath, []string{tmp.Name(), "fail"}, parseHeartRateLine, readingSessionContinuous, "http://127.0.0.1:1", "Clinic", "Patient", logFn, nil)
-	if result.succeeded() {
-		t.Fatalf("expected failed attempt, got %+v", result)
-	}
-	if result.errMsg == "" {
-		t.Fatal("expected error message on failed attempt")
-	}
-
-	result = runCLIOnce(ctx, cancel, shPath, []string{tmp.Name(), "ok"}, parseHeartRateLine, readingSessionContinuous, "http://127.0.0.1:1", "Clinic", "Patient", logFn, nil)
-	if !result.succeeded() || !result.receivedOutput {
-		t.Fatalf("expected successful attempt with output, got %+v", result)
-	}
-}
-
-func TestIsFinalReading(t *testing.T) {
-	cases := []struct {
-		name string
-		data map[string]interface{}
-		want bool
-	}{
-		{name: "nibp result", data: map[string]interface{}{"type": "result", "sys": 120}, want: true},
-		{name: "glucose", data: map[string]interface{}{"type": "data", "glu": 105}, want: true},
-		{name: "temperature", data: map[string]interface{}{"type": "data", "temp": 36.5}, want: true},
-		{name: "heart rate", data: map[string]interface{}{"type": "data", "pr": 75, "spo2": 98}, want: false},
-		{name: "cuff update", data: map[string]interface{}{"type": "cuff_update", "cuff_pressure": 120}, want: false},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := isFinalReading(tc.data); got != tc.want {
-				t.Fatalf("isFinalReading() = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestParseTemperatureLine(t *testing.T) {
-	cases := []struct {
-		line string
-		want float64
-	}{
-		{line: "DATA:TEMP=36.5", want: 36.5},
-		{line: "data: temp=37.1", want: 37.1},
-		{line: "DATA:TEMP=36.2,UNIT=C", want: 36.2},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.line, func(t *testing.T) {
-			got, err := parseTemperatureLine(tc.line)
-			if err != nil {
-				t.Fatalf("parseTemperatureLine() error = %v", err)
-			}
-			data, ok := got.(map[string]interface{})
-			if !ok {
-				t.Fatalf("expected map result, got %T", got)
-			}
-			if !isFinalReading(data) {
-				t.Fatal("expected temperature reading to be final")
-			}
-			temp, ok := data["temp"].(float64)
-			if !ok || temp != tc.want {
-				t.Fatalf("temp = %v, want %v", data["temp"], tc.want)
-			}
-		})
-	}
-}
-
-func TestRunCLIOnceAutoStopsOnNIBPResult(t *testing.T) {
-	shPath, err := exec.LookPath("sh")
-	if err != nil {
-		t.Skip("sh not available")
-	}
-
-	script := `echo "DATA:CUFF_PRESSURE=120"
-echo "DATA:NIBP_RESULT:SYS=120,DIA=80,MAP=93,PR=70"
-sleep 60
-`
-	tmp, err := os.CreateTemp("", "medicart-cli-nibp-*.sh")
-	if err != nil {
-		t.Fatalf("create temp script: %v", err)
-	}
-	defer os.Remove(tmp.Name())
-
-	if _, err := tmp.WriteString(script); err != nil {
-		t.Fatalf("write temp script: %v", err)
-	}
-	if err := tmp.Close(); err != nil {
-		t.Fatalf("close temp script: %v", err)
-	}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	var logs []string
-	logFn := func(msg string) { logs = append(logs, msg) }
-
-	result := runCLIOnce(ctx, cancel, shPath, []string{tmp.Name()}, parseNIBPLine, readingSessionFinal, srv.URL, "Clinic", "Patient", logFn, nil)
-	if !result.completed {
-		t.Fatalf("expected auto-complete after NIBP result, got %+v", result)
-	}
-	if !result.receivedOutput {
-		t.Fatal("expected output from NIBP session")
-	}
-
-	logText := strings.Join(logs, "\n")
-	if !strings.Contains(logText, "Final reading received.") {
-		t.Fatalf("expected final-reading log, got: %s", logText)
-	}
-	if !strings.Contains(logText, "Sending reading:") {
-		t.Fatalf("expected send log, got: %s", logText)
-	}
-}
-
-// makeFakeFrame returns a solid-color image of the given size.
-func makeFakeFrame(w, h int, c color.Color) image.Image {
+func makeFakeFrame(w, h int, c color.Color) *image.RGBA {
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
@@ -239,9 +52,6 @@ func makeFakeFrame(w, h int, c color.Color) image.Image {
 	return img
 }
 
-// buildPreviewSection mirrors the Comms tab's "Live Feed" card structure
-// (two buttons in a GridWithColumns above a canvas.Image) so the test
-// reproduces the layout where buttons supposedly lose text.
 func buildPreviewSection() (start, stop *widget.Button, img *canvas.Image, root *fyne.Container) {
 	start = widget.NewButton("Start Preview", func() {})
 	stop = widget.NewButton("Stop Preview", func() {})
@@ -255,9 +65,6 @@ func buildPreviewSection() (start, stop *widget.Button, img *canvas.Image, root 
 	return
 }
 
-// TestPreviewImageNeverNilWhenVisible guards against fyne issue #4345
-// (visible canvas.Image with nil Image thrashes GL texture cache and
-// blanks out cached button text glyphs on macOS).
 func TestPreviewImageNeverNilWhenVisible(t *testing.T) {
 	test.NewTempApp(t)
 
@@ -269,8 +76,6 @@ func TestPreviewImageNeverNilWhenVisible(t *testing.T) {
 		t.Fatal("preview image is nil/empty but visible — will trigger fyne #4345 texture-cache thrashing on macOS GLFW")
 	}
 
-	// Simulate a stop that resets the image; the placeholder must
-	// still keep Image non-nil.
 	img.Image = blankFrame
 	img.Refresh()
 	if img.Image == nil {
@@ -278,11 +83,6 @@ func TestPreviewImageNeverNilWhenVisible(t *testing.T) {
 	}
 }
 
-// TestButtonTextSurvivesPreviewLifecycle verifies that buttons retain
-// their Text field through a full preview start/stop cycle. This catches
-// state-level regressions; the macOS GLFW visual glitch is render-only
-// and not observable via the software test renderer, but if Text ever
-// gets cleared by Fyne internals this will catch it.
 func TestButtonTextSurvivesPreviewLifecycle(t *testing.T) {
 	test.NewTempApp(t)
 
@@ -303,8 +103,6 @@ func TestButtonTextSurvivesPreviewLifecycle(t *testing.T) {
 
 	checkText("initial")
 
-	// Simulate a stream of fake frames being pushed to the canvas image
-	// (mirroring what the live preview does once a second).
 	for i := 0; i < 5; i++ {
 		frame := fitToPreview(makeFakeFrame(640, 480, color.RGBA{R: uint8(i * 40), G: 100, B: 200, A: 255}))
 		img.Image = frame
@@ -312,21 +110,16 @@ func TestButtonTextSurvivesPreviewLifecycle(t *testing.T) {
 		checkText("frame-" + string(rune('0'+i)))
 	}
 
-	// Simulate "Stop Preview" — clear the canvas image.
 	img.Image = nil
 	img.Refresh()
 	checkText("after-stop")
 
-	// Simulate restarting.
 	frame := fitToPreview(makeFakeFrame(640, 480, color.RGBA{R: 50, G: 200, B: 50, A: 255}))
 	img.Image = frame
 	img.Refresh()
 	checkText("after-restart")
 }
 
-// TestPreviewImageDoesNotExpandLayout verifies the layout's min size stays
-// bounded regardless of frame size, since canvas.Image historically reported
-// the natural pixel size of any loaded image as its min size.
 func TestPreviewImageDoesNotExpandLayout(t *testing.T) {
 	test.NewTempApp(t)
 
@@ -337,14 +130,12 @@ func TestPreviewImageDoesNotExpandLayout(t *testing.T) {
 
 	initialMin := root.MinSize()
 
-	// Large frame should not push the layout's min size past the cap.
 	bigFrame := fitToPreview(makeFakeFrame(1920, 1080, color.RGBA{R: 200, G: 200, B: 200, A: 255}))
 	img.Image = bigFrame
 	img.Refresh()
 
 	afterMin := root.MinSize()
 
-	// Width should not have grown noticeably (allow for theme padding tolerance).
 	if afterMin.Width > initialMin.Width+1 {
 		t.Errorf("layout min width grew: was %.1f, now %.1f", initialMin.Width, afterMin.Width)
 	}
@@ -353,9 +144,6 @@ func TestPreviewImageDoesNotExpandLayout(t *testing.T) {
 	}
 }
 
-// TestFitToPreviewBounds verifies fitToPreview always produces an image
-// that fits within the preview cap so canvas.Image cannot demand more
-// space than the layout grants it.
 func TestFitToPreviewBounds(t *testing.T) {
 	cases := []struct{ w, h int }{
 		{640, 480},
@@ -372,7 +160,6 @@ func TestFitToPreviewBounds(t *testing.T) {
 			t.Errorf("fitToPreview(%dx%d) -> %dx%d exceeds %dx%d cap",
 				c.w, c.h, b.Dx(), b.Dy(), previewMaxW, previewMaxH)
 		}
-		// Aspect ratio preserved within rounding tolerance.
 		want := float64(c.w) / float64(c.h)
 		got2 := float64(b.Dx()) / float64(b.Dy())
 		if diff := want - got2; diff > 0.02 || diff < -0.02 {
@@ -382,12 +169,6 @@ func TestFitToPreviewBounds(t *testing.T) {
 	}
 }
 
-// TestRenderSnapshot captures the rendered canvas after the simulated
-// stop sequence and saves it as a PNG so a human (or follow-up tooling)
-// can visually verify the buttons still show their text.
-//
-// Run with:  go test -run TestRenderSnapshot -v
-// Output PNG: ./testdata/snapshot.png (overwritten each run).
 func TestRenderSnapshot(t *testing.T) {
 	test.NewTempApp(t)
 
@@ -400,7 +181,6 @@ func TestRenderSnapshot(t *testing.T) {
 	img.Image = frame
 	img.Refresh()
 
-	// Simulate stop.
 	img.Image = nil
 	img.Refresh()
 

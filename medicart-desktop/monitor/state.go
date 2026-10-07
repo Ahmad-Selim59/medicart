@@ -268,12 +268,16 @@ func mergeFloat(dst *FloatReading, src FloatReading, at time.Time) {
 	if !src.Valid {
 		return
 	}
+	obs := src.ObservedAt
+	if obs.IsZero() {
+		obs = at
+	}
+	if dst.Valid && !dst.ObservedAt.IsZero() && obs.Before(dst.ObservedAt) {
+		return
+	}
 	dst.Value = src.Value
 	dst.Valid = true
-	dst.ObservedAt = at
-	if !src.ObservedAt.IsZero() {
-		dst.ObservedAt = src.ObservedAt
-	}
+	dst.ObservedAt = obs
 }
 
 func patientKey(p PatientSnapshot) string {

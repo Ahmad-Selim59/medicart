@@ -2,16 +2,17 @@
 
 A desktop application built with [Fyne](https://fyne.io/) to monitor medical sensors and upload patient data to a remote web server.
 
-This application acts as a bridge between local medical devices (via `lepu_cli.exe`) and your central health record system.
+This application bridges the **ZUG TR8 patient monitor** (HL7 over UDP) and your central health record system. Manual **glucose** entry and **ECG image upload** (when the monitor is off) are also supported.
 
 ## Features
 
 - **Graphical User Interface**: Easy-to-use desktop interface with Light/Dark mode support.
-- **Device Support**: Interfaces with Heart Rate/SpO2, NIBP (Blood Pressure), Glucose, and Temperature sensors.
-- **Data Ingestion**: Parses raw device data and sends structured JSON to a specified HTTP endpoint.
-- **Patient Association**: Allows tagging readings with a specific Patient Name.
-- **Real-time Status**: Visual feedback and error highlighting (red for errors).
-- **ZUG TR8 monitor (HL7 UDP)**: Listens on UDP port **5500** by default (configurable in Settings); live values on the Readings tab; tap a vital button to save one snapshot. **ECG** is buffered from continuous **ORU^W01** waveform messages (not from numeric vitals in R01); the Readings tab shows a **live W01 preview** and debug line (sample count / peak). **Save ECG from monitor** renders ~3 s of Lead II (or the best ECG lead with signal) as PNG. If the preview is a flat line, the TR8 is sending **zeros in W01** while **heart rate on the monitor screen** still comes from **ORU^R01** — check the monitor’s HL7 export options so ECG waveform is included on the W01 stream.
+- **TR8 vitals**: Heart rate, SpO2, NIBP, and **temperature** from the monitor HL7 stream (`ORU^R01`); tap a button to save one snapshot to the server.
+- **Manual glucose** on the Readings tab.
+- **Data Ingestion**: Structured JSON to a configurable HTTP `/api/ingest` endpoint.
+- **Patient Association**: Patient/clinic from HL7 with Settings fallbacks.
+- **Real-time Status**: Live vitals cache, connection status, Live Console.
+- **ZUG TR8 monitor (HL7 UDP)**: Listens on UDP port **5500** by default (configurable in Settings). **ECG** is buffered from **ORU^W01** waveforms; use **Save ECG from monitor** for a PNG strip. Live W01 preview and debug stats appear on the Readings tab when the monitor is enabled.
 
 ### TR8 HL7 setup (Windows)
 
@@ -26,6 +27,8 @@ This application acts as a bridge between local medical devices (via `lepu_cli.e
 
 5. **Allow source IP** in Settings must be **empty** unless you intentionally filter one monitor address. You do **not** need to know the monitor IP for normal operation.
 6. On Readings, after a few seconds you should see a **UDP self-test** line in Live Console. If **packet count** stays 0 but self-test ran, it is almost always firewall or another program still bound to the same UDP port (close PowerShell test listeners).
+
+**Temperature** on the Readings card comes from TR8 `MDC_TEMP` (150344) in HL7. If it shows **—**, the stream is sending `-99.9` / no probe value—use the probe or temp module connected to the monitor so R01 includes a valid reading.
 
 ### “Access forbidden” when binding UDP (Windows)
 
@@ -52,20 +55,7 @@ Pick a port **not** inside any `Start Port`–`End Port` range listed there.
     *   **Windows**: MSYS2 with Mingw-w64 or TDM-GCC.
     *   **macOS**: Xcode Command Line Tools (`xcode-select --install`).
     *   **Linux**: GCC (`sudo apt install gcc`).
-3.  **Device CLIs** (Windows): Place executables and their full publish output in `dependencies/` next to the desktop app:
-
-    ```
-    medicart-desktop-windows-386/
-    ├── medicart-desktop-windows-386.exe
-    └── dependencies/
-        ├── lepu_cli.exe
-        ├── lepu_cli.dll
-        ├── camera_cli.exe
-        ├── MinttiCLI.exe          (optional — stethoscope only)
-        └── runtimes/              (required by lepu_cli — keep inside dependencies/)
-    ```
-
-    Paths are resolved from the folder containing the desktop executable. Each CLI runs with `dependencies/` as its working directory so DLLs and `runtimes/` load correctly. CLIs can also be placed on the system PATH.
+3.  **Optional dependencies** (Windows): For Comms tab camera control/preview, place `camera_cli.exe` in `dependencies/` next to the desktop executable (or on the system PATH).
 
 ## Installation
 
@@ -83,83 +73,27 @@ To run the application directly:
 go run .
 ```
 
-To build a standalone executable:
+Or build:
 
 ```bash
-go build -o MedicartUploader .
+go build -o medicart-desktop .
 ```
 
-to build in windows 32 bit:
-```bash
-GOOS=windows GOARCH=386 CGO_ENABLED=1 \
-  CC=i686-w64-mingw32-gcc \
-  CXX=i686-w64-mingw32-g++ \
-  go build -o medicart-desktop-windows-386.exe .
-```
+## Configuration
 
-## Usage
+Settings are stored in `~/.medicart/config.json` (or `%USERPROFILE%\.medicart\config.json` on Windows).
 
-1.  **Web Server URL**: Enter the full URL of your backend API endpoint (e.g., `http://myserver.com/api/readings`).
-2.  **Patient Name**: Enter the name of the patient currently being examined. This field is required.
-3.  **Start Monitoring**: Click the button corresponding to the sensor you want to use (e.g., "Start Heart Rate / SpO2").
-4.  **Stop**: Click the "Stop" button to end the current session.
+Key fields:
 
-## Data Format
+- `server_base`: Base URL of the web server (e.g. `http://localhost:8080`)
+- `monitor_enabled`: TR8 UDP listener on/off
+- `monitor_udp_port`: Default **5500**
+- `clinic_name`, `patient_name`: Fallbacks when HL7 omits them
 
-The application sends HTTP POST requests with a JSON body. All payloads include a `patient_name` field.
+## API Payload Examples
 
-### Heart Rate / SpO2
-```json
-{
-  "type": "data",
-  "pr": 75,
-  "spo2": 98,
-  "patient_name": "John Doe"
-}
-```
-
-### NIBP (Blood Pressure)
-**Intermediate Updates (Cuff Pressure):**
-```json
-{
-  "type": "cuff_update",
-  "cuff_pressure": 120,
-  "patient_name": "John Doe"
-}
-```
-
-**Final Result:**
-```json
-{
-  "type": "result",
-  "sys": 120,
-  "dia": 80,
-  "map": 93,
-  "pr": 70,
-  "irr": false,
-  "patient_name": "John Doe"
-}
-```
-
-### Glucose
-```json
-{
-  "type": "data",
-  "glu": 105,
-  "patient_name": "John Doe"
-}
-```
-
-### Temperature
-```json
-{
-  "type": "data",
-  "temp": 36.5,
-  "patient_name": "John Doe"
-}
-```
+See `api_documentation.md` for ingest JSON shapes (vitals, ECG, glucose, profile).
 
 ## Legacy Code
 
 The original WebSocket-based server implementation has been moved to the `legacy/` directory.
-
