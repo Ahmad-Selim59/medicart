@@ -91,6 +91,7 @@ type MonitorState struct {
 	connection ConnectionMeta
 	patient    PatientSnapshot
 	vitals     VitalsSnapshot
+	waveform   *WaveformCache
 
 	lastPatientKey string
 
@@ -102,7 +103,9 @@ type MonitorState struct {
 
 // NewMonitorState creates an empty monitor state.
 func NewMonitorState() *MonitorState {
-	return &MonitorState{}
+	return &MonitorState{
+		waveform: NewWaveformCache(),
+	}
 }
 
 // SetPatientChangeHandler registers a callback fired after ProfileDebounce on patient key change.
@@ -303,6 +306,22 @@ func (s *MonitorState) schedulePatientChange(p PatientSnapshot) {
 		s.debounceMu.Unlock()
 		handler(patient)
 	})
+}
+
+// ApplyWaveform merges W01 ECG samples into the rolling cache.
+func (s *MonitorState) ApplyWaveform(up *WaveformUpdate, at time.Time) {
+	if s.waveform == nil {
+		return
+	}
+	s.waveform.Apply(up, at)
+}
+
+// ECGLeadSnapshot returns cached samples for a lead (default Lead II).
+func (s *MonitorState) ECGLeadSnapshot(leadKey string) LeadSnapshot {
+	if s.waveform == nil {
+		return LeadSnapshot{}
+	}
+	return s.waveform.SnapshotLead(leadKey)
 }
 
 // PatientForCommit returns the current patient snapshot for ingest.

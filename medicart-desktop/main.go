@@ -1080,10 +1080,6 @@ func main() {
 		btnNIBP.SetIcon(icon)
 		btnTemp.SetIcon(icon)
 	}
-	monitorEnabledCheck.OnChanged = func(checked bool) {
-		updateVitalButtonIcons()
-		startMonitorListener(monitorCfgFromUI())
-	}
 	updateVitalButtonIcons()
 
 	uploadECG := func(path string) {
@@ -1133,6 +1129,33 @@ func main() {
 			go uploadECG(path)
 		}, myWindow)
 	})
+
+	btnECGFromMonitor := widget.NewButtonWithIcon("Save ECG from monitor", theme.DocumentSaveIcon(), func() {
+		base := strings.TrimSpace(serverBaseEntry.Text)
+		if base == "" {
+			log("Error: Please enter a Server Base URL in Settings")
+			return
+		}
+		go commitECGFromMonitor(myWindow, log, monitorState, ingestURL(base), clinicNameEntry.Text, patientNameEntry.Text)
+	})
+
+	ecgCardActions := container.NewVBox(btnECGFromMonitor, btnECGUpload)
+	updateECGButtons := func() {
+		if monitorEnabledCheck.Checked {
+			btnECGFromMonitor.Show()
+			btnECGUpload.Hide()
+		} else {
+			btnECGFromMonitor.Hide()
+			btnECGUpload.Show()
+		}
+		ecgCardActions.Refresh()
+	}
+	updateECGButtons()
+	monitorEnabledCheck.OnChanged = func(checked bool) {
+		updateVitalButtonIcons()
+		updateECGButtons()
+		startMonitorListener(monitorCfgFromUI())
+	}
 
 	// Stethoscope
 	var stethMacEntry *widget.Entry
@@ -2709,9 +2732,7 @@ func main() {
 			btnSaveGlucose,
 		)),
 		widget.NewSeparator(),
-		widget.NewCard("ECG", "Upload an ECG strip or snapshot image", container.NewVBox(
-			btnECGUpload,
-		)),
+		widget.NewCard("ECG", "Save Lead II from TR8 W01 stream, or upload an image when monitor is off", ecgCardActions),
 		widget.NewSeparator(),
 		widget.NewCard("Stethoscope", "Search, connect, and stream auscultation", container.NewVBox(
 			widget.NewLabel("MAC Address (optional):"),
@@ -2928,6 +2949,46 @@ func commitFromMonitor(
 		return
 	}
 	log(fmt.Sprintf("%s saved from monitor", kind))
+}
+
+func commitECGFromMonitor(
+	win fyne.Window,
+	log func(string),
+	state *monitor.MonitorState,
+	targetURL string,
+	settingsClinic, settingsPatient string,
+) {
+	patient := monitor.ResolvePatientIdentity(state.PatientForCommit(), settingsClinic, settingsPatient)
+	if ok, msg := monitor.CanCommitVitals(state.PatientForCommit(), settingsClinic, settingsPatient); !ok {
+		log("Error: " + msg)
+		fyne.Do(func() {
+			dialog.ShowInformation("Cannot save ECG", msg, win)
+		})
+		return
+	}
+	now := time.Now()
+	lead := state.ECGLeadSnapshot(monitor.DefaultECGLeadKey)
+	result := monitor.BuildECGCommitPNG(lead, now)
+	if result.Err != nil {
+		log(result.Err.Error())
+		fyne.Do(func() {
+			dialog.ShowInformation("Cannot save ECG", result.Err.Error(), win)
+		})
+		return
+	}
+	payload := map[string]interface{}{
+		"type":       "ecg",
+		"image":      base64.StdEncoding.EncodeToString(result.PNG),
+		"image_mime": "image/png",
+	}
+	if err := sendReadingPayload(log, targetURL, patient.ClinicName, patient.PatientName, payload); err != nil {
+		log(fmt.Sprintf("Error: ECG upload failed: %v", err))
+		fyne.Do(func() {
+			dialog.ShowError(err, win)
+		})
+		return
+	}
+	log("ECG saved from monitor")
 }
 
 func syncPatientUIFromMonitor(

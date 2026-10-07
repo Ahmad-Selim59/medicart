@@ -16,6 +16,7 @@ type ParsedMessage struct {
 	Skip        bool
 	Patient     *PatientSnapshot
 	Vitals      *VitalsSnapshot
+	Waveform    *WaveformUpdate // ORU^W01 ECG chunks (when Skip)
 }
 
 // ParseHL7Payload splits raw UDP bytes into messages and parses each.
@@ -169,7 +170,11 @@ func parseOneMessage(body string) (*ParsedMessage, error) {
 		}
 	}
 	if msg.Skip {
-		return &ParsedMessage{MessageType: msgType, Skip: true, Patient: patientIf(hasPatient, patient)}, nil
+		out := &ParsedMessage{MessageType: msgType, Skip: true, Patient: patientIf(hasPatient, patient)}
+		if IsWaveformMessage(msgType) {
+			out.Waveform = BuildWaveformUpdate(segments, msgType)
+		}
+		return out, nil
 	}
 
 	if !shouldProcessVitals(msgType) {

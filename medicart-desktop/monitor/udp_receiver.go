@@ -107,8 +107,14 @@ func Listen(ctx context.Context, cfg ListenConfig, state *MonitorState, onInfo f
 			onInfo(fmt.Sprintf("Monitor: UDP packet (%d bytes) had no HL7 MSH segment; preview: %q", n, preview))
 		}
 		for _, msg := range msgs {
-			if msg == nil || msg.Skip {
-				if msg != nil && msg.Patient != nil {
+			if msg == nil {
+				continue
+			}
+			if msg.Waveform != nil {
+				state.ApplyWaveform(msg.Waveform, now)
+			}
+			if msg.Skip {
+				if msg.Patient != nil {
 					state.ApplyParsedMessage(&ParsedMessage{Patient: msg.Patient}, now)
 				}
 				continue

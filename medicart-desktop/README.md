@@ -11,7 +11,7 @@ This application acts as a bridge between local medical devices (via `lepu_cli.e
 - **Data Ingestion**: Parses raw device data and sends structured JSON to a specified HTTP endpoint.
 - **Patient Association**: Allows tagging readings with a specific Patient Name.
 - **Real-time Status**: Visual feedback and error highlighting (red for errors).
-- **ZUG TR8 monitor (HL7 UDP)**: Listens on UDP port **5500** by default (configurable in Settings); live values on the Readings tab; tap a vital button to save one snapshot.
+- **ZUG TR8 monitor (HL7 UDP)**: Listens on UDP port **5500** by default (configurable in Settings); live values on the Readings tab; tap a vital button to save one snapshot. **ECG** is buffered from continuous **ORU^W01** waveform messages (not from numeric vitals in R01); use **Save ECG from monitor** to render a short Lead II strip as PNG and upload it.
 
 ### TR8 HL7 setup (Windows)
 
