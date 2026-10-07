@@ -26,6 +26,7 @@ type FloatReading struct {
 	Value      float64
 	ObservedAt time.Time
 	Valid      bool
+	Rank       int // higher = preferred source (e.g. TR8 spot temp 1.2.5)
 }
 
 // IntReading holds one integer observation.
@@ -303,12 +304,18 @@ func mergeFloat(dst *FloatReading, src FloatReading, at time.Time) {
 	if obs.IsZero() {
 		obs = at
 	}
-	if dst.Valid && !dst.ObservedAt.IsZero() && obs.Before(dst.ObservedAt) {
-		return
+	if dst.Valid {
+		if src.Rank < dst.Rank {
+			return
+		}
+		if src.Rank == dst.Rank && !dst.ObservedAt.IsZero() && obs.Before(dst.ObservedAt) {
+			return
+		}
 	}
 	dst.Value = src.Value
 	dst.Valid = true
 	dst.ObservedAt = obs
+	dst.Rank = src.Rank
 }
 
 func patientKey(p PatientSnapshot) string {

@@ -124,6 +124,76 @@ func TestParseTempWithLeadingUnicodeMSH(t *testing.T) {
 	}
 }
 
+func TestParseSpotTempFahrenheitGunChannel(t *testing.T) {
+	// ZUG Table 40: spot temp OBX-4 = 1.2.5.150344, units °F.
+	msg := `MSH|^~\&|TR8|FAC|||||ORU^R01|1|P|2.4
+OBX|1|NM|150344^MDC_TEMP^MDC|1.2.5.150344|98.6|268224^MDC_DIM_FAHR^MDC`
+	msgs, err := ParseHL7Payload([]byte(msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	temp := msgs[0].Vitals.Temp
+	if !temp.Valid {
+		t.Fatalf("expected valid temp, Info=%v", msgs[0].Info)
+	}
+	if temp.Value < 36.9 || temp.Value > 37.2 {
+		t.Fatalf("98.6°F should be ~37°C, got %.2f", temp.Value)
+	}
+	if temp.Rank != 100 {
+		t.Fatalf("spot channel rank: %d", temp.Rank)
+	}
+}
+
+func TestParseTempOBX_SNPicksValueNotMetadata(t *testing.T) {
+	msg := `MSH|^~\&|TR8|FAC|||||ORU^R01|1|P|2.4
+OBX|1|NM|150344^MDC_TEMP^MDC|1.2.5.150344|1966^36.4^|268192^MDC_DIM_DEGC^MDC`
+	msgs, err := ParseHL7Payload([]byte(msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !msgs[0].Vitals.Temp.Valid || msgs[0].Vitals.Temp.Value != 36.4 {
+		t.Fatalf("temp: %+v info=%v", msgs[0].Vitals.Temp, msgs[0].Info)
+	}
+	alt := false
+	for _, line := range msgs[0].Info {
+		if strings.Contains(line, "alternate OBX-5 component") {
+			alt = true
+		}
+	}
+	if !alt {
+		t.Fatalf("expected alternate-component log, Info=%v", msgs[0].Info)
+	}
+}
+
+func TestParseTempOBX_StrictFirstComponentOnly(t *testing.T) {
+	msg := `MSH|^~\&|TR8|FAC|||||ORU^R01|1|P|2.4
+OBX|1|NM|150344^MDC_TEMP^MDC|1.2.5.150344|36.4^99.9^|268192^MDC_DIM_DEGC^MDC`
+	msgs, err := ParseHL7Payload([]byte(msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !msgs[0].Vitals.Temp.Valid || msgs[0].Vitals.Temp.Value != 36.4 {
+		t.Fatalf("must use first OBX-5 component, got %+v", msgs[0].Vitals.Temp)
+	}
+	for _, line := range msgs[0].Info {
+		if strings.Contains(line, "alternate OBX-5") {
+			t.Fatalf("should not use fallback when primary is valid: %s", line)
+		}
+	}
+}
+
+func TestParseTempDiffOBXIgnored(t *testing.T) {
+	msg := `MSH|^~\&|TR8|FAC|||||ORU^R01|1|P|2.4
+OBX|1|NM|188440^MDC_TEMP_DIFF^MDC|1.2.4.188440|5.0|268224^MDC_DIM_FAHR^MDC`
+	msgs, err := ParseHL7Payload([]byte(msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msgs[0].Vitals != nil && msgs[0].Vitals.Temp.Valid {
+		t.Fatal("delta temp should not set body temp")
+	}
+}
+
 func TestParseGunTempORUR04(t *testing.T) {
 	msg := `MSH|^~\&|TR8|FAC|||||ORU^R04|2|P|2.4
 OBX|1|NM|150344^MDC_TEMP^MDC||36.4|268192^MDC_DIM_DEGC^MDC`

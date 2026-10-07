@@ -416,74 +416,161 @@ func obxMDCKey(identifierField string, seps hl7Separators) string {
 	return strings.ToUpper(code)
 }
 
-func segmentMentionsTemp(seg hl7Segment) bool {
-	if seg.name != "OBX" {
+func isBodyTempOBXSegment(seg hl7Segment) bool {
+	if seg.name != "OBX" || len(seg.fields) < 4 {
 		return false
 	}
-	for i := 1; i < len(seg.fields); i++ {
-		u := strings.ToUpper(seg.fields[i])
-		if strings.Contains(u, "150344") || strings.Contains(u, "MDC_TEMP") {
-			return true
+	idField := strings.ToUpper(seg.fields[3])
+	if strings.Contains(idField, "TEMP_DIFF") || strings.Contains(idField, "188440") {
+		return false
+	}
+	key := obxMDCKey(seg.fields[3], seg.seps)
+	if key == "MDC_TEMP" || key == "150344" {
+		return true
+	}
+	return strings.Contains(idField, "150344") &&
+		strings.Contains(idField, "MDC_TEMP") &&
+		!strings.Contains(idField, "DIFF")
+}
+
+func segmentMentionsTemp(seg hl7Segment) bool {
+	return isBodyTempOBXSegment(seg)
+}
+
+func obxTempSubIDString(seg hl7Segment) string {
+	if len(seg.fields) > 4 {
+		return strings.TrimSpace(seg.fields[4])
+	}
+	return ""
+}
+
+func tempChannelPriority(subID string) int {
+	u := strings.ToUpper(subID)
+	switch {
+	case strings.Contains(u, "1.2.5.150344") || strings.Contains(u, "1.2.5"):
+		return 100 // spot / IR gun (ZUG Table 40)
+	case strings.Contains(u, "1.13.2"):
+		return 40
+	case strings.Contains(u, "1.13.1"):
+		return 35
+	case strings.Contains(u, "1.2.1") || strings.Contains(u, "1.2.2"):
+		return 30
+	default:
+		return 10
+	}
+}
+
+// obxTempCandidateSet lists OBX-5 values to try. TR8 Table 40 uses type NM (one number).
+// We always try strict (first component) first; fallback components only if strict fails.
+type obxTempCandidateSet struct {
+	Strict   []string
+	Fallback []string
+	ValType  string
+}
+
+func obxTempReadingCandidates(seg hl7Segment) obxTempCandidateSet {
+	var set obxTempCandidateSet
+	if len(seg.fields) > 2 {
+		set.ValType = strings.TrimSpace(seg.fields[2])
+	}
+	valueField := ""
+	if len(seg.fields) > 5 {
+		valueField = strings.TrimSpace(seg.fields[5])
+	} else if len(seg.fields) > 4 && !looksLikeTempSubIDOrMDCCode(seg.fields[4]) {
+		valueField = strings.TrimSpace(seg.fields[4])
+	}
+	if valueField == "" {
+		return set
+	}
+	parts := strings.Split(valueField, string(seg.seps.component))
+	primary := strings.TrimSpace(fieldComponent(valueField, seg.seps, 0))
+	if primary == "" {
+		primary = valueField
+	}
+	set.Strict = []string{primary}
+	for i := 1; i < len(parts); i++ {
+		p := strings.TrimSpace(parts[i])
+		if p != "" {
+			set.Fallback = append(set.Fallback, p)
 		}
+	}
+	return set
+}
+
+func looksLikeTempSubIDOrMDCCode(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return true
+	}
+	u := strings.ToUpper(raw)
+	if strings.Contains(u, "MDC_DIM") || strings.Contains(raw, "^MDC") {
+		return true
+	}
+	if strings.Count(raw, ".") >= 2 && strings.Contains(raw, "150344") {
+		return true
+	}
+	if strings.Count(raw, ".") >= 3 && !strings.Contains(raw, "e") && !strings.Contains(raw, "E") {
+		return true
+	}
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return false
+	}
+	if f >= 100000 && f <= 999999 && !strings.Contains(raw, ".") {
+		return true
 	}
 	return false
 }
 
-func fieldLooksLikeTempID(field string, seps hl7Separators) bool {
-	if field == "" {
-		return false
+func obxTempUnits(seg hl7Segment, subID string) string {
+	units := ""
+	if len(seg.fields) > 6 {
+		units = obxUnitsKey(seg)
 	}
-	key := obxMDCKey(field, seps)
-	if isTempOBXIdentifier(key, field) {
-		return true
+	if units == "" && tempChannelPriority(subID) >= 100 {
+		// ZUG Table 40: spot temperature published in °F.
+		return "FAHR"
 	}
-	u := strings.ToUpper(field)
-	return strings.Contains(u, "150344") || strings.Contains(u, "MDC_TEMP")
+	return units
 }
 
-func obxTempValueAndUnits(seg hl7Segment) (rawVal, units string) {
-	identIdx := -1
-	for i := 2; i < len(seg.fields); i++ {
-		if fieldLooksLikeTempID(seg.fields[i], seg.seps) || tempSubIDField(seg.fields[i]) {
-			identIdx = i
-			break
-		}
+func pickBodyTempReading(candidates []string, units string) (raw string, celsius float64, ok bool) {
+	if len(candidates) == 0 {
+		return "", 0, false
 	}
-	if identIdx < 0 {
-		return "", ""
-	}
-	for j := identIdx + 1; j < len(seg.fields) && j <= identIdx+5; j++ {
-		f := strings.TrimSpace(fieldComponent(seg.fields[j], seg.seps, 0))
-		if f == "" {
-			f = strings.TrimSpace(seg.fields[j])
-		}
-		if f == "" {
+	for _, raw := range candidates {
+		if isSentinelRaw(raw) || looksLikeTempSubIDOrMDCCode(raw) {
 			continue
 		}
-		if strings.Contains(strings.ToUpper(f), "MDC_DIM") || strings.Contains(f, "^MDC") {
-			if units == "" {
-				units = normalizeUnitKey(obxMDCKey(f, seg.seps))
-			}
+		f, vok := validFloat(raw)
+		if !vok {
 			continue
 		}
-		if isSentinelRaw(f) {
-			return f, units
+		scales := []float64{f}
+		if f >= 300 && f <= 5000 && !strings.Contains(raw, ".") {
+			scales = append(scales, f/100.0, f/10.0)
 		}
-		if _, err := strconv.ParseFloat(f, 64); err == nil {
-			if units == "" && j+1 < len(seg.fields) {
-				units = obxUnitsKeyAt(seg, j+1)
+		for _, val := range scales {
+			c, cok := ConvertTempToCelsius(val, units)
+			if cok && isPlausibleBodyTempC(c) {
+				return raw, c, true
 			}
-			return f, units
 		}
 	}
-	return "", units
+	// Return first sentinel if any (for logging).
+	for _, raw := range candidates {
+		if isSentinelRaw(raw) {
+			return raw, 0, false
+		}
+	}
+	return candidates[0], 0, false
 }
 
-func tempSubIDField(field string) bool {
-	u := strings.ToUpper(field)
-	return strings.Contains(field, "150344") ||
-		strings.Contains(u, "1.13.1") ||
-		strings.Contains(u, "1.13.2")
+func obxTempValueAndUnits(seg hl7Segment) (candidates obxTempCandidateSet, units, subID string) {
+	subID = obxTempSubIDString(seg)
+	units = obxTempUnits(seg, subID)
+	candidates = obxTempReadingCandidates(seg)
+	return candidates, units, subID
 }
 
 func obxUnitsKeyAt(seg hl7Segment, idx int) string {
@@ -494,15 +581,12 @@ func obxUnitsKeyAt(seg hl7Segment, idx int) string {
 }
 
 func parseOBXTempFlexible(seg hl7Segment, v *VitalsSnapshot, info *[]string) bool {
-	rawVal, units := obxTempValueAndUnits(seg)
-	if rawVal == "" && units == "" && !segmentMentionsTemp(seg) {
+	if !segmentMentionsTemp(seg) {
 		return false
 	}
+	cand, units, subID := obxTempValueAndUnits(seg)
 	obsTime := parseHL7Time(seg, 14)
-	if units == "" {
-		units = obxUnitsKey(seg)
-	}
-	return parseTempOBX(v, rawVal, units, obsTime, info, seg)
+	return parseTempOBX(v, cand, units, subID, obsTime, info, seg)
 }
 
 func parseOBX(seg hl7Segment, v *VitalsSnapshot, p *PatientSnapshot, info *[]string) bool {
@@ -555,8 +639,15 @@ func parseOBX(seg hl7Segment, v *VitalsSnapshot, p *PatientSnapshot, info *[]str
 			v.NIBPPulse = IntReading{Value: n, Valid: true, ObservedAt: obsTime}
 			return true
 		}
-	case "MDC_TEMP", "150344", "188440", "188472":
-		return parseTempOBX(v, rawVal, units, obsTime, info, seg)
+	case "MDC_TEMP", "150344":
+		cand, u, subID := obxTempValueAndUnits(seg)
+		if len(cand.Strict) == 0 && rawVal != "" {
+			cand.Strict = []string{rawVal}
+		}
+		if u == "" {
+			u = units
+		}
+		return parseTempOBX(v, cand, u, subID, obsTime, info, seg)
 	case "MDC_ATTR_PT_WEIGHT", "MDC_WEIGHT", "MDC_BODY_WEIGHT":
 		if f, ok := validFloat(rawVal); ok {
 			kg, ok := ConvertWeightToKg(f, units)
@@ -574,19 +665,10 @@ func parseOBX(seg hl7Segment, v *VitalsSnapshot, p *PatientSnapshot, info *[]str
 			return false
 		}
 	}
-	if isTempOBXIdentifier(id, seg.fields[3]) || tempOBXSubID(seg) {
-		return parseTempOBX(v, rawVal, units, obsTime, info, seg)
+	if isBodyTempOBXSegment(seg) {
+		return parseOBXTempFlexible(seg, v, info)
 	}
 	return false
-}
-
-func tempOBXSubID(seg hl7Segment) bool {
-	if len(seg.fields) < 5 {
-		return false
-	}
-	return strings.Contains(seg.fields[4], "150344") ||
-		strings.Contains(strings.ToUpper(seg.fields[4]), "1.13.1") ||
-		strings.Contains(strings.ToUpper(seg.fields[4]), "1.13.2")
 }
 
 func obxNumericValue(seg hl7Segment) string {
@@ -618,44 +700,41 @@ func obxNumericValue(seg hl7Segment) string {
 	return raw
 }
 
-func isTempOBXIdentifier(key, identifierField string) bool {
-	if key == "MDC_TEMP" || key == "150344" || key == "188440" || key == "188472" {
-		return true
-	}
-	u := strings.ToUpper(identifierField)
-	return strings.Contains(u, "150344") || strings.Contains(u, "MDC_TEMP")
-}
-
-func parseTempOBX(v *VitalsSnapshot, rawVal, units string, obsTime time.Time, info *[]string, seg hl7Segment) bool {
+func parseTempOBX(v *VitalsSnapshot, cand obxTempCandidateSet, units, subID string, obsTime time.Time, info *[]string, seg hl7Segment) bool {
 	logTemp := func(msg string) {
 		if info != nil {
 			*info = append(*info, msg)
 		}
 	}
-	if rawVal == "" && len(seg.fields) > 2 {
-		logTemp(fmt.Sprintf("Monitor temp OBX: type=%s id=%q (empty value field)", seg.fields[2], fieldComponent(seg.fields[3], seg.seps, 0)))
+	subLabel := subID
+	if subLabel == "" {
+		subLabel = "?"
+	}
+	if len(cand.Strict) == 0 && len(cand.Fallback) == 0 {
+		logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s (empty OBX-5 value)", subLabel))
 		return false
 	}
-	if isSentinelRaw(rawVal) {
-		logTemp(fmt.Sprintf("Monitor temp OBX: raw=%s (no reading in HL7)", rawVal))
-		return false
+	raw, celsius, ok := pickBodyTempReading(cand.Strict, units)
+	usedAlternate := false
+	if !ok && len(cand.Fallback) > 0 {
+		raw, celsius, ok = pickBodyTempReading(cand.Fallback, units)
+		usedAlternate = ok
 	}
-	f, ok := validFloat(rawVal)
 	if !ok {
-		logTemp(fmt.Sprintf("Monitor temp OBX: raw=%q units=%q (not a numeric value)", rawVal, units))
+		if isSentinelRaw(raw) {
+			logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s raw=%s (no reading in HL7)", subLabel, raw))
+			return false
+		}
+		logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s raw=%q units=%q type=%s (no plausible body temp in OBX-5)", subLabel, raw, units, cand.ValType))
 		return false
 	}
-	c, ok := ConvertTempToCelsius(f, units)
-	if !ok {
-		logTemp(fmt.Sprintf("Monitor temp OBX: raw=%s units=%q (unknown unit)", rawVal, units))
-		return false
+	rank := tempChannelPriority(subID)
+	applyBodyTemp(v, celsius, obsTime, rank)
+	if usedAlternate {
+		logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s raw=%s units=%q -> %.1f °C (alternate OBX-5 component, type=%s)", subLabel, raw, units, celsius, cand.ValType))
+	} else {
+		logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s raw=%s units=%q -> %.1f °C (buffered)", subLabel, raw, units, celsius))
 	}
-	if !isPlausibleBodyTempC(c) {
-		logTemp(fmt.Sprintf("Monitor temp OBX: raw=%s units=%q -> %.2f °C (out of range)", rawVal, units, c))
-		return false
-	}
-	applyBodyTemp(v, c, obsTime)
-	logTemp(fmt.Sprintf("Monitor temp OBX: raw=%s units=%q -> %.1f °C (buffered)", rawVal, units, c))
 	return true
 }
 
@@ -752,16 +831,19 @@ func isPlausibleBodyTempC(celsius float64) bool {
 	return celsius >= 25 && celsius <= 45
 }
 
-func applyBodyTemp(v *VitalsSnapshot, celsius float64, obsTime time.Time) {
+func applyBodyTemp(v *VitalsSnapshot, celsius float64, obsTime time.Time, rank int) {
 	if v == nil {
 		return
 	}
 	if !v.Temp.Valid {
-		v.Temp = FloatReading{Value: celsius, Valid: true, ObservedAt: obsTime}
+		v.Temp = FloatReading{Value: celsius, Valid: true, ObservedAt: obsTime, Rank: rank}
 		return
 	}
-	if !obsTime.IsZero() && !v.Temp.ObservedAt.IsZero() && obsTime.Before(v.Temp.ObservedAt) {
+	if rank < v.Temp.Rank {
 		return
 	}
-	v.Temp = FloatReading{Value: celsius, Valid: true, ObservedAt: obsTime}
+	if rank == v.Temp.Rank && !obsTime.IsZero() && !v.Temp.ObservedAt.IsZero() && obsTime.Before(v.Temp.ObservedAt) {
+		return
+	}
+	v.Temp = FloatReading{Value: celsius, Valid: true, ObservedAt: obsTime, Rank: rank}
 }
