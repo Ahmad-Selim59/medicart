@@ -71,14 +71,22 @@ go mod tidy
 GOOS=linux GOARCH=amd64 go build -o medicart-server-ubuntu .
 ```
 
-Copy `medicart-server-ubuntu` to the Ubuntu server (e.g. `/home/ubuntu/medicart/web-server/`) and restart the service:
+### Deploy on Ubuntu (EC2)
+
+`setup.sh` installs Go, nginx, SSL, and builds the first binary.
+
+After code changes on the server:
 
 ```bash
-cd web-server
-go build -o medicart-server-ubuntu .
-sudo systemctl restart medicart
+cd /home/ubuntu/medicart
+./deploy.sh
 ```
 
-Or from the repo root on the server, run `./deploy.sh` (pulls, rebuilds, and restarts).
+`deploy.sh` pulls latest code, runs `go build`, and restarts the `medicart` service.
 
-**Important:** `git pull` alone is not enough — the systemd service runs the compiled `medicart-server-ubuntu` binary. You must rebuild after pulling code changes.
+Optional — build on your Mac and upload instead:
+
+```bash
+cd medicart
+MEDICART_SERVER=ubuntu@YOUR_EC2_PUBLIC_HOST ./release.sh
+```

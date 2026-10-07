@@ -9,12 +9,38 @@ DOMAIN="yourdomain.com"
 
 APP_DIR="/home/ubuntu/medicart"
 WEB_DIR="$APP_DIR/web-server"
+GO_VERSION="1.24.2"
+GO_INSTALL_DIR="/usr/local/go"
+
+install_go() {
+	if [ -x "$GO_INSTALL_DIR/bin/go" ] && "$GO_INSTALL_DIR/bin/go" version | grep -q "go${GO_VERSION}"; then
+		echo "Go ${GO_VERSION} already installed."
+		return
+	fi
+
+	echo "Installing Go ${GO_VERSION}..."
+	curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+	sudo rm -rf "$GO_INSTALL_DIR"
+	sudo tar -C /usr/local -xzf /tmp/go.tar.gz
+	rm /tmp/go.tar.gz
+
+	sudo tee /etc/profile.d/go-path.sh > /dev/null <<'EOF'
+export PATH="/usr/local/go/bin:$PATH"
+EOF
+}
+
+ensure_go_path() {
+	export PATH="$GO_INSTALL_DIR/bin:$PATH"
+}
 
 ### Update + install packages
 echo "Updating system and installing dependencies..."
 sudo apt update -y
 sudo DEBIAN_FRONTEND=noninteractive apt install -y \
-    git gh nginx certbot python3-certbot-nginx
+    git gh nginx certbot python3-certbot-nginx curl
+
+install_go
+ensure_go_path
 
 ### GitHub auth (non-interactive)
 echo "Authenticating GitHub CLI..."
@@ -109,7 +135,14 @@ sudo systemctl daemon-reexec
 sudo systemctl daemon-reload
 sudo systemctl enable medicart
 
-### Start service cleanly
+### Build and start service
+echo "Building web server..."
+ensure_go_path
+cd "$WEB_DIR"
+go mod tidy
+go build -o medicart-server-ubuntu .
+
+echo "Starting service..."
 sudo systemctl restart medicart
 
 ### Done
