@@ -30,7 +30,7 @@ OBX|2|NM|150456^MDC_PULS_OXIM_SAT_O2^MDC||98|262688^MDC_DIM_PERCENT^MDC||||||||2
 OBX|3|NM|150301^MDC_PRESS_CUFF_SYS^MDC||120|266016^MDC_DIM_MMHG^MDC||||||||20210611102047
 OBX|4|NM|150302^MDC_PRESS_CUFF_DIA^MDC||80|266016^MDC_DIM_MMHG^MDC||||||||20210611102047
 OBX|5|NM|150303^MDC_PRESS_CUFF_MEAN^MDC||93|266016^MDC_DIM_MMHG^MDC||||||||20210611102047
-OBX|6|NM|150344^MDC_TEMP^MDC||36.6|268192^MDC_DIM_DEGC^MDC||||||||20210611102047`
+OBX|6|NM|150344^MDC_TEMP^MDC|1.2.5.150344|36.6|268192^MDC_DIM_DEGC^MDC||||||||20210611102047`
 
 func TestParseGoldenORUR01_NoValidVitals(t *testing.T) {
 	msgs, err := ParseHL7Payload([]byte(goldenORUR01))
@@ -194,27 +194,58 @@ OBX|1|NM|188440^MDC_TEMP_DIFF^MDC|1.2.4.188440|5.0|268224^MDC_DIM_FAHR^MDC`
 	}
 }
 
-func TestParseGunTempORUR04(t *testing.T) {
+func TestParseSpotTempPreferredOverProbe(t *testing.T) {
+	msg := `MSH|^~\&|TR8|FAC|||||ORU^R01|1|P|2.4
+OBX|1|NM|150344^MDC_TEMP^MDC|1.2.1.150344|36.9|268192^MDC_DIM_DEGC^MDC
+OBX|2|NM|150344^MDC_TEMP^MDC|1.2.5.150344|36.4|268192^MDC_DIM_DEGC^MDC||||R|||20261008020630||APERIODIC
+OBX|3|NM|150344^MDC_TEMP^MDC|1.2.2.150344|37.1|268192^MDC_DIM_DEGC^MDC`
+	msgs, err := ParseHL7Payload([]byte(msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := msgs[0].Vitals.Temp.Value; got != 36.4 {
+		t.Fatalf("spot temp should win, got %.1f info=%v", got, msgs[0].Info)
+	}
+}
+
+func TestParseTempInvalidMarker(t *testing.T) {
+	msg := `MSH|^~\&|TR8|FAC|||||ORU^R01|1|P|2.4
+OBX|1||150344^MDC_TEMP^MDC|1.2.5.150344||268192^MDC_DIM_DEGC^MDC||INV|||X`
+	msgs, err := ParseHL7Payload([]byte(msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msgs[0].Vitals != nil && msgs[0].Vitals.Temp.Valid {
+		t.Fatal("INV temp must not be valid")
+	}
+	if len(msgs[0].Info) == 0 || !strings.Contains(msgs[0].Info[0], "marked invalid") {
+		t.Fatalf("expected invalid log, got %v", msgs[0].Info)
+	}
+}
+
+func TestParseTempAlertMessageIgnored(t *testing.T) {
 	msg := `MSH|^~\&|TR8|FAC|||||ORU^R04|2|P|2.4
 OBX|1|NM|150344^MDC_TEMP^MDC||36.4|268192^MDC_DIM_DEGC^MDC`
 	msgs, err := ParseHL7Payload([]byte(msg))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !msgs[0].Vitals.Temp.Valid || msgs[0].Vitals.Temp.Value != 36.4 {
-		t.Fatalf("temp: %+v", msgs[0].Vitals.Temp)
+	if msgs[0].Vitals != nil && msgs[0].Vitals.Temp.Valid {
+		t.Fatal("R04 alert messages must not update vitals")
 	}
 }
 
-func TestParseShortTempOBXFiveFields(t *testing.T) {
+func TestParseRoomProbeInBodyRangeIgnored(t *testing.T) {
+	// A warm room (or probe) reading 26 °C must never show as patient temp.
 	msg := `MSH|^~\&|TR8|FAC|||||ORU^R01|1|P|2.4
-OBX|1|NM|150344^MDC_TEMP^MDC|36.4`
+OBX|1|NM|150344^MDC_TEMP^MDC|1.2.1.150344|26.0|268192^MDC_DIM_DEGC^MDC
+OBX|2|NM|150344^MDC_TEMP^MDC|1.2.2.150344|36.5|268192^MDC_DIM_DEGC^MDC`
 	msgs, err := ParseHL7Payload([]byte(msg))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !msgs[0].Vitals.Temp.Valid || msgs[0].Vitals.Temp.Value != 36.4 {
-		t.Fatalf("temp: %+v info=%v", msgs[0].Vitals.Temp, msgs[0].Info)
+	if v := msgs[0].Vitals; v != nil && v.Temp.Valid {
+		t.Fatalf("probe channels must not set patient temp: %+v", v.Temp)
 	}
 }
 

@@ -46,7 +46,7 @@ func TestConvertHeightToCm(t *testing.T) {
 func TestParseOBX_TempFahrenheit(t *testing.T) {
 	msg := `MSH|^~\&|TR8|FAC|||||ORU^R01|1|P|2.4
 OBR|1|||182777000^monitoring^SCT
-OBX|1|NM|150344^MDC_TEMP^MDC||98.6|268224^MDC_DIM_DEGF^MDC`
+OBX|1|NM|150344^MDC_TEMP^MDC|1.2.5.150344|98.6|268224^MDC_DIM_DEGF^MDC`
 	msgs, err := ParseHL7Payload([]byte(msg))
 	if err != nil || len(msgs) != 1 {
 		t.Fatal(err)

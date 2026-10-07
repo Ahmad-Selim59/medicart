@@ -49,8 +49,45 @@ func Listen(ctx context.Context, cfg ListenConfig, state *MonitorState, onInfo f
 	buf := make([]byte, 65507)
 	var packetsSeen int64
 	var filteredLogged bool
-	var lastTempLog string
-	var r01NoTempExportLogged bool
+	var noMSHLogged int
+	lastTempLogBySub := make(map[string]string)
+	reassemblers := make(map[string]*hl7Reassembler)
+
+	handleMessages := func(raws [][]byte, now time.Time) {
+		for _, raw := range raws {
+			msgs, parseErr := ParseHL7Payload(raw)
+			if parseErr != nil {
+				state.RecordParseError()
+				if onInfo != nil {
+					onInfo(fmt.Sprintf("Monitor HL7 parse error: %v", parseErr))
+				}
+				continue
+			}
+			state.RecordMessagesParsed(len(msgs))
+			if len(msgs) == 0 {
+				if onInfo != nil && noMSHLogged < 3 {
+					noMSHLogged++
+					onInfo(fmt.Sprintf("Monitor: dropped %d bytes with no MSH (joined mid-message?); preview: %q", len(raw), previewBytes(raw, 80)))
+				}
+				continue
+			}
+			for _, msg := range msgs {
+				applyParsedMonitorMessage(state, msg, now)
+				if onInfo == nil {
+					continue
+				}
+				for _, line := range msg.Info {
+					if sub := tempLogSubKey(line); sub != "" {
+						if lastTempLogBySub[sub] == line {
+							continue
+						}
+						lastTempLogBySub[sub] = line
+					}
+					onInfo(line)
+				}
+			}
+		}
+	}
 
 	for {
 		select {
@@ -59,10 +96,14 @@ func Listen(ctx context.Context, cfg ListenConfig, state *MonitorState, onInfo f
 		default:
 		}
 
-		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		_ = pc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 		n, remote, err := pc.ReadFrom(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				now := time.Now()
+				for _, r := range reassemblers {
+					handleMessages(r.FlushIdle(now), now)
+				}
 				continue
 			}
 			select {
@@ -93,55 +134,53 @@ func Listen(ctx context.Context, cfg ListenConfig, state *MonitorState, onInfo f
 			onInfo(fmt.Sprintf("Monitor: first UDP packet from %s (%d bytes)", sourceIP, n))
 		}
 
-		msgs, parseErr := ParseHL7Payload(buf[:n])
-		if parseErr != nil {
-			state.RecordParseError()
-			if onInfo != nil {
-				onInfo(fmt.Sprintf("Monitor HL7 parse error: %v", parseErr))
-			}
-			continue
+		r := reassemblers[sourceIP]
+		if r == nil {
+			r = &hl7Reassembler{}
+			reassemblers[sourceIP] = r
 		}
-		state.RecordMessagesParsed(len(msgs))
-		payloadStr := string(buf[:n])
-		payloadUpper := strings.ToUpper(payloadStr)
-		hasTempInPayload := strings.Contains(payloadStr, "150344") || strings.Contains(payloadUpper, "MDC_TEMP")
-		if onInfo != nil && !r01NoTempExportLogged && packetsSeen >= 5 && strings.Contains(payloadUpper, "ORU^R01") && !hasTempInPayload {
-			r01NoTempExportLogged = true
-			onInfo("Monitor temp: ORU^R01 packets have no MDC_TEMP (150344) OBX — the value on the TR8 screen may not be exported over HL7 until temp is enabled in the monitor interface profile")
-		}
-		if len(msgs) == 0 && onInfo != nil && packetsSeen <= 3 {
-			preview := strings.TrimSpace(string(buf[:min(n, 80)]))
-			preview = strings.ReplaceAll(preview, "\r", `\r`)
-			preview = strings.ReplaceAll(preview, "\n", `\n`)
-			onInfo(fmt.Sprintf("Monitor: UDP packet (%d bytes) had no HL7 MSH segment; preview: %q", n, preview))
-		}
-		for _, msg := range msgs {
-			if msg == nil {
-				continue
-			}
-			if msg.Waveform != nil {
-				state.ApplyWaveform(msg.Waveform, now)
-			}
-			if msg.Skip {
-				if msg.Patient != nil {
-					state.ApplyParsedMessage(&ParsedMessage{Patient: msg.Patient}, now)
-				}
-				continue
-			}
-			state.ApplyParsedMessage(msg, now)
-			if onInfo != nil {
-				for _, line := range msg.Info {
-					if strings.Contains(line, "temp OBX") {
-						if line == lastTempLog {
-							continue
-						}
-						lastTempLog = line
-					}
-					onInfo(line)
-				}
-			}
+		handleMessages(r.Push(buf[:n], now), now)
+		if r.Overflowed() && onInfo != nil {
+			onInfo(fmt.Sprintf("Monitor: discarded oversized partial HL7 buffer from %s (no message end seen)", sourceIP))
 		}
 	}
+}
+
+func applyParsedMonitorMessage(state *MonitorState, msg *ParsedMessage, now time.Time) {
+	if msg == nil {
+		return
+	}
+	if msg.Waveform != nil {
+		state.ApplyWaveform(msg.Waveform, now)
+	}
+	if msg.Skip {
+		if msg.Patient != nil {
+			state.ApplyParsedMessage(&ParsedMessage{Patient: msg.Patient}, now)
+		}
+		return
+	}
+	state.ApplyParsedMessage(msg, now)
+}
+
+// tempLogSubKey returns the temp channel of a "Monitor temp OBX: sub=…" line so repeats
+// are suppressed per channel (T1, T2 and spot alternate within one message).
+func tempLogSubKey(line string) string {
+	const marker = "temp OBX: sub="
+	i := strings.Index(line, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := line[i+len(marker):]
+	if j := strings.IndexByte(rest, ' '); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
+func previewBytes(b []byte, max int) string {
+	s := strings.TrimSpace(string(b[:min(len(b), max)]))
+	s = strings.ReplaceAll(s, "\r", " ")
+	return strings.ReplaceAll(s, "\n", " ")
 }
 
 func allowIPLabel(allowIP string) string {

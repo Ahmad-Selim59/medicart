@@ -257,11 +257,8 @@ func shouldProcessVitals(msgType string) bool {
 	if len(parts) < 2 {
 		return false
 	}
-	if parts[0] != "ORU" {
-		return false
-	}
-	// W01 is waveform-only; other ORU types (R01, R04, …) may carry vitals / gun temp.
-	return parts[1] != "W01"
+	// ZUG: observations (incl. aperiodic spot temp) are ORU^R01; R04 is alerts, W01 waveforms.
+	return parts[0] == "ORU" && parts[1] == "R01"
 }
 
 func isWaveformOBR(seg hl7Segment) bool {
@@ -277,11 +274,11 @@ func isWaveformOBR(seg hl7Segment) bool {
 }
 
 type hl7Separators struct {
-	field    byte
-	component byte
+	field      byte
+	component  byte
 	repetition byte
-	escape   byte
-	sub      byte
+	escape     byte
+	sub        byte
 }
 
 func defaultSeps() hl7Separators {
@@ -447,7 +444,7 @@ func obxTempSubIDString(seg hl7Segment) string {
 func tempChannelPriority(subID string) int {
 	u := strings.ToUpper(subID)
 	switch {
-	case strings.Contains(u, "1.2.5.150344") || strings.Contains(u, "1.2.5"):
+	case strings.HasPrefix(u, "1.2.5."):
 		return 100 // spot / IR gun (ZUG Table 40)
 	case strings.Contains(u, "1.13.2"):
 		return 40
@@ -523,15 +520,29 @@ func looksLikeTempSubIDOrMDCCode(raw string) bool {
 }
 
 func obxTempUnits(seg hl7Segment, subID string) string {
-	units := ""
 	if len(seg.fields) > 6 {
-		units = obxUnitsKey(seg)
+		return obxUnitsKey(seg)
 	}
-	if units == "" && tempChannelPriority(subID) >= 100 {
-		// ZUG Table 40: spot temperature published in °F.
-		return "FAHR"
+	return ""
+}
+
+// obxInvalid reports the ZUG invalid marker: OBX-8 "INV" or OBX-11 "X" (OBX-5 is then blank).
+func obxInvalid(seg hl7Segment) bool {
+	if len(seg.fields) > 8 && strings.EqualFold(strings.TrimSpace(seg.fields[8]), "INV") {
+		return true
 	}
-	return units
+	return len(seg.fields) > 11 && strings.EqualFold(strings.TrimSpace(seg.fields[11]), "X")
+}
+
+func celsiusFromTemp(value float64, units string) (float64, bool) {
+	if strings.TrimSpace(units) == "" {
+		// Body-temp ranges in °C (25–45) and °F (77–113) don't overlap, so the unit is unambiguous.
+		if value >= 77 && value <= 113 {
+			return ConvertTempToCelsius(value, "DEGF")
+		}
+		return value, true
+	}
+	return ConvertTempToCelsius(value, units)
 }
 
 func pickBodyTempReading(candidates []string, units string) (raw string, celsius float64, ok bool) {
@@ -546,15 +557,8 @@ func pickBodyTempReading(candidates []string, units string) (raw string, celsius
 		if !vok {
 			continue
 		}
-		scales := []float64{f}
-		if f >= 300 && f <= 5000 && !strings.Contains(raw, ".") {
-			scales = append(scales, f/100.0, f/10.0)
-		}
-		for _, val := range scales {
-			c, cok := ConvertTempToCelsius(val, units)
-			if cok && isPlausibleBodyTempC(c) {
-				return raw, c, true
-			}
+		if c, cok := celsiusFromTemp(f, units); cok && isPlausibleBodyTempC(c) {
+			return raw, c, true
 		}
 	}
 	// Return first sentinel if any (for logging).
@@ -710,8 +714,19 @@ func parseTempOBX(v *VitalsSnapshot, cand obxTempCandidateSet, units, subID stri
 	if subLabel == "" {
 		subLabel = "?"
 	}
+	if !isSpotTempChannel(subID) {
+		// Probe channels on this setup measure room temperature, never the patient.
+		if len(cand.Strict) > 0 {
+			logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s %s raw=%s (ignored — only the spot/gun channel is patient temp)", subLabel, tempChannelName(subID), cand.Strict[0]))
+		}
+		return false
+	}
+	if obxInvalid(seg) {
+		logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s %s (monitor marked invalid — no gun reading yet)", subLabel, tempChannelName(subID)))
+		return false
+	}
 	if len(cand.Strict) == 0 && len(cand.Fallback) == 0 {
-		logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s (empty OBX-5 value)", subLabel))
+		logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s %s (empty OBX-5 value)", subLabel, tempChannelName(subID)))
 		return false
 	}
 	raw, celsius, ok := pickBodyTempReading(cand.Strict, units)
@@ -725,17 +740,35 @@ func parseTempOBX(v *VitalsSnapshot, cand obxTempCandidateSet, units, subID stri
 			logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s raw=%s (no reading in HL7)", subLabel, raw))
 			return false
 		}
-		logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s raw=%q units=%q type=%s (no plausible body temp in OBX-5)", subLabel, raw, units, cand.ValType))
+		logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s %s raw=%q units=%q (outside body range 25–45 °C — probe not on patient?)", subLabel, tempChannelName(subID), raw, units))
 		return false
 	}
 	rank := tempChannelPriority(subID)
 	applyBodyTemp(v, celsius, obsTime, rank)
 	if usedAlternate {
-		logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s raw=%s units=%q -> %.1f °C (alternate OBX-5 component, type=%s)", subLabel, raw, units, celsius, cand.ValType))
+		logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s %s raw=%s units=%q -> %.1f °C (alternate OBX-5 component, type=%s)", subLabel, tempChannelName(subID), raw, units, celsius, cand.ValType))
 	} else {
-		logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s raw=%s units=%q -> %.1f °C (buffered)", subLabel, raw, units, celsius))
+		logTemp(fmt.Sprintf("Monitor temp OBX: sub=%s %s raw=%s units=%q -> %.1f °C (buffered)", subLabel, tempChannelName(subID), raw, units, celsius))
 	}
 	return true
+}
+
+func isSpotTempChannel(subID string) bool {
+	return tempChannelPriority(subID) == 100
+}
+
+func tempChannelName(subID string) string {
+	switch tempChannelPriority(subID) {
+	case 100:
+		return "[spot/gun]"
+	case 10:
+		return "[temp]"
+	default:
+		if strings.Contains(subID, "1.2.2") || strings.Contains(subID, "1.13.2") {
+			return "[T2 probe]"
+		}
+		return "[T1 probe]"
+	}
 }
 
 func parseHL7Time(seg hl7Segment, fieldIdx int) time.Time {
@@ -767,7 +800,7 @@ func ageFromDOB(dob string) int {
 	t := parseHL7TimeString(dob)
 	if t.IsZero() {
 		return 0
-}
+	}
 	now := time.Now()
 	age := now.Year() - t.Year()
 	if now.YearDay() < t.YearDay() {

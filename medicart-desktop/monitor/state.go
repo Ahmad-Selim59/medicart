@@ -65,14 +65,14 @@ type PatientSnapshot struct {
 
 // VitalsSnapshot is the latest cached monitor readings.
 type VitalsSnapshot struct {
-	ECGHeartRate   IntReading
-	SpO2Pulse      IntReading
-	SpO2           IntReading
-	NIBPSys        IntReading
-	NIBPDia        IntReading
-	NIBPMap        IntReading
-	NIBPPulse      IntReading
-	Temp           FloatReading
+	ECGHeartRate IntReading
+	SpO2Pulse    IntReading
+	SpO2         IntReading
+	NIBPSys      IntReading
+	NIBPDia      IntReading
+	NIBPMap      IntReading
+	NIBPPulse    IntReading
+	Temp         FloatReading
 }
 
 // PublicSnapshot is a copy safe for UI without holding the lock.
@@ -305,7 +305,9 @@ func mergeFloat(dst *FloatReading, src FloatReading, at time.Time) {
 		obs = at
 	}
 	if dst.Valid {
-		if src.Rank < dst.Rank {
+		// A stale spot reading must not block fresh probe readings forever.
+		dstFresh := dst.ObservedAt.IsZero() || obs.Sub(dst.ObservedAt) < MaxStaleness
+		if src.Rank < dst.Rank && dstFresh {
 			return
 		}
 		if src.Rank == dst.Rank && !dst.ObservedAt.IsZero() && obs.Before(dst.ObservedAt) {
