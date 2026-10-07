@@ -375,6 +375,7 @@ func parseOBX(seg hl7Segment, v *VitalsSnapshot, p *PatientSnapshot) bool {
 		rawVal = strings.TrimSpace(seg.fields[6])
 	}
 	obsTime := parseHL7Time(seg, 14)
+	units := obxUnitsKey(seg)
 
 	switch id {
 	case "MDC_ECG_HEART_RATE", "147842":
@@ -413,18 +414,27 @@ func parseOBX(seg hl7Segment, v *VitalsSnapshot, p *PatientSnapshot) bool {
 			return true
 		}
 	case "MDC_TEMP", "150344", "188440", "188472":
-		if f, ok := validBodyTempCelsius(rawVal); ok {
-			applyBodyTemp(v, f, obsTime)
-			return true
+		if f, ok := validFloat(rawVal); ok {
+			c, ok := ConvertTempToCelsius(f, units)
+			if ok && isPlausibleBodyTempC(c) {
+				applyBodyTemp(v, c, obsTime)
+				return true
+			}
 		}
 	case "MDC_ATTR_PT_WEIGHT", "MDC_WEIGHT", "MDC_BODY_WEIGHT":
 		if f, ok := validFloat(rawVal); ok {
-			p.Weight = f
+			kg, ok := ConvertWeightToKg(f, units)
+			if ok && kg > 0 {
+				p.Weight = kg
+			}
 			return false
 		}
 	case "MDC_ATTR_PT_HEIGHT", "MDC_HEIGHT", "MDC_BODY_HEIGHT":
 		if f, ok := validFloat(rawVal); ok {
-			p.Height = f
+			cm, ok := ConvertHeightToCm(f, units)
+			if ok && cm > 0 {
+				p.Height = cm
+			}
 			return false
 		}
 	}
@@ -506,16 +516,8 @@ func validFloat(raw string) (float64, bool) {
 	return f, true
 }
 
-func validBodyTempCelsius(raw string) (float64, bool) {
-	f, ok := validFloat(raw)
-	if !ok {
-		return 0, false
-	}
-	// Plausible clinical range (°C); TR8 sends MDC_DIM_DEGC for 150344.
-	if f < 25 || f > 45 {
-		return 0, false
-	}
-	return f, true
+func isPlausibleBodyTempC(celsius float64) bool {
+	return celsius >= 25 && celsius <= 45
 }
 
 func applyBodyTemp(v *VitalsSnapshot, celsius float64, obsTime time.Time) {
