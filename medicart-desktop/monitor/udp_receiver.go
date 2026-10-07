@@ -49,6 +49,8 @@ func Listen(ctx context.Context, cfg ListenConfig, state *MonitorState, onInfo f
 	buf := make([]byte, 65507)
 	var packetsSeen int64
 	var filteredLogged bool
+	var lastTempLog string
+	var r01NoTempExportLogged bool
 
 	for {
 		select {
@@ -100,6 +102,13 @@ func Listen(ctx context.Context, cfg ListenConfig, state *MonitorState, onInfo f
 			continue
 		}
 		state.RecordMessagesParsed(len(msgs))
+		payloadStr := string(buf[:n])
+		payloadUpper := strings.ToUpper(payloadStr)
+		hasTempInPayload := strings.Contains(payloadStr, "150344") || strings.Contains(payloadUpper, "MDC_TEMP")
+		if onInfo != nil && !r01NoTempExportLogged && packetsSeen >= 5 && strings.Contains(payloadUpper, "ORU^R01") && !hasTempInPayload {
+			r01NoTempExportLogged = true
+			onInfo("Monitor temp: ORU^R01 packets have no MDC_TEMP (150344) OBX — the value on the TR8 screen may not be exported over HL7 until temp is enabled in the monitor interface profile")
+		}
 		if len(msgs) == 0 && onInfo != nil && packetsSeen <= 3 {
 			preview := strings.TrimSpace(string(buf[:min(n, 80)]))
 			preview = strings.ReplaceAll(preview, "\r", `\r`)
@@ -120,6 +129,17 @@ func Listen(ctx context.Context, cfg ListenConfig, state *MonitorState, onInfo f
 				continue
 			}
 			state.ApplyParsedMessage(msg, now)
+			if onInfo != nil {
+				for _, line := range msg.Info {
+					if strings.Contains(line, "temp OBX") {
+						if line == lastTempLog {
+							continue
+						}
+						lastTempLog = line
+					}
+					onInfo(line)
+				}
+			}
 		}
 	}
 }

@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"bytes"
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ type ParsedMessage struct {
 	Patient     *PatientSnapshot
 	Vitals      *VitalsSnapshot
 	Waveform    *WaveformUpdate // ORU^W01 ECG chunks (when Skip)
+	Info        []string        // optional debug lines for Live Console (temp tracing, etc.)
 }
 
 // ParseHL7Payload splits raw UDP bytes into messages and parses each.
@@ -122,6 +124,7 @@ func parseOneMessage(body string) (*ParsedMessage, error) {
 	hasVitals := false
 
 	var msgType string
+	var parseInfo []string
 	for _, seg := range segments {
 		switch seg.name {
 		case "MSH":
@@ -156,7 +159,7 @@ func parseOneMessage(body string) (*ParsedMessage, error) {
 				continue
 			}
 			if shouldProcessVitals(msgType) {
-				if parseOBX(seg, vitals, patient) {
+				if parseOBX(seg, vitals, patient, &parseInfo) {
 					hasVitals = true
 				}
 			}
@@ -184,11 +187,27 @@ func parseOneMessage(body string) (*ParsedMessage, error) {
 		}, nil
 	}
 
-	return &ParsedMessage{
+	out := &ParsedMessage{
 		MessageType: msgType,
 		Patient:     patientIf(hasPatient, patient),
 		Vitals:      vitalsIf(hasVitals, vitals),
-	}, nil
+	}
+	if shouldProcessVitals(msgType) && strings.Contains(body, "150344") {
+		hasTempLog := false
+		for _, line := range parseInfo {
+			if strings.Contains(line, "temp OBX") || strings.Contains(line, "temp:") {
+				hasTempLog = true
+				break
+			}
+		}
+		if !hasTempLog {
+			parseInfo = append(parseInfo, "Monitor temp: HL7 packet contains 150344 but no temp OBX segment matched — check TR8 HL7 profile")
+		}
+	}
+	if len(parseInfo) > 0 {
+		out.Info = parseInfo
+	}
+	return out, nil
 }
 
 func patientIf(ok bool, p *PatientSnapshot) *PatientSnapshot {
@@ -365,15 +384,12 @@ func obxMDCKey(identifierField string, seps hl7Separators) string {
 	return strings.ToUpper(code)
 }
 
-func parseOBX(seg hl7Segment, v *VitalsSnapshot, p *PatientSnapshot) bool {
+func parseOBX(seg hl7Segment, v *VitalsSnapshot, p *PatientSnapshot, info *[]string) bool {
 	if len(seg.fields) < 6 {
 		return false
 	}
 	id := obxMDCKey(seg.fields[3], seg.seps)
-	rawVal := strings.TrimSpace(seg.fields[5])
-	if rawVal == "" && len(seg.fields) > 6 {
-		rawVal = strings.TrimSpace(seg.fields[6])
-	}
+	rawVal := obxNumericValue(seg)
 	obsTime := parseHL7Time(seg, 14)
 	units := obxUnitsKey(seg)
 
@@ -414,13 +430,7 @@ func parseOBX(seg hl7Segment, v *VitalsSnapshot, p *PatientSnapshot) bool {
 			return true
 		}
 	case "MDC_TEMP", "150344", "188440", "188472":
-		if f, ok := validFloat(rawVal); ok {
-			c, ok := ConvertTempToCelsius(f, units)
-			if ok && isPlausibleBodyTempC(c) {
-				applyBodyTemp(v, c, obsTime)
-				return true
-			}
-		}
+		return parseTempOBX(v, rawVal, units, obsTime, info, seg)
 	case "MDC_ATTR_PT_WEIGHT", "MDC_WEIGHT", "MDC_BODY_WEIGHT":
 		if f, ok := validFloat(rawVal); ok {
 			kg, ok := ConvertWeightToKg(f, units)
@@ -438,7 +448,89 @@ func parseOBX(seg hl7Segment, v *VitalsSnapshot, p *PatientSnapshot) bool {
 			return false
 		}
 	}
+	if isTempOBXIdentifier(id, seg.fields[3]) || tempOBXSubID(seg) {
+		return parseTempOBX(v, rawVal, units, obsTime, info, seg)
+	}
 	return false
+}
+
+func tempOBXSubID(seg hl7Segment) bool {
+	if len(seg.fields) < 5 {
+		return false
+	}
+	return strings.Contains(seg.fields[4], "150344") ||
+		strings.Contains(strings.ToUpper(seg.fields[4]), "1.13.1") ||
+		strings.Contains(strings.ToUpper(seg.fields[4]), "1.13.2")
+}
+
+func obxNumericValue(seg hl7Segment) string {
+	if len(seg.fields) < 6 {
+		return ""
+	}
+	valType := ""
+	if len(seg.fields) > 2 {
+		valType = strings.TrimSpace(seg.fields[2])
+	}
+	raw := strings.TrimSpace(fieldComponent(seg.fields[5], seg.seps, 0))
+	if raw == "" {
+		raw = strings.TrimSpace(seg.fields[5])
+	}
+	if raw == "" && (strings.EqualFold(valType, "SN") || strings.EqualFold(valType, "NM")) {
+		for _, idx := range []int{1, 2, 3} {
+			raw = strings.TrimSpace(fieldComponent(seg.fields[5], seg.seps, idx))
+			if raw != "" {
+				break
+			}
+		}
+	}
+	if raw == "" && len(seg.fields) > 6 {
+		raw = strings.TrimSpace(fieldComponent(seg.fields[6], seg.seps, 0))
+		if raw == "" {
+			raw = strings.TrimSpace(seg.fields[6])
+		}
+	}
+	return raw
+}
+
+func isTempOBXIdentifier(key, identifierField string) bool {
+	if key == "MDC_TEMP" || key == "150344" || key == "188440" || key == "188472" {
+		return true
+	}
+	u := strings.ToUpper(identifierField)
+	return strings.Contains(u, "150344") || strings.Contains(u, "MDC_TEMP")
+}
+
+func parseTempOBX(v *VitalsSnapshot, rawVal, units string, obsTime time.Time, info *[]string, seg hl7Segment) bool {
+	logTemp := func(msg string) {
+		if info != nil {
+			*info = append(*info, msg)
+		}
+	}
+	if rawVal == "" && len(seg.fields) > 2 {
+		logTemp(fmt.Sprintf("Monitor temp OBX: type=%s id=%q (empty value field)", seg.fields[2], fieldComponent(seg.fields[3], seg.seps, 0)))
+		return false
+	}
+	if isSentinelRaw(rawVal) {
+		logTemp(fmt.Sprintf("Monitor temp OBX: raw=%s (no reading in HL7)", rawVal))
+		return false
+	}
+	f, ok := validFloat(rawVal)
+	if !ok {
+		logTemp(fmt.Sprintf("Monitor temp OBX: raw=%q units=%q (not a numeric value)", rawVal, units))
+		return false
+	}
+	c, ok := ConvertTempToCelsius(f, units)
+	if !ok {
+		logTemp(fmt.Sprintf("Monitor temp OBX: raw=%s units=%q (unknown unit)", rawVal, units))
+		return false
+	}
+	if !isPlausibleBodyTempC(c) {
+		logTemp(fmt.Sprintf("Monitor temp OBX: raw=%s units=%q -> %.2f °C (out of range)", rawVal, units, c))
+		return false
+	}
+	applyBodyTemp(v, c, obsTime)
+	logTemp(fmt.Sprintf("Monitor temp OBX: raw=%s units=%q -> %.1f °C (buffered)", rawVal, units, c))
+	return true
 }
 
 func parseHL7Time(seg hl7Segment, fieldIdx int) time.Time {
@@ -513,7 +605,21 @@ func validFloat(raw string) (float64, bool) {
 	if err != nil {
 		return 0, false
 	}
+	// TR8 / MDC use -1, -999, -99.9 when a sensor has no reading.
+	if f < 0 {
+		return 0, false
+	}
 	return f, true
+}
+
+func isSentinelRaw(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	switch raw {
+	case "-1", "-999", "-99.9", "-99", "-999.0":
+		return true
+	default:
+		return false
+	}
 }
 
 func isPlausibleBodyTempC(celsius float64) bool {

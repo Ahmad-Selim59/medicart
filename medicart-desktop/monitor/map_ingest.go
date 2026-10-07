@@ -146,29 +146,33 @@ func buildTemp(v VitalsSnapshot, now time.Time) CommitResult {
 
 // FormatVitalDisplay returns human-readable live values for the UI.
 func FormatVitalDisplay(v VitalsSnapshot) (hr, spo2, nibp, temp string) {
-	if v.ECGHeartRate.Valid {
+	if vitalIntOK(v.ECGHeartRate) {
 		hr = fmt.Sprintf("%d bpm", v.ECGHeartRate.Value)
-	} else if v.SpO2Pulse.Valid {
+	} else if vitalIntOK(v.SpO2Pulse) {
 		hr = fmt.Sprintf("%d bpm (SpO2)", v.SpO2Pulse.Value)
 	} else {
 		hr = "—"
 	}
-	if v.SpO2.Valid {
+	if vitalIntOK(v.SpO2) && v.SpO2.Value <= 100 {
 		spo2 = fmt.Sprintf("%d%%", v.SpO2.Value)
 	} else {
 		spo2 = "—"
 	}
-	if v.NIBPSys.Valid && v.NIBPDia.Valid && v.NIBPMap.Valid {
+	if vitalIntOK(v.NIBPSys) && vitalIntOK(v.NIBPDia) && vitalIntOK(v.NIBPMap) {
 		nibp = fmt.Sprintf("%d/%d (%d)", v.NIBPSys.Value, v.NIBPDia.Value, v.NIBPMap.Value)
 	} else {
 		nibp = "—"
 	}
-	if v.Temp.Valid {
+	if v.Temp.Valid && v.Temp.Value >= 0 && isPlausibleBodyTempC(v.Temp.Value) {
 		temp = fmt.Sprintf("%.1f °C", v.Temp.Value)
 	} else {
 		temp = "—"
 	}
 	return hr, spo2, nibp, temp
+}
+
+func vitalIntOK(r IntReading) bool {
+	return r.Valid && r.Value >= 0
 }
 
 // ConnectionStatusText formats monitor link status for the UI.

@@ -66,6 +66,48 @@ func TestParseGoldenORUW01_Skipped(t *testing.T) {
 	}
 }
 
+func TestParseSentinelMinusOne_NoValidVitals(t *testing.T) {
+	const r01 = `MSH|^~\&|TR8|FAC|||||ORU^R01|1|P|2.4
+OBX|1|NM|147842^MDC_ECG_HEART_RATE^MDC||-1|264864^MDC_DIM_BEAT_PER_MIN^MDC
+OBX|2|NM|150456^MDC_PULS_OXIM_SAT_O2^MDC||-1|262688^MDC_DIM_PERCENT^MDC
+OBX|3|NM|150301^MDC_PRESS_CUFF_SYS^MDC||-1|266016^MDC_DIM_MMHG^MDC
+OBX|4|NM|150302^MDC_PRESS_CUFF_DIA^MDC||-1|266016^MDC_DIM_MMHG^MDC
+OBX|5|NM|150303^MDC_PRESS_CUFF_MEAN^MDC||-1|266016^MDC_DIM_MMHG^MDC`
+	msgs, err := ParseHL7Payload([]byte(r01))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := msgs[0].Vitals
+	if v == nil {
+		return
+	}
+	if v.ECGHeartRate.Valid || v.SpO2.Valid || v.NIBPSys.Valid {
+		t.Fatalf("expected no valid vitals for -1 sentinels: %+v", v)
+	}
+	hr, spo2, nibp, _ := FormatVitalDisplay(*v)
+	if hr != "—" || spo2 != "—" || nibp != "—" {
+		t.Fatalf("display: hr=%q spo2=%q nibp=%q", hr, spo2, nibp)
+	}
+}
+
+func TestParseTempOBX_LogsSentinelInfo(t *testing.T) {
+	msgs, err := ParseHL7Payload([]byte(goldenORUR01))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := msgs[0]
+	found := false
+	for _, line := range msg.Info {
+		if strings.Contains(line, "temp OBX") && strings.Contains(line, "-99.9") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected temp debug line for sentinel, got Info=%v", msg.Info)
+	}
+}
+
 func TestParseSyntheticPatientAndVitals(t *testing.T) {
 	msgs, err := ParseHL7Payload([]byte(syntheticPatientR01))
 	if err != nil {

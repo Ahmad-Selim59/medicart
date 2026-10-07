@@ -28,7 +28,7 @@ This application bridges the **ZUG TR8 patient monitor** (HL7 over UDP) and your
 5. **Allow source IP** in Settings must be **empty** unless you intentionally filter one monitor address. You do **not** need to know the monitor IP for normal operation.
 6. On Readings, after a few seconds you should see a **UDP self-test** line in Live Console. If **packet count** stays 0 but self-test ran, it is almost always firewall or another program still bound to the same UDP port (close PowerShell test listeners).
 
-**Temperature** on the Readings card comes from TR8 `MDC_TEMP` (150344) in HL7. Values are normalized to **°C** using OBX-6 units when present (e.g. `MDC_DIM_DEGC`, `MDC_DIM_DEGF`); missing units are treated as Celsius. **Weight** and **height** from patient OBX are stored as **kg** and **cm** with the same unit handling. If temp shows **—**, the stream is sending `-99.9` / no probe value—use the probe on the monitor so R01 includes a valid reading.
+**Temperature** on the Readings card comes from TR8 `MDC_TEMP` (150344) in HL7. Values are normalized to **°C** using OBX-6 units when present (e.g. `MDC_DIM_DEGC`, `MDC_DIM_DEGF`); missing units are treated as Celsius. **Weight** and **height** from patient OBX are stored as **kg** and **cm** with the same unit handling. Unset monitor values (`-1`, `-999`, `-99.9`) show as **—** on the live card. When temp OBX is present, the **Live Console** logs lines starting with `Monitor temp OBX:` (accepted reading, sentinel, or parse issue). If you see **no** temp lines and a one-time note that R01 has no `150344`, the TR8 is not exporting temperature on HL7 even if the screen shows a value—check the monitor’s HL7 / interface settings.
 
 ### “Access forbidden” when binding UDP (Windows)
 

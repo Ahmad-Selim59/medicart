@@ -198,6 +198,7 @@ func (s *MonitorState) ApplyParsedMessage(msg *ParsedMessage, receivedAt time.Ti
 	}
 	if msg.Vitals != nil {
 		mergeVitals(&s.vitals, msg.Vitals, receivedAt)
+		sanitizeVitals(&s.vitals)
 	}
 
 	key := patientKey(s.patient)
@@ -252,8 +253,38 @@ func mergeVitals(dst *VitalsSnapshot, src *VitalsSnapshot, at time.Time) {
 	mergeFloat(&dst.Temp, src.Temp, at)
 }
 
+func sanitizeVitals(v *VitalsSnapshot) {
+	if v == nil {
+		return
+	}
+	if v.ECGHeartRate.Valid && v.ECGHeartRate.Value < 0 {
+		v.ECGHeartRate.Valid = false
+	}
+	if v.SpO2Pulse.Valid && v.SpO2Pulse.Value < 0 {
+		v.SpO2Pulse.Valid = false
+	}
+	if v.SpO2.Valid && (v.SpO2.Value < 0 || v.SpO2.Value > 100) {
+		v.SpO2.Valid = false
+	}
+	if v.NIBPSys.Valid && v.NIBPSys.Value < 0 {
+		v.NIBPSys.Valid = false
+	}
+	if v.NIBPDia.Valid && v.NIBPDia.Value < 0 {
+		v.NIBPDia.Valid = false
+	}
+	if v.NIBPMap.Valid && v.NIBPMap.Value < 0 {
+		v.NIBPMap.Valid = false
+	}
+	if v.NIBPPulse.Valid && v.NIBPPulse.Value < 0 {
+		v.NIBPPulse.Valid = false
+	}
+	if v.Temp.Valid && v.Temp.Value < 0 {
+		v.Temp.Valid = false
+	}
+}
+
 func mergeInt(dst *IntReading, src IntReading, at time.Time) {
-	if !src.Valid {
+	if !src.Valid || src.Value < 0 {
 		return
 	}
 	dst.Value = src.Value
@@ -265,7 +296,7 @@ func mergeInt(dst *IntReading, src IntReading, at time.Time) {
 }
 
 func mergeFloat(dst *FloatReading, src FloatReading, at time.Time) {
-	if !src.Valid {
+	if !src.Valid || src.Value < 0 {
 		return
 	}
 	obs := src.ObservedAt
