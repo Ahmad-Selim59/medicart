@@ -38,6 +38,7 @@ type IntReading struct {
 // ConnectionMeta tracks UDP activity.
 type ConnectionMeta struct {
 	ListenAddr      string
+	ListenError     string
 	LastPacketAt    time.Time
 	SourceIP        string
 	PacketsReceived int64
@@ -126,6 +127,24 @@ func (s *MonitorState) Snapshot() PublicSnapshot {
 func (s *MonitorState) SetListening(addr string) {
 	s.mu.Lock()
 	s.connection.ListenAddr = addr
+	s.connection.ListenError = ""
+	s.mu.Unlock()
+}
+
+// SetListenError records a permanent bind failure for the UI.
+func (s *MonitorState) SetListenError(err error) {
+	if err == nil {
+		return
+	}
+	s.mu.Lock()
+	s.connection.ListenError = err.Error()
+	s.mu.Unlock()
+}
+
+// ClearListenError clears a prior bind error after a successful listen.
+func (s *MonitorState) ClearListenError() {
+	s.mu.Lock()
+	s.connection.ListenError = ""
 	s.mu.Unlock()
 }
 

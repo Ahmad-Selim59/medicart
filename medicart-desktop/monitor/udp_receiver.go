@@ -24,16 +24,18 @@ func Listen(ctx context.Context, cfg ListenConfig, state *MonitorState, onInfo f
 	}
 	port := cfg.UDPPort
 	if port <= 0 {
-		port = 5000
+		port = DefaultUDPPort
 	}
 
 	pc, boundAddr, err := openUDPListen(host, port)
 	if err != nil {
 		if onInfo != nil {
-			onInfo(fmt.Sprintf("Monitor UDP listen failed on %s: %v", boundAddr, err))
+			onInfo(FormatBindError(boundAddr, err))
 		}
+		state.SetListenError(err)
 		return
 	}
+	state.ClearListenError()
 	defer pc.Close()
 
 	state.SetListening(boundAddr)

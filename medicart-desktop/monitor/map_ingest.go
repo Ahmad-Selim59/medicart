@@ -173,9 +173,15 @@ func FormatVitalDisplay(v VitalsSnapshot) (hr, spo2, nibp, temp string) {
 
 // ConnectionStatusText formats monitor link status for the UI.
 func ConnectionStatusText(c ConnectionMeta, now time.Time, vitals VitalsSnapshot) string {
+	if msg := strings.TrimSpace(c.ListenError); msg != "" {
+		if strings.Contains(strings.ToLower(msg), "forbidden") || strings.Contains(strings.ToLower(msg), "access permissions") {
+			return "Monitor: Windows reserved/blocked this UDP port — change port in Settings (e.g. 5500) and match TR8"
+		}
+		return "Monitor: not listening — see Live Console"
+	}
 	addr := strings.TrimSpace(c.ListenAddr)
 	if addr == "" {
-		addr = "0.0.0.0:5000"
+		addr = fmt.Sprintf("0.0.0.0:%d", DefaultUDPPort)
 	}
 	if c.PacketsFiltered > 0 && c.PacketsReceived == 0 {
 		return fmt.Sprintf("Monitor: listening on %s — packets arrive but are blocked by Allow IP filter (%d dropped)", addr, c.PacketsFiltered)

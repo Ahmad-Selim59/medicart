@@ -439,7 +439,7 @@ func defaultAppConfig() AppConfig {
 		ServerBase:      "http://localhost:8081",
 		MonitorEnabled:  true,
 		MonitorBindHost: "0.0.0.0",
-		MonitorUDPPort:  5000,
+		MonitorUDPPort:  monitor.DefaultUDPPort,
 	}
 }
 
@@ -448,7 +448,7 @@ func applyMonitorDefaults(cfg *AppConfig) {
 		cfg.MonitorBindHost = "0.0.0.0"
 	}
 	if cfg.MonitorUDPPort <= 0 {
-		cfg.MonitorUDPPort = 5000
+		cfg.MonitorUDPPort = monitor.DefaultUDPPort
 	}
 }
 
@@ -752,7 +752,7 @@ func main() {
 	monitorBindEntry.SetPlaceHolder("0.0.0.0")
 	monitorBindEntry.SetText(cfg.MonitorBindHost)
 	monitorPortEntry := widget.NewEntry()
-	monitorPortEntry.SetPlaceHolder("5000")
+	monitorPortEntry.SetPlaceHolder(strconv.Itoa(monitor.DefaultUDPPort))
 	monitorPortEntry.SetText(strconv.Itoa(cfg.MonitorUDPPort))
 	monitorAllowIPEntry := widget.NewEntry()
 	monitorAllowIPEntry.SetPlaceHolder("optional — single source IP")

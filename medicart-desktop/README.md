@@ -11,21 +11,39 @@ This application acts as a bridge between local medical devices (via `lepu_cli.e
 - **Data Ingestion**: Parses raw device data and sends structured JSON to a specified HTTP endpoint.
 - **Patient Association**: Allows tagging readings with a specific Patient Name.
 - **Real-time Status**: Visual feedback and error highlighting (red for errors).
-- **ZUG TR8 monitor (HL7 UDP)**: Listens on UDP port 5000 for vitals; live values on the Readings tab; tap a vital button to save one snapshot.
+- **ZUG TR8 monitor (HL7 UDP)**: Listens on UDP port **5500** by default (configurable in Settings); live values on the Readings tab; tap a vital button to save one snapshot.
 
 ### TR8 HL7 setup (Windows)
 
-1. On the monitor, set the HL7 **destination** to this PC’s LAN IP and **UDP port 5000** (defaults in Settings → TR8 Monitor).
+1. On the monitor, set the HL7 **destination** to this PC’s LAN IP and **UDP port 5500** (must match Settings → TR8 Monitor → UDP port).
 2. In Medicart **Settings**, set **Clinic Name** and **Server Base URL**. The TR8 usually does **not** send a clinic name; vitals uploads use this clinic when HL7 has none.
 3. Leave **Allow source IP** empty unless you intentionally filter one monitor IP.
-4. Allow inbound **UDP 5000** in Windows Firewall for **this app’s .exe** (PowerShell can receive while Medicart is blocked — they are different programs). Example (Admin PowerShell, adjust the path):
+4. Allow inbound **UDP** (your chosen port, default **5500**) in Windows Firewall for **this app’s .exe**. Example (Admin PowerShell, adjust the path):
 
    ```powershell
-   New-NetFirewallRule -DisplayName "Medicart HL7 UDP" -Direction Inbound -Protocol UDP -LocalPort 5000 -Action Allow -Program "C:\path\to\medicart-desktop-windows-386.exe"
+   New-NetFirewallRule -DisplayName "Medicart HL7 UDP" -Direction Inbound -Protocol UDP -LocalPort 5500 -Action Allow -Program "C:\path\to\medicart-desktop-windows-386.exe"
    ```
 
 5. **Allow source IP** in Settings must be **empty** unless you intentionally filter one monitor address. You do **not** need to know the monitor IP for normal operation.
-6. On Readings, after a few seconds you should see a **UDP self-test** line in Live Console. If **packet count** stays 0 but self-test ran, it is almost always firewall or another program still bound to port 5000 (close PowerShell listeners).
+6. On Readings, after a few seconds you should see a **UDP self-test** line in Live Console. If **packet count** stays 0 but self-test ran, it is almost always firewall or another program still bound to the same UDP port (close PowerShell test listeners).
+
+### “Access forbidden” when binding UDP (Windows)
+
+Windows often **reserves** UDP port **5000** (Hyper-V, WSL2, Docker). The app defaults to **5500** for that reason. If bind still fails, pick another port in Settings and on the TR8 (must match).
+
+**If you need a different port:**
+
+1. Medicart **Settings → TR8 Monitor → UDP port** → e.g. `9000` → **Save Settings**
+2. On the TR8, set the HL7 **destination port** to the same value.
+3. Add a firewall rule for that UDP port if needed.
+
+To inspect Windows reserved ranges (Admin PowerShell):
+
+```powershell
+netsh interface ipv4 show excludedportrange protocol=udp
+```
+
+Pick a port **not** inside any `Start Port`–`End Port` range listed there.
 
 ## Prerequisites
 

@@ -14,7 +14,7 @@ import (
 
 func openUDPListen(host string, port int) (net.PacketConn, string, error) {
 	if port <= 0 {
-		port = 5000
+		port = DefaultUDPPort
 	}
 	host = strings.TrimSpace(host)
 	var ip net.IP
