@@ -81,38 +81,52 @@ func ParseHL7Payload(raw []byte) ([]*ParsedMessage, error) {
 	return out, nil
 }
 
-func parseOneMessage(body string) (*ParsedMessage, error) {
+func normalizeHL7Line(line string) string {
+	line = strings.TrimSpace(line)
+	line = strings.Trim(line, "\uFEFF\u2028\u2029\u200B\x00")
+	return line
+}
+
+func lineFromSegment(seg hl7Segment) string {
+	if len(seg.fields) == 0 {
+		return seg.name
+	}
+	return strings.Join(seg.fields, string(seg.seps.field))
+}
+
+func splitHL7Segments(body string) []hl7Segment {
 	body = strings.ReplaceAll(body, "\r\n", "\n")
 	body = strings.ReplaceAll(body, "\r", "\n")
-	lines := strings.Split(body, "\n")
 	var segments []hl7Segment
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
+	seps := defaultSeps()
+	for _, line := range strings.Split(body, "\n") {
+		line = normalizeHL7Line(line)
 		if line == "" {
 			continue
 		}
-		// Remove BOM / odd leading chars before segment type.
-		if i := strings.Index(line, "MSH|"); i == 0 {
-			segments = append(segments, parseSegment(line, defaultSeps()))
+		if idx := strings.Index(line, "MSH|"); idx >= 0 {
+			line = line[idx:]
+			seg := parseSegment(line, defaultSeps())
+			segments = append(segments, seg)
+			seps = seg.seps
 			continue
 		}
-		if i := strings.Index(line, "PID|"); i >= 0 {
-			line = line[i:]
-		} else if i := strings.Index(line, "PV1|"); i >= 0 {
-			line = line[i:]
-		} else if i := strings.Index(line, "OBR|"); i >= 0 {
-			line = line[i:]
-		} else if i := strings.Index(line, "OBX|"); i >= 0 {
-			line = line[i:]
-		} else if len(line) < 4 || line[3] != '|' {
-			continue
+		for _, prefix := range []string{"PID|", "PV1|", "OBR|", "OBX|", "EVN|", "NTE|"} {
+			if idx := strings.Index(line, prefix); idx >= 0 {
+				line = line[idx:]
+				break
+			}
 		}
-		seps := defaultSeps()
-		if len(segments) > 0 && segments[0].name == "MSH" {
-			seps = segments[0].seps
+		if len(line) < 4 || line[3] != '|' {
+			continue
 		}
 		segments = append(segments, parseSegment(line, seps))
 	}
+	return segments
+}
+
+func parseOneMessage(body string) (*ParsedMessage, error) {
+	segments := splitHL7Segments(body)
 	if len(segments) == 0 {
 		return nil, nil
 	}
@@ -125,6 +139,7 @@ func parseOneMessage(body string) (*ParsedMessage, error) {
 
 	var msgType string
 	var parseInfo []string
+	var tempOBXSegments []hl7Segment
 	for _, seg := range segments {
 		switch seg.name {
 		case "MSH":
@@ -155,6 +170,15 @@ func parseOneMessage(body string) (*ParsedMessage, error) {
 				msg.Skip = true
 			}
 		case "OBX":
+			if segmentMentionsTemp(seg) {
+				tempOBXSegments = append(tempOBXSegments, seg)
+				if !msg.Skip && shouldProcessVitals(msgType) {
+					if parseOBXTempFlexible(seg, vitals, &parseInfo) {
+						hasVitals = true
+					}
+				}
+				continue
+			}
 			if msg.Skip {
 				continue
 			}
@@ -192,16 +216,20 @@ func parseOneMessage(body string) (*ParsedMessage, error) {
 		Patient:     patientIf(hasPatient, patient),
 		Vitals:      vitalsIf(hasVitals, vitals),
 	}
-	if shouldProcessVitals(msgType) && strings.Contains(body, "150344") {
+	if shouldProcessVitals(msgType) && len(tempOBXSegments) > 0 {
 		hasTempLog := false
 		for _, line := range parseInfo {
-			if strings.Contains(line, "temp OBX") || strings.Contains(line, "temp:") {
+			if strings.Contains(line, "temp OBX") {
 				hasTempLog = true
 				break
 			}
 		}
 		if !hasTempLog {
-			parseInfo = append(parseInfo, "Monitor temp: HL7 packet contains 150344 but no temp OBX segment matched — check TR8 HL7 profile")
+			raw := lineFromSegment(tempOBXSegments[0])
+			if len(raw) > 160 {
+				raw = raw[:160] + "…"
+			}
+			parseInfo = append(parseInfo, fmt.Sprintf("Monitor temp OBX: segment seen but not parsed: %s", raw))
 		}
 	}
 	if len(parseInfo) > 0 {
@@ -225,11 +253,15 @@ func vitalsIf(ok bool, v *VitalsSnapshot) *VitalsSnapshot {
 }
 
 func shouldProcessVitals(msgType string) bool {
-	parts := strings.Split(strings.ToUpper(msgType), "^")
+	parts := strings.Split(strings.ToUpper(strings.TrimSpace(msgType)), "^")
 	if len(parts) < 2 {
 		return false
 	}
-	return parts[0] == "ORU" && parts[1] == "R01"
+	if parts[0] != "ORU" {
+		return false
+	}
+	// W01 is waveform-only; other ORU types (R01, R04, …) may carry vitals / gun temp.
+	return parts[1] != "W01"
 }
 
 func isWaveformOBR(seg hl7Segment) bool {
@@ -384,7 +416,101 @@ func obxMDCKey(identifierField string, seps hl7Separators) string {
 	return strings.ToUpper(code)
 }
 
+func segmentMentionsTemp(seg hl7Segment) bool {
+	if seg.name != "OBX" {
+		return false
+	}
+	for i := 1; i < len(seg.fields); i++ {
+		u := strings.ToUpper(seg.fields[i])
+		if strings.Contains(u, "150344") || strings.Contains(u, "MDC_TEMP") {
+			return true
+		}
+	}
+	return false
+}
+
+func fieldLooksLikeTempID(field string, seps hl7Separators) bool {
+	if field == "" {
+		return false
+	}
+	key := obxMDCKey(field, seps)
+	if isTempOBXIdentifier(key, field) {
+		return true
+	}
+	u := strings.ToUpper(field)
+	return strings.Contains(u, "150344") || strings.Contains(u, "MDC_TEMP")
+}
+
+func obxTempValueAndUnits(seg hl7Segment) (rawVal, units string) {
+	identIdx := -1
+	for i := 2; i < len(seg.fields); i++ {
+		if fieldLooksLikeTempID(seg.fields[i], seg.seps) || tempSubIDField(seg.fields[i]) {
+			identIdx = i
+			break
+		}
+	}
+	if identIdx < 0 {
+		return "", ""
+	}
+	for j := identIdx + 1; j < len(seg.fields) && j <= identIdx+5; j++ {
+		f := strings.TrimSpace(fieldComponent(seg.fields[j], seg.seps, 0))
+		if f == "" {
+			f = strings.TrimSpace(seg.fields[j])
+		}
+		if f == "" {
+			continue
+		}
+		if strings.Contains(strings.ToUpper(f), "MDC_DIM") || strings.Contains(f, "^MDC") {
+			if units == "" {
+				units = normalizeUnitKey(obxMDCKey(f, seg.seps))
+			}
+			continue
+		}
+		if isSentinelRaw(f) {
+			return f, units
+		}
+		if _, err := strconv.ParseFloat(f, 64); err == nil {
+			if units == "" && j+1 < len(seg.fields) {
+				units = obxUnitsKeyAt(seg, j+1)
+			}
+			return f, units
+		}
+	}
+	return "", units
+}
+
+func tempSubIDField(field string) bool {
+	u := strings.ToUpper(field)
+	return strings.Contains(field, "150344") ||
+		strings.Contains(u, "1.13.1") ||
+		strings.Contains(u, "1.13.2")
+}
+
+func obxUnitsKeyAt(seg hl7Segment, idx int) string {
+	if idx < 0 || idx >= len(seg.fields) {
+		return ""
+	}
+	return normalizeUnitKey(obxMDCKey(seg.fields[idx], seg.seps))
+}
+
+func parseOBXTempFlexible(seg hl7Segment, v *VitalsSnapshot, info *[]string) bool {
+	rawVal, units := obxTempValueAndUnits(seg)
+	if rawVal == "" && units == "" && !segmentMentionsTemp(seg) {
+		return false
+	}
+	obsTime := parseHL7Time(seg, 14)
+	if units == "" {
+		units = obxUnitsKey(seg)
+	}
+	return parseTempOBX(v, rawVal, units, obsTime, info, seg)
+}
+
 func parseOBX(seg hl7Segment, v *VitalsSnapshot, p *PatientSnapshot, info *[]string) bool {
+	if segmentMentionsTemp(seg) {
+		if len(seg.fields) < 4 {
+			return parseOBXTempFlexible(seg, v, info)
+		}
+	}
 	if len(seg.fields) < 6 {
 		return false
 	}

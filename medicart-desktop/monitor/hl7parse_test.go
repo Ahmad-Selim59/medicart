@@ -90,6 +90,64 @@ OBX|5|NM|150303^MDC_PRESS_CUFF_MEAN^MDC||-1|266016^MDC_DIM_MMHG^MDC`
 	}
 }
 
+const tr8TempOBXFull = `OBX|7|NM|150344^MDC_TEMP^MDC|1.13.1.150344|-99.9|268192^MDC_DIM_DEGC^MDC||||||||20210611102047|||^|00A037009B000000^^00A037009B000000^EUI-64`
+
+func TestParseTR8FullTempOBXLine(t *testing.T) {
+	msg := `MSH|^~\&|XH80X^00A037009B000000^EUI-64||||20210611102047||ORU^R01^ORU_R01|41|P|2.4|||AL|NE||UNICODE UTF-8
+` + tr8TempOBXFull
+	msgs, err := ParseHL7Payload([]byte(msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, line := range msgs[0].Info {
+		if strings.Contains(line, "temp OBX") && strings.Contains(line, "-99.9") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected temp OBX log, Info=%v", msgs[0].Info)
+	}
+}
+
+func TestParseTempWithLeadingUnicodeMSH(t *testing.T) {
+	msg := "\u2028MSH|^~\\&|TR8|FAC|||||ORU^R01|1|P|2.4\r" + tr8TempOBXFull
+	msgs, err := ParseHL7Payload([]byte(msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msgs[0].MessageType == "" {
+		t.Fatal("expected message type from MSH after unicode prefix")
+	}
+	if len(msgs[0].Info) == 0 {
+		t.Fatal("expected temp OBX debug lines")
+	}
+}
+
+func TestParseGunTempORUR04(t *testing.T) {
+	msg := `MSH|^~\&|TR8|FAC|||||ORU^R04|2|P|2.4
+OBX|1|NM|150344^MDC_TEMP^MDC||36.4|268192^MDC_DIM_DEGC^MDC`
+	msgs, err := ParseHL7Payload([]byte(msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !msgs[0].Vitals.Temp.Valid || msgs[0].Vitals.Temp.Value != 36.4 {
+		t.Fatalf("temp: %+v", msgs[0].Vitals.Temp)
+	}
+}
+
+func TestParseShortTempOBXFiveFields(t *testing.T) {
+	msg := `MSH|^~\&|TR8|FAC|||||ORU^R01|1|P|2.4
+OBX|1|NM|150344^MDC_TEMP^MDC|36.4`
+	msgs, err := ParseHL7Payload([]byte(msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !msgs[0].Vitals.Temp.Valid || msgs[0].Vitals.Temp.Value != 36.4 {
+		t.Fatalf("temp: %+v info=%v", msgs[0].Vitals.Temp, msgs[0].Info)
+	}
+}
+
 func TestParseTempOBX_LogsSentinelInfo(t *testing.T) {
 	msgs, err := ParseHL7Payload([]byte(goldenORUR01))
 	if err != nil {
