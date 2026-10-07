@@ -41,6 +41,9 @@ import (
 // returns a larger native frame (e.g. 640x480 or 1920x1080).
 const previewMaxW, previewMaxH = 320, 240
 
+// showStethoscopeInReadings toggles the Stethoscope card on the Readings tab.
+const showStethoscopeInReadings = false
+
 // captureVideoSize and captureFramerate pin dshow/v4l2 to a modest resolution
 // so MJPEG frames stay small and ffmpeg does not buffer high-res captures.
 const captureVideoSize = "640x480"
@@ -2722,8 +2725,7 @@ func main() {
 	)
 
 	// 2. Readings Tab
-	// Mimicking the Vitals & Stethoscope section + Live Console
-	readingsContent := container.NewVBox(
+	readingsParts := []fyne.CanvasObject{
 		widget.NewLabelWithStyle("Patient Readings", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		widget.NewLabel("When TR8 monitor is enabled, live values update from HL7; tap a vital to save one snapshot to the server."),
 		widget.NewCard("TR8 Monitor", "Live cache from UDP HL7 stream", container.NewVBox(
@@ -2748,12 +2750,18 @@ func main() {
 		)),
 		widget.NewSeparator(),
 		widget.NewCard("ECG", "Live W01 preview (Lead II / best ECG lead); save PNG or upload when monitor is off", ecgCardBody),
-		widget.NewSeparator(),
-		widget.NewCard("Stethoscope", "Search, connect, and stream auscultation", container.NewVBox(
-			widget.NewLabel("MAC Address (optional):"),
-			stethMacEntry,
-			btnStethoscope,
-		)),
+	}
+	if showStethoscopeInReadings {
+		readingsParts = append(readingsParts,
+			widget.NewSeparator(),
+			widget.NewCard("Stethoscope", "Search, connect, and stream auscultation", container.NewVBox(
+				widget.NewLabel("MAC Address (optional):"),
+				stethMacEntry,
+				btnStethoscope,
+			)),
+		)
+	}
+	readingsParts = append(readingsParts,
 		widget.NewSeparator(),
 		widget.NewCard("Live Console", "System Active", container.NewVBox(
 			statusLabel,
@@ -2761,6 +2769,7 @@ func main() {
 			stopBtn,
 		)),
 	)
+	readingsContent := container.NewVBox(readingsParts...)
 
 	// 3. Comms Tab — split into Video, Control, and Chat sub-tabs
 	videoContent := container.NewVBox(
