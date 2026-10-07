@@ -8,8 +8,8 @@ import (
 	"image/png"
 )
 
-// RenderECGStripPNG draws a simple ECG trace on white background.
-func RenderECGStripPNG(samples []float64, width, height int) ([]byte, error) {
+// RenderECGStripImage draws a simple ECG trace on white background.
+func RenderECGStripImage(samples []float64, width, height int) (*image.RGBA, error) {
 	if width <= 0 {
 		width = 800
 	}
@@ -19,7 +19,24 @@ func RenderECGStripPNG(samples []float64, width, height int) ([]byte, error) {
 	if len(samples) < 2 {
 		return nil, fmt.Errorf("not enough samples to render")
 	}
+	img := renderECGStripRGBA(samples, width, height)
+	return img, nil
+}
 
+// RenderECGStripPNG encodes RenderECGStripImage as PNG.
+func RenderECGStripPNG(samples []float64, width, height int) ([]byte, error) {
+	img, err := RenderECGStripImage(samples, width, height)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func renderECGStripRGBA(samples []float64, width, height int) *image.RGBA {
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 	white := color.RGBA{255, 255, 255, 255}
 	grid := color.RGBA{230, 230, 230, 255}
@@ -52,6 +69,8 @@ func RenderECGStripPNG(samples []float64, width, height int) ([]byte, error) {
 	span := maxV - minV
 	if span < 1e-6 {
 		span = 1
+		minV = minV - 0.5
+		span = 1
 	}
 	margin := 16.0
 	plotH := float64(height) - 2*margin
@@ -73,12 +92,7 @@ func RenderECGStripPNG(samples []float64, width, height int) ([]byte, error) {
 		}
 		prevX, prevY = x, y
 	}
-
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return img
 }
 
 func drawLine(img *image.RGBA, x0, y0, x1, y1 int, c color.Color) {

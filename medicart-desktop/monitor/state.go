@@ -324,6 +324,14 @@ func (s *MonitorState) ECGLeadSnapshot(leadKey string) LeadSnapshot {
 	return s.waveform.SnapshotLead(leadKey)
 }
 
+// ECGBestLeadSnapshot returns the best ECG lead buffer for preview/commit.
+func (s *MonitorState) ECGBestLeadSnapshot() LeadSnapshot {
+	if s.waveform == nil {
+		return LeadSnapshot{}
+	}
+	return s.waveform.SnapshotBestECGLead()
+}
+
 // PatientForCommit returns the current patient snapshot for ingest.
 func (s *MonitorState) PatientForCommit() PatientSnapshot {
 	s.mu.RLock()

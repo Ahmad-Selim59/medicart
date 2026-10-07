@@ -853,6 +853,10 @@ func main() {
 				[]widget.RichTextSegment{&widget.TextSegment{Text: line, Style: style}},
 				logRich.Segments...,
 			)
+			const maxLogLines = 120
+			if len(logRich.Segments) > maxLogLines {
+				logRich.Segments = logRich.Segments[:maxLogLines]
+			}
 			logRich.Refresh()
 
 			statusText := "Status: " + msg
@@ -1139,7 +1143,18 @@ func main() {
 		go commitECGFromMonitor(myWindow, log, monitorState, ingestURL(base), clinicNameEntry.Text, patientNameEntry.Text)
 	})
 
+	ecgPreviewImage := canvas.NewImageFromImage(blankFrame)
+	ecgPreviewImage.FillMode = canvas.ImageFillContain
+	ecgPreviewImage.SetMinSize(fyne.NewSize(420, 110))
+	ecgDebugLabel := widget.NewLabel("ECG W01: enable monitor to see live strip preview")
+	ecgDebugLabel.Wrapping = fyne.TextWrapWord
+
 	ecgCardActions := container.NewVBox(btnECGFromMonitor, btnECGUpload)
+	ecgCardBody := container.NewVBox(
+		ecgDebugLabel,
+		ecgPreviewImage,
+		ecgCardActions,
+	)
 	updateECGButtons := func() {
 		if monitorEnabledCheck.Checked {
 			btnECGFromMonitor.Show()
@@ -2732,7 +2747,7 @@ func main() {
 			btnSaveGlucose,
 		)),
 		widget.NewSeparator(),
-		widget.NewCard("ECG", "Save Lead II from TR8 W01 stream, or upload an image when monitor is off", ecgCardActions),
+		widget.NewCard("ECG", "Live W01 preview (Lead II / best ECG lead); save PNG or upload when monitor is off", ecgCardBody),
 		widget.NewSeparator(),
 		widget.NewCard("Stethoscope", "Search, connect, and stream auscultation", container.NewVBox(
 			widget.NewLabel("MAC Address (optional):"),
@@ -2852,8 +2867,22 @@ func main() {
 		defer tick.Stop()
 		for range tick.C {
 			if !monitorEnabledCheck.Checked {
-				fyne.Do(func() { monitorStatusLabel.SetText("Monitor: off (enable in Settings)") })
+				fyne.Do(func() {
+					monitorStatusLabel.SetText("Monitor: off (enable in Settings)")
+					ecgDebugLabel.SetText("ECG W01: monitor off")
+					ecgPreviewImage.Image = blankFrame
+					ecgPreviewImage.Refresh()
+				})
 				continue
+			}
+			now := time.Now()
+			ecgLead := monitorState.ECGBestLeadSnapshot()
+			ecgDebug := monitor.FormatECGDebugLine(ecgLead, now)
+			var ecgPreview *image.RGBA
+			if samples := monitor.PreviewWindowSamples(ecgLead, now); len(samples) >= 2 {
+				if img, err := monitor.RenderECGStripImage(samples, 420, 110); err == nil {
+					ecgPreview = img
+				}
 			}
 			snap := monitorState.Snapshot()
 			hr, spo2, nibp, temp := monitor.FormatVitalDisplay(snap.Vitals)
@@ -2871,6 +2900,13 @@ func main() {
 				liveSpO2Label.SetText(spo2)
 				liveNIBPLabel.SetText(nibp)
 				liveTempLabel.SetText(temp)
+				ecgDebugLabel.SetText(ecgDebug)
+				if ecgPreview != nil {
+					ecgPreviewImage.Image = ecgPreview
+				} else {
+					ecgPreviewImage.Image = blankFrame
+				}
+				ecgPreviewImage.Refresh()
 				if shouldSyncPatient {
 					syncPatientUIFromMonitor(patientCopy, patientNameEntry, clinicNameEntry, ageEntry, weightEntry, heightEntry, genderSelect)
 				}
@@ -2967,7 +3003,7 @@ func commitECGFromMonitor(
 		return
 	}
 	now := time.Now()
-	lead := state.ECGLeadSnapshot(monitor.DefaultECGLeadKey)
+	lead := state.ECGBestLeadSnapshot()
 	result := monitor.BuildECGCommitPNG(lead, now)
 	if result.Err != nil {
 		log(result.Err.Error())
@@ -3020,8 +3056,16 @@ func sendReadingPayload(log func(string), targetURL, clinicName, patientName str
 	payload := maps.Clone(data)
 	payload["patient_name"] = patientName
 	payload["clinic_name"] = clinicName
-	log(fmt.Sprintf("Sending reading: %v", payload))
+	log(fmt.Sprintf("Sending reading: %s", formatPayloadForLog(payload)))
 	return sendData(targetURL, payload)
+}
+
+func formatPayloadForLog(payload map[string]interface{}) string {
+	view := maps.Clone(payload)
+	if img, ok := view["image"].(string); ok && len(img) > 64 {
+		view["image"] = fmt.Sprintf("<base64 %d bytes>", len(img))
+	}
+	return fmt.Sprintf("%v", view)
 }
 
 func waitCLIShutdown(scanDone <-chan struct{}, cmd *exec.Cmd) error {

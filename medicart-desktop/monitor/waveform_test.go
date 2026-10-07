@@ -43,18 +43,36 @@ func TestBuildWaveformUpdate_LeadII(t *testing.T) {
 
 func TestECGCommitPipeline(t *testing.T) {
 	state := NewMonitorState()
-	msgs, _ := ParseHL7Payload([]byte(testW01ECG))
 	now := time.Now()
-	for i := 0; i < 60; i++ {
-		state.ApplyWaveform(msgs[0].Waveform, now)
+	chunk := LeadSampleChunk{
+		LeadKey:    DefaultECGLeadKey,
+		SampleRate: 500,
 	}
-	lead := state.ECGLeadSnapshot(DefaultECGLeadKey)
+	for i := 0; i < 600; i++ {
+		chunk.Samples = append(chunk.Samples, float64((i%40)-20))
+	}
+	state.ApplyWaveform(&WaveformUpdate{Chunks: []LeadSampleChunk{chunk}}, now)
+	lead := state.ECGBestLeadSnapshot()
 	res := BuildECGCommitPNG(lead, now)
 	if res.Err != nil {
 		t.Fatal(res.Err)
 	}
 	if len(res.PNG) < 100 {
 		t.Fatalf("png too small: %d", len(res.PNG))
+	}
+}
+
+func TestCanCommitECG_RejectsFlat(t *testing.T) {
+	now := time.Now()
+	flat := LeadSnapshot{
+		LeadKey:    DefaultECGLeadKey,
+		Samples:    make([]float64, 600),
+		SampleRate: 500,
+		UpdatedAt:  now,
+	}
+	ok, msg := CanCommitECG(flat, now)
+	if ok || msg == "" {
+		t.Fatalf("expected flat rejection, ok=%v msg=%q", ok, msg)
 	}
 }
 

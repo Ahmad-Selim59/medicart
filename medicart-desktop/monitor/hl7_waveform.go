@@ -96,8 +96,8 @@ func BuildWaveformUpdate(segments []hl7Segment, msgType string) *WaveformUpdate 
 				}
 				m.resolution = f
 			}
-		case isECGLeadIdentifier(id) && valType == "NA":
-			samples := parseSampleList(seg.fields[5])
+		case isECGLeadIdentifier(id) && (valType == "NA" || valType == "NM"):
+			samples := parseSampleList(obxWaveformValue(seg))
 			if len(samples) == 0 {
 				continue
 			}
@@ -109,6 +109,11 @@ func BuildWaveformUpdate(segments []hl7Segment, msgType string) *WaveformUpdate 
 					rate = m.sampleRate
 				}
 				res = m.resolution
+			}
+			if res > 0 {
+				for i := range samples {
+					samples[i] *= res
+				}
 			}
 			chunks = append(chunks, LeadSampleChunk{
 				LeadKey:    id,
@@ -135,4 +140,20 @@ func waveformSubIDBase(subID string) string {
 		return subID[:i]
 	}
 	return subID
+}
+
+// obxWaveformValue returns OBX-5 sample list (TR8 puts units in OBX-6).
+func obxWaveformValue(seg hl7Segment) string {
+	if len(seg.fields) < 6 {
+		return ""
+	}
+	raw := strings.TrimSpace(seg.fields[5])
+	if raw != "" {
+		return raw
+	}
+	next := strings.TrimSpace(seg.fields[6])
+	if next != "" && !strings.Contains(strings.ToUpper(next), "MDC_DIM") {
+		return next
+	}
+	return raw
 }
