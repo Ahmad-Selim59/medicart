@@ -18,8 +18,14 @@ This application acts as a bridge between local medical devices (via `lepu_cli.e
 1. On the monitor, set the HL7 **destination** to this PC’s LAN IP and **UDP port 5000** (defaults in Settings → TR8 Monitor).
 2. In Medicart **Settings**, set **Clinic Name** and **Server Base URL**. The TR8 usually does **not** send a clinic name; vitals uploads use this clinic when HL7 has none.
 3. Leave **Allow source IP** empty unless you intentionally filter one monitor IP.
-4. Allow inbound **UDP 5000** in Windows Firewall for the desktop app.
-5. On Readings, status should show **connected** and packet count once data arrives. If it stays on **no UDP packets yet**, the stream is not reaching the PC (wrong IP/port, firewall, or cable/Wi‑Fi).
+4. Allow inbound **UDP 5000** in Windows Firewall for **this app’s .exe** (PowerShell can receive while Medicart is blocked — they are different programs). Example (Admin PowerShell, adjust the path):
+
+   ```powershell
+   New-NetFirewallRule -DisplayName "Medicart HL7 UDP" -Direction Inbound -Protocol UDP -LocalPort 5000 -Action Allow -Program "C:\path\to\medicart-desktop-windows-386.exe"
+   ```
+
+5. **Allow source IP** in Settings must be **empty** unless you intentionally filter one monitor address. You do **not** need to know the monitor IP for normal operation.
+6. On Readings, after a few seconds you should see a **UDP self-test** line in Live Console. If **packet count** stays 0 but self-test ran, it is almost always firewall or another program still bound to port 5000 (close PowerShell listeners).
 
 ## Prerequisites
 

@@ -891,6 +891,23 @@ func main() {
 		})
 	}
 
+	var monitorLogMu sync.Mutex
+	var monitorLogPending []string
+	flushMonitorLogs := func() {
+		monitorLogMu.Lock()
+		batch := monitorLogPending
+		monitorLogPending = nil
+		monitorLogMu.Unlock()
+		for _, msg := range batch {
+			log(msg)
+		}
+	}
+	appendMonitorLog := func(msg string) {
+		monitorLogMu.Lock()
+		monitorLogPending = append(monitorLogPending, msg)
+		monitorLogMu.Unlock()
+	}
+
 	startMonitorListener = func(appCfg AppConfig) {
 		monitorCancelMu.Lock()
 		if monitorCancel != nil {
@@ -908,7 +925,7 @@ func main() {
 		monitorCancel = cancel
 		monitorCancelMu.Unlock()
 		lc := monitorListenConfig(appCfg)
-		go monitor.Listen(ctx, lc, monitorState, func(msg string) { log(msg) })
+		go monitor.Listen(ctx, lc, monitorState, appendMonitorLog)
 	}
 
 	monitorState.SetPatientChangeHandler(func(p monitor.PatientSnapshot) {
@@ -2827,6 +2844,7 @@ func main() {
 				patientCopy.Age > 0 ||
 				strings.TrimSpace(patientCopy.Gender) != ""
 			fyne.Do(func() {
+				flushMonitorLogs()
 				monitorStatusLabel.SetText(status)
 				liveHRLabel.SetText(hr)
 				liveSpO2Label.SetText(spo2)

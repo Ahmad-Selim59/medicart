@@ -13,13 +13,21 @@ import (
 )
 
 func openUDPListen(host string, port int) (net.PacketConn, string, error) {
-	if strings.TrimSpace(host) == "" {
-		host = "0.0.0.0"
-	}
 	if port <= 0 {
 		port = 5000
 	}
-	addr := fmt.Sprintf("%s:%d", host, port)
+	host = strings.TrimSpace(host)
+	var ip net.IP
+	switch host {
+	case "", "0.0.0.0":
+		ip = net.IPv4zero
+	default:
+		ip = net.ParseIP(host)
+		if ip == nil {
+			return nil, "", fmt.Errorf("invalid bind host %q", host)
+		}
+	}
+	addr := &net.UDPAddr{IP: ip, Port: port}
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			return c.Control(func(fd uintptr) {
@@ -27,12 +35,9 @@ func openUDPListen(host string, port int) (net.PacketConn, string, error) {
 			})
 		},
 	}
-	pc, err := lc.ListenPacket(context.Background(), "udp4", addr)
+	pc, err := lc.ListenPacket(context.Background(), "udp4", addr.String())
 	if err != nil {
-		pc, err = lc.ListenPacket(context.Background(), "udp", addr)
+		return nil, addr.String(), err
 	}
-	if err != nil {
-		return nil, addr, err
-	}
-	return pc, addr, nil
+	return pc, pc.LocalAddr().String(), nil
 }

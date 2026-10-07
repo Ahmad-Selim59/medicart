@@ -3,30 +3,30 @@
 package monitor
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"strings"
 )
 
-// openUDPListen binds an IPv4 UDP socket (matches typical TR8 / PowerShell UdpClient behavior on Windows).
 func openUDPListen(host string, port int) (net.PacketConn, string, error) {
-	if strings.TrimSpace(host) == "" {
-		host = "0.0.0.0"
-	}
 	if port <= 0 {
 		port = 5000
 	}
-	addr := fmt.Sprintf("%s:%d", host, port)
-	lc := net.ListenConfig{}
-	pc, err := lc.ListenPacket(context.Background(), "udp4", addr)
-	if err != nil {
-		// Fallback for platforms where udp4 on 0.0.0.0 fails.
-		pc, err2 := lc.ListenPacket(context.Background(), "udp", addr)
-		if err2 != nil {
-			return nil, addr, err
+	host = strings.TrimSpace(host)
+	var ip net.IP
+	switch host {
+	case "", "0.0.0.0":
+		ip = net.IPv4zero
+	default:
+		ip = net.ParseIP(host)
+		if ip == nil {
+			return nil, "", fmt.Errorf("invalid bind host %q", host)
 		}
-		return pc, addr, nil
 	}
-	return pc, addr, nil
+	addr := &net.UDPAddr{IP: ip, Port: port}
+	conn, err := net.ListenUDP("udp4", addr)
+	if err != nil {
+		return nil, addr.String(), err
+	}
+	return conn, conn.LocalAddr().String(), nil
 }
