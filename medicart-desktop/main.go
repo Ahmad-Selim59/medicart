@@ -44,6 +44,31 @@ const previewMaxW, previewMaxH = 320, 240
 // showStethoscopeInReadings toggles the Stethoscope card on the Readings tab.
 const showStethoscopeInReadings = false
 
+const localGunTempMaxAge = 30 * time.Minute
+
+// gunTempState holds the last infrared/CLI thermometer reading for the Readings UI.
+type gunTempState struct {
+	mu    sync.Mutex
+	value float64
+	at    time.Time
+}
+
+func (g *gunTempState) set(v float64) {
+	g.mu.Lock()
+	g.value = v
+	g.at = time.Now()
+	g.mu.Unlock()
+}
+
+func (g *gunTempState) label() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.at.IsZero() || time.Since(g.at) > localGunTempMaxAge {
+		return "—"
+	}
+	return fmt.Sprintf("%.1f °C (gun)", g.value)
+}
+
 // captureVideoSize and captureFramerate pin dshow/v4l2 to a modest resolution
 // so MJPEG frames stay small and ffmpeg does not buffer high-res captures.
 const captureVideoSize = "640x480"
@@ -766,6 +791,7 @@ func main() {
 	liveSpO2Label := widget.NewLabel("—")
 	liveNIBPLabel := widget.NewLabel("—")
 	liveTempLabel := widget.NewLabel("—")
+	var gunTemp gunTempState
 
 	monitorCfgFromUI := func() AppConfig {
 		port, _ := strconv.Atoi(strings.TrimSpace(monitorPortEntry.Text))
@@ -988,7 +1014,15 @@ func main() {
 		}
 
 		stopBtn.Enable()
-		go runCLIAndSend(name, args, parser, targetURL, clinicName, patientName, log, func() {
+		onCLIReading := func(data map[string]interface{}) {
+			if v, ok := data["temp"].(float64); ok && v > 0 && v < 50 {
+				gunTemp.set(v)
+				fyne.Do(func() {
+					liveTempLabel.SetText(gunTemp.label())
+				})
+			}
+		}
+		go runCLIAndSend(name, args, parser, targetURL, clinicName, patientName, log, onCLIReading, func() {
 			fyne.Do(func() { stopBtn.Disable() })
 		})
 	}
@@ -1074,18 +1108,22 @@ func main() {
 	btnSaveGlucose.Importance = widget.HighImportance
 	glucoseEntry.OnSubmitted = func(string) { submitGlucose() }
 
-	btnTemp := widget.NewButtonWithIcon("Temperature", theme.DocumentSaveIcon(), func() {
-		vitalButtonTapped("Temperature", []string{"-temperature"}, parseTemperatureLine, monitor.VitalTemp)
+	btnTemp := widget.NewButtonWithIcon("Temperature", theme.MediaPlayIcon(), func() {
+		startProcess("Temperature", []string{"-temperature"}, parseTemperatureLine)
 	})
 
 	updateVitalButtonIcons := func() {
-		icon := theme.MediaPlayIcon()
+		monitorSave := theme.DocumentSaveIcon()
+		cliPlay := theme.MediaPlayIcon()
 		if monitorEnabledCheck.Checked {
-			icon = theme.DocumentSaveIcon()
+			btnHeartRate.SetIcon(monitorSave)
+			btnNIBP.SetIcon(monitorSave)
+		} else {
+			btnHeartRate.SetIcon(cliPlay)
+			btnNIBP.SetIcon(cliPlay)
 		}
-		btnHeartRate.SetIcon(icon)
-		btnNIBP.SetIcon(icon)
-		btnTemp.SetIcon(icon)
+		// Body temp uses lepu_cli gun even when TR8 monitor is enabled (monitor temp is often unset).
+		btnTemp.SetIcon(cliPlay)
 	}
 	updateVitalButtonIcons()
 
@@ -2894,7 +2932,11 @@ func main() {
 				}
 			}
 			snap := monitorState.Snapshot()
-			hr, spo2, nibp, temp := monitor.FormatVitalDisplay(snap.Vitals)
+			hr, spo2, nibp, monTemp := monitor.FormatVitalDisplay(snap.Vitals)
+			temp := monTemp
+			if temp == "—" {
+				temp = gunTemp.label()
+			}
 			status := monitor.ConnectionStatusText(snap.Connection, time.Now(), snap.Vitals)
 			patientCopy := snap.Patient
 			shouldSyncPatient := strings.TrimSpace(patientCopy.PatientID) != "" ||
@@ -3177,7 +3219,7 @@ func resolveCLIPath(name string) string {
 	return resolveDependencyCLI(cmdPath)
 }
 
-func runCLIOnce(ctx context.Context, cancel context.CancelFunc, cmdPath string, args []string, parser LineParser, sessionKind readingSessionKind, targetURL, clinicName, patientName string, log func(string)) cliAttemptResult {
+func runCLIOnce(ctx context.Context, cancel context.CancelFunc, cmdPath string, args []string, parser LineParser, sessionKind readingSessionKind, targetURL, clinicName, patientName string, log func(string), onReading func(map[string]interface{})) cliAttemptResult {
 	result := cliAttemptResult{}
 
 	if ctx.Err() != nil {
@@ -3320,6 +3362,9 @@ func runCLIOnce(ctx context.Context, cancel context.CancelFunc, cmdPath string, 
 			}
 
 			pendingReading = maps.Clone(dataMap)
+			if onReading != nil {
+				onReading(dataMap)
+			}
 			if sessionKind == readingSessionFinal && isFinalReading(dataMap) {
 				return finishAfterSend("Final reading received.")
 			}
@@ -3359,7 +3404,7 @@ flush:
 	return result
 }
 
-func runCLIAndSend(name string, args []string, parser LineParser, targetURL string, clinicName string, patientName string, log func(string), onFinish func()) {
+func runCLIAndSend(name string, args []string, parser LineParser, targetURL string, clinicName string, patientName string, log func(string), onReading func(map[string]interface{}), onFinish func()) {
 	defer onFinish()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -3390,7 +3435,7 @@ func runCLIAndSend(name string, args []string, parser LineParser, targetURL stri
 
 		log(fmt.Sprintf("Starting %s (attempt %d/%d, %s)...", name, attempt, cliMaxAttempts, cmdPath))
 
-		result := runCLIOnce(ctx, cancel, cmdPath, args, parser, readingSessionKindForName(name), targetURL, clinicName, patientName, log)
+		result := runCLIOnce(ctx, cancel, cmdPath, args, parser, readingSessionKindForName(name), targetURL, clinicName, patientName, log, onReading)
 		if result.cancelled {
 			log("Process stopped by user.")
 			return
@@ -3766,24 +3811,50 @@ func parseNIBPLine(line string) (interface{}, error) {
 	return nil, nil
 }
 
-// Temperature
+// Temperature (lepu_cli / infrared gun). Accepts DATA:TEMP=… and comma-separated DATA: lines.
 func parseTemperatureLine(line string) (interface{}, error) {
 	normalized := normalizeCLILine(line)
-	if strings.HasPrefix(normalized, "DATA:TEMP=") {
-		valStr := strings.TrimPrefix(normalized, "DATA:TEMP=")
-		if idx := strings.Index(valStr, ","); idx >= 0 {
-			valStr = valStr[:idx]
+	if strings.HasPrefix(normalized, "DATA:") {
+		payload := strings.TrimPrefix(normalized, "DATA:")
+		if strings.HasPrefix(payload, "TEMP=") {
+			valStr := strings.TrimPrefix(payload, "TEMP=")
+			if idx := strings.Index(valStr, ","); idx >= 0 {
+				valStr = valStr[:idx]
+			}
+			if val, ok := parseTemperatureValue(valStr); ok {
+				return temperatureReading(val), nil
+			}
 		}
-		val, err := strconv.ParseFloat(valStr, 64)
-		if err != nil {
-			return nil, err
+		kv := parseKV(payload)
+		for key, valStr := range kv {
+			switch strings.ToUpper(strings.TrimSpace(key)) {
+			case "TEMP", "BODYTEMP", "BT", "T":
+				if val, ok := parseTemperatureValue(valStr); ok {
+					return temperatureReading(val), nil
+				}
+			}
 		}
-		return map[string]interface{}{
-			"type": "data",
-			"temp": val,
-		}, nil
 	}
 	return nil, nil
+}
+
+func parseTemperatureValue(raw string) (float64, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	val, err := strconv.ParseFloat(raw, 64)
+	if err != nil || val <= 0 || val >= 50 {
+		return 0, false
+	}
+	return val, true
+}
+
+func temperatureReading(celsius float64) map[string]interface{} {
+	return map[string]interface{}{
+		"type": "data",
+		"temp": celsius,
+	}
 }
 
 // Stethoscope

@@ -110,7 +110,7 @@ func TestRunCLIOnceRetriesUntilOutput(t *testing.T) {
 	var logs []string
 	logFn := func(msg string) { logs = append(logs, msg) }
 
-	result := runCLIOnce(ctx, cancel, shPath, []string{tmp.Name(), "fail"}, parseHeartRateLine, readingSessionContinuous, "http://127.0.0.1:1", "Clinic", "Patient", logFn)
+	result := runCLIOnce(ctx, cancel, shPath, []string{tmp.Name(), "fail"}, parseHeartRateLine, readingSessionContinuous, "http://127.0.0.1:1", "Clinic", "Patient", logFn, nil)
 	if result.succeeded() {
 		t.Fatalf("expected failed attempt, got %+v", result)
 	}
@@ -118,7 +118,7 @@ func TestRunCLIOnceRetriesUntilOutput(t *testing.T) {
 		t.Fatal("expected error message on failed attempt")
 	}
 
-	result = runCLIOnce(ctx, cancel, shPath, []string{tmp.Name(), "ok"}, parseHeartRateLine, readingSessionContinuous, "http://127.0.0.1:1", "Clinic", "Patient", logFn)
+	result = runCLIOnce(ctx, cancel, shPath, []string{tmp.Name(), "ok"}, parseHeartRateLine, readingSessionContinuous, "http://127.0.0.1:1", "Clinic", "Patient", logFn, nil)
 	if !result.succeeded() || !result.receivedOutput {
 		t.Fatalf("expected successful attempt with output, got %+v", result)
 	}
@@ -211,7 +211,7 @@ sleep 60
 	var logs []string
 	logFn := func(msg string) { logs = append(logs, msg) }
 
-	result := runCLIOnce(ctx, cancel, shPath, []string{tmp.Name()}, parseNIBPLine, readingSessionFinal, srv.URL, "Clinic", "Patient", logFn)
+	result := runCLIOnce(ctx, cancel, shPath, []string{tmp.Name()}, parseNIBPLine, readingSessionFinal, srv.URL, "Clinic", "Patient", logFn, nil)
 	if !result.completed {
 		t.Fatalf("expected auto-complete after NIBP result, got %+v", result)
 	}
